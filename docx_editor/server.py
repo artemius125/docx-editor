@@ -1,5 +1,6 @@
 """FastAPI-сервер: загрузка .docx, правка запросом (полный цикл edit.run_edit), скачивание."""
 
+import asyncio
 import json
 import time
 import uuid
@@ -56,14 +57,25 @@ async def edit(prompt: str = Form(...), session: str = Form(...)):
     tasks = edit_mod.split(prompt)
     model = _env()["LLM_MODEL"]
 
-    def stream():
+    async def stream():
         nonlocal doc, idx
         started = prev = time.perf_counter()
         yield json.dumps({"type": "planning"}) + "\n"
 
         done, failed = [], []
         for task_n, task in enumerate(tasks, start=1):
-            result, doc, idx = edit_mod.run_edit(doc, idx, task)
+            # run_edit синхронный и может считать до минуты (кавычки/типографика по
+            # многим блокам) — уводим его с event loop в поток, чтобы между байтами
+            # успевать слать пинг: облачный туннель рвёт соединение по тишине, не по
+            # длительности (Ф10). Пинг игнорируется клиентом (неизвестный type) —
+            # web/index.html не трогаем.
+            edit_task = asyncio.create_task(asyncio.to_thread(edit_mod.run_edit, doc, idx, task))
+            while not edit_task.done():
+                try:
+                    await asyncio.wait_for(asyncio.shield(edit_task), timeout=5)
+                except asyncio.TimeoutError:
+                    yield json.dumps({"type": "ping"}) + "\n"
+            result, doc, idx = edit_task.result()
             doc.save(str(path))  # сразу после правки — файл и событие не должны расходиться
             log.append(session, {
                 "task": task_n,

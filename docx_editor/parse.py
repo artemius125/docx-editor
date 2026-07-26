@@ -51,6 +51,42 @@ def _same_format(a, b):
     return all(a.get(k) == b.get(k) for k in ("b", "i", "u"))
 
 
+def _level(p_el):
+    """Уровень структуры из w:outlineLvl (прямое форматирование), или None.
+
+    Документ может не иметь именованных стилей Heading* вовсе (см. Ф9) и при
+    этом нести реальную структуру через outlineLvl в pPr — его и читаем
+    напрямую из XML, а не через p.style.
+    """
+    pPr = p_el.find(qn("w:pPr"))
+    if pPr is None:
+        return None
+    outline = pPr.find(qn("w:outlineLvl"))
+    if outline is None:
+        return None
+    return int(outline.get(qn("w:val")))
+
+
+def _list(p_el):
+    """{"ilvl","numId"} из w:numPr абзаца (тоже прямое форматирование), или None.
+
+    Отсутствующий w:ilvl внутри w:numPr означает уровень 0 (так у Word).
+    Без w:numId привязать абзац к конкретной нумерации нельзя — это не список.
+    """
+    pPr = p_el.find(qn("w:pPr"))
+    if pPr is None:
+        return None
+    numPr = pPr.find(qn("w:numPr"))
+    if numPr is None:
+        return None
+    numId_el = numPr.find(qn("w:numId"))
+    if numId_el is None:
+        return None
+    ilvl_el = numPr.find(qn("w:ilvl"))
+    ilvl = int(ilvl_el.get(qn("w:val"))) if ilvl_el is not None else 0
+    return {"ilvl": ilvl, "numId": int(numId_el.get(qn("w:val")))}
+
+
 def doc_map(doc, idx):
     """Блоки в текущем порядке body. Элементы, удалённые из body, выпадают.
 
@@ -73,6 +109,8 @@ def doc_map(doc, idx):
                 "text": p.text,
                 "align": _ALIGN.get(p.alignment),
                 "runs": _runs(p),
+                "level": _level(el),
+                "list": _list(el),
             })
         elif el.tag == _TBL:
             t = Table(el, doc)

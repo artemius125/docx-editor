@@ -2,6 +2,9 @@
 на настоящем документе Архитектура_ColBERT.docx, плюс outline и fragment.
 """
 
+import re
+from collections import Counter
+
 from docx import Document
 
 from docx_editor.parse import doc_map, index
@@ -90,14 +93,24 @@ def test_by_text_tolerates_nbsp():
 
 
 def test_outline_is_compact_and_valid():
+    # Ф9: outline теперь строится по level (w:outlineLvl), а не по имени стиля —
+    # в документе 24 реальных заголовка (1 H0 + 9 H1 + 14 H2), печатаются целиком,
+    # это подняло размер с 2972 знаков (плоский список без единого заголовка,
+    # старая проверка по Heading*/Title находила ноль) до ~4000 — бюджет всё ещё
+    # мелкий на фоне документа в 35 тыс. знаков и укладывается в промпт Навигатора.
     blocks = _load()
     o = find.outline(blocks)
-    assert len(o) < 3200, f"оглавление слишком длинное для промпта Навигатора: {len(o)} знаков"
+    assert len(o) < 4200, f"оглавление слишком длинное для промпта Навигатора: {len(o)} знаков"
+    headings = [l for l in o.splitlines() if re.search(r"^\S+ \[H\d\]", l)]
+    assert len(headings) == 24, f"ожидали 24 заголовка (level != None), получили {len(headings)}"
+    by_level = Counter(int(re.search(r"\[H(\d)\]", l).group(1)) for l in headings)
+    assert by_level == {0: 1, 1: 9, 2: 14}, f"неожиданное распределение по уровням: {by_level}"
     ids = {line.split(" ", 1)[0] for line in o.splitlines()}
     real_ids = {b["id"] for b in blocks}
     assert ids <= real_ids, f"в оглавлении лишние id: {ids - real_ids}"
     assert len(ids) == len(blocks), "оглавление пропустило блоки"
-    print(f"find_demo: outline — {len(o)} знаков на {len(blocks)} блоков, все id существуют")
+    print(f"find_demo: outline — {len(o)} знаков на {len(blocks)} блоков "
+          f"(24 реальных заголовка по level, было 2972 знака и 0 заголовков по стилю)")
 
 
 def test_fragment_dedupes_overlap():

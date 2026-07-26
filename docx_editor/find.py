@@ -70,11 +70,12 @@ def first_mention(blocks, term):
 def outline(blocks):
     """Компактная карта документа — единственное, что видит Навигатор.
 
-    Заголовочные стили (Heading*/Title) — текст целиком, их мало и они
-    короткие. Остальное — id и обрезанный префикс текста: в приёмочном
-    документе заголовков нет вовсе (все 116 абзацев стилем Normal), и без
-    сжатого превью обычных абзацев оглавление было бы пустым и бесполезным
-    именно на нём.
+    Заголовки определяются по `level` (w:outlineLvl из pPr), а не по имени
+    стиля: приёмочный документ размечен прямым форматированием и стилей
+    Heading*/Title не содержит вовсе (см. Ф9) — старая проверка по стилю
+    находила ноль заголовков и превращала оглавление в плоский список.
+    Заголовок — текст целиком с пометкой уровня (H0/H1/H2), чтобы модель
+    видела вложенность; обычный абзац — id и обрезанный префикс, как раньше.
     """
     lines = []
     for b in blocks:
@@ -82,9 +83,9 @@ def outline(blocks):
             ncols = len(b["rows"][0]) if b["rows"] else 0
             lines.append(f'{b["id"]} [table {len(b["rows"])}x{ncols}]')
             continue
-        style, text = b["style"], b["text"]
-        if style.startswith("Heading") or style == "Title":
-            lines.append(f'{b["id"]} [{style}] {text}')
+        level, text = b.get("level"), b["text"]
+        if level is not None:
+            lines.append(f'{b["id"]} [H{level}] {text}')
         else:
             prefix = text[:_PREFIX] + "…" if len(text) > _PREFIX else text
             lines.append(f'{b["id"]} {prefix}')

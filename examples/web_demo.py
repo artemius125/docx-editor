@@ -40,6 +40,14 @@ def main():
     assert "rolledBack" in agent_msg, \
         "renderAgentMsg обязан учитывать откаченные правки в итоговой сводке, а не только done/failed"
 
+    # Ф9: структура документа — прямое форматирование (w:outlineLvl/w:numPr),
+    # рендер обязан читать level/list.ilvl, а не только именованный style.
+    render_p = _extract("renderParagraph", text)
+    assert "b.level" in render_p, \
+        "renderParagraph обязан рисовать заголовки по b.level (Ф9), а не только по стилю"
+    assert "b.list" in render_p and "ilvl" in render_p, \
+        "renderParagraph обязан рисовать списки по b.list.ilvl (Ф9)"
+
     print("web_demo: ok")
 
 

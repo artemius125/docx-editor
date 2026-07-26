@@ -208,6 +208,11 @@
   .p-number.list-start { counter-reset: listnum; }
   .p-number::before { content: counter(listnum) "."; position: absolute; left: 0; }
 
+  /* Списки по w:numPr (прямое форматирование, см. Ф9) — отступ и маркер по
+     list.ilvl задаются инлайн-стилем в JS (глубина отступа и text-indent
+     произвольные), здесь только общий вид блока. */
+  .p-list { margin: 0 0 .3rem; min-height: 1.5em; }
+
   .doc-table-wrap { max-width: 100%; overflow-x: auto; margin: .8rem 0; }
   table.doc-table { border-collapse: collapse; width: 100%; font-size: .95rem; }
   table.doc-table td { border: 1px solid var(--table-border); padding: .4rem .6rem; vertical-align: top; }
@@ -455,17 +460,41 @@ function renderRuns(runs, text) {
   }).join("");
 }
 
+// Ф9: структура — прямое форматирование (w:outlineLvl/w:numPr), не именованный
+// стиль (см. parse.py/BUILD_PLAN). level решает раньше style: level 0 — заголовок
+// документа, 1/2 — уровни разделов, глубже — держится на p-h3, как и было для
+// стиля "Heading 3".
+const LEVEL_HEADING_CLASS = ["p-title", "p-h1", "p-h2"];
+// Маркер списка по list.ilvl; 0 и 1 обязаны различаться визуально (задание Ф9),
+// глубже уровни переиспользуют по кругу — в приёмочном документе их нет.
+const LIST_MARKERS = ["•", "–"];
+
 function renderParagraph(b, changed) {
-  const cls = HEADING_STYLE_CLASS[b.style] || "p-normal";
-  const isListNumber = b.style === "List Number";
-  const startClass = isListNumber && !prevWasListNumber ? " list-start" : "";
-  prevWasListNumber = isListNumber;
+  let cls, prefix = "";
+  const styleParts = [];
+  if (b.align) styleParts.push(`text-align:${b.align}`);
+
+  if (b.level !== null && b.level !== undefined) {
+    cls = LEVEL_HEADING_CLASS[b.level] || "p-h3";
+    prevWasListNumber = false;
+  } else if (b.list) {
+    cls = "p-list";
+    const indent = 1.4 + b.list.ilvl * 1.4;
+    styleParts.push(`padding-left:${indent}rem`, "text-indent:-1.4rem");
+    prefix = `${LIST_MARKERS[b.list.ilvl % LIST_MARKERS.length]}  `;
+    prevWasListNumber = false;
+  } else {
+    cls = HEADING_STYLE_CLASS[b.style] || "p-normal";
+    const isListNumber = b.style === "List Number";
+    if (isListNumber && !prevWasListNumber) cls += " list-start";
+    prevWasListNumber = isListNumber;
+  }
 
   let inner = renderRuns(b.runs, b.text);
   if (changed) inner = `<span class="hl">${inner}</span>`;
 
-  const alignStyle = b.align ? ` style="text-align:${b.align}"` : "";
-  return `<div class="${cls}${startClass}"${alignStyle}>${inner}</div>`;
+  const styleAttr = styleParts.length ? ` style="${styleParts.join(";")}"` : "";
+  return `<div class="${cls}"${styleAttr}>${prefix}${inner}</div>`;
 }
 
 function renderTable(b, changed) {
