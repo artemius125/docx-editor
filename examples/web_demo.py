@@ -33,6 +33,8 @@ def main():
     assert "verdict" in op_line, "renderOpLine обязан читать вердикт правки"
     assert "rolled_back" in op_line, \
         "renderOpLine обязан отдельно отмечать rolled_back — иначе откат Проверяющего неотличим от провала"
+    assert "already" in op_line, \
+        "renderOpLine обязан отдельно отмечать already (Ф8 item A) — иначе честный «уже было» неотличим от обычного done"
 
     agent_msg = _extract("renderAgentMsg", text)
     assert "rolledBack" in agent_msg, \

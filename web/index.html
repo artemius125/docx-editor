@@ -528,6 +528,7 @@ function renderOpLine(o) {
   if (o.task !== undefined) taskParts.push(`№${o.task}`);
   if (o.model === "fallback") taskParts.push("резерв");
   if (o.verdict === "rolled_back") taskParts.push("откат");
+  if (o.verdict === "already") taskParts.push("уже было");
   const taskMeta = taskParts.length ? `<span class="op-meta">${taskParts.join(" · ")}</span>` : "";
   if (debugMode) {
     const metaParts = [];

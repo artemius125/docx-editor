@@ -47,6 +47,11 @@ PROMPT_CRASH = (
 # правильно — проверяет, что журнал честно пишет iter=2 (а не декоративную 1).
 RETRY_MARKER = "запуск с ретраем редактора"
 
+# Правка 4 (отдельная сессия, отдельный чистый документ) — Ф8 item A: rule на
+# документе, уже нормализованном, диффа нет — обязан течь как status=done,
+# verdict=already, а не как провал.
+ALREADY_MARKER = "уже нормально по типографике"
+
 _REQUIRED_OP_FIELDS = {
     "type", "status", "text", "task", "task_text", "model", "at", "dt", "blocks", "verdict",
 }
@@ -60,6 +65,8 @@ def _fake_chat(messages):
             return {"kind": "local", "rule": None, "ids": ["p7"], "anchors": []}
         if CRASH_MARKER in user:
             raise RuntimeError("сбой навигатора (тест громких ошибок)")
+        if ALREADY_MARKER in user:
+            return {"kind": "global", "rule": "typography", "ids": [], "anchors": []}
         return {"kind": "local", "rule": None, "ids": ["p999"], "anchors": ["текст, которого точно нет"]}
     if "редактор" in system:
         if "не прошла проверку" in user:
@@ -232,7 +239,46 @@ def test_journal_iter_retry():
     print("server_demo: ретрай Редактора отражён в журнале честно — iter=2")
 
 
+def test_already_streams_as_done():
+    """Ф8 item A: rule на уже нормализованном документе (свежий чистый
+    документ, отдельный от DOC, чтобы гарантированно не иметь опечаток
+    типографики) даёт verdict=already с пустым diff'ом — событие потока
+    обязано нести status="done" (это честный успех, не провал) и попасть
+    в done итогового result, при этом verdict в событии остаётся "already",
+    отличая его от обычного done для отладки/UI-чипа."""
+    llm.chat = _fake_chat
+    client = TestClient(app)
+
+    clean_doc = Document()
+    clean_doc.add_paragraph("Чистый абзац без опечаток и лишних пробелов.")
+    buf = io.BytesIO()
+    clean_doc.save(buf)
+    buf.seek(0)
+    files = {"file": ("clean.docx", buf, "application/octet-stream")}
+    session = client.post("/upload", files=files).json()["session"]
+
+    edit = client.post("/edit", data={"prompt": f"1. {ALREADY_MARKER}.", "session": session})
+    assert edit.status_code == 200
+    events = [json.loads(line) for line in edit.text.splitlines() if line.strip()]
+    op_evt = next(e for e in events if e["type"] == "op")
+
+    assert op_evt["verdict"] == "already", op_evt
+    assert op_evt["status"] == "done", op_evt
+    assert op_evt["text"], "у already обязан быть непустой текст (причина)"
+
+    result_evt = events[-1]
+    assert result_evt["type"] == "result"
+    assert result_evt["done"] == [op_evt["text"]], result_evt
+    assert result_evt["failed"] == [], result_evt
+
+    records = client.get(f"/logs?session={session}").json()
+    assert len(records) == 1 and records[0]["verdict"] == "already", records
+
+    print("server_demo: already-правка стримится как status=done (verdict=already) и попадает в done итога")
+
+
 if __name__ == "__main__":
     session_from_main = main()
     test_crash_does_not_lose_saved_progress(session_from_main)
+    test_already_streams_as_done()
     test_journal_iter_retry()

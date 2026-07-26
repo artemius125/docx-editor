@@ -56,7 +56,7 @@ doc = Document(SRC)
 idx = index(doc)
 model = _env()["LLM_MODEL"]
 
-counts = {"done": 0, "failed": 0, "rolled_back": 0, "crashed": 0}
+counts = {"done": 0, "failed": 0, "rolled_back": 0, "already": 0, "crashed": 0}
 violations = []
 crashed = []
 started = time.perf_counter()
@@ -88,7 +88,10 @@ for n, task in enumerate(tasks, start=1):
     changed = before_texts != after_texts
     if verdict == "done" and not changed:
         violations.append(f"#{n}: verdict=done, но содержимое документа не изменилось")
-    if verdict in ("failed", "rolled_back"):
+    # "already" (Ф8, item A) — тоже честный исход, а не провал, но по устройству (rule
+    # без diff'а) документ обязан остаться нетронутым и причина непустой — те же два
+    # условия, что и у failed/rolled_back, поэтому в одной проверке.
+    if verdict in ("failed", "rolled_back", "already"):
         if changed:
             violations.append(f"#{n}: verdict={verdict}, но содержимое документа изменилось")
         if not reason:
@@ -102,7 +105,7 @@ for n, task in enumerate(tasks, start=1):
 
 elapsed = time.perf_counter() - started
 print(f"\ndone={counts['done']} failed={counts['failed']} rolled_back={counts['rolled_back']} "
-      f"crashed={counts['crashed']} из {len(tasks)} за {elapsed:.1f}с")
+      f"already={counts['already']} crashed={counts['crashed']} из {len(tasks)} за {elapsed:.1f}с")
 
 doc.save(OUT_PATH)
 print("verdict-vs-reality: " + ("нарушений нет" if not violations else "НАРУШЕНИЯ:\n" + "\n".join(violations)))

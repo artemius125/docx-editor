@@ -78,11 +78,15 @@ async def edit(prompt: str = Form(...), session: str = Form(...)):
                 "reply": json.dumps(result["reply"], ensure_ascii=False),
             })
             now = time.perf_counter()
+            # "already" — тоже честный успех (item A из Ф8: rule, ничего не поменявший,
+            # потому что требуемое состояние уже в документе), а не провал: статус и
+            # список "done" его не отличают от "done", "verdict" в событии несёт разницу.
+            success = result["verdict"] in ("done", "already")
             text = "; ".join(result["applied"]) if result["verdict"] == "done" else result["reason"]
-            (done if result["verdict"] == "done" else failed).append(text)
+            (done if success else failed).append(text)
             yield json.dumps({
                 "type": "op",
-                "status": "done" if result["verdict"] == "done" else "failed",
+                "status": "done" if success else "failed",
                 "text": text,
                 "task": task_n,
                 "task_text": task,

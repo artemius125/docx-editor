@@ -4,8 +4,11 @@
 закрываем фикстурой; живой вызов — только там, где без него нельзя).
 """
 
+import os
+
 from docx import Document
 
+from docx_editor import edit as edit_mod
 from docx_editor.edit import _btext, run_edit, split
 from docx_editor.parse import doc_map, index
 
@@ -181,6 +184,152 @@ def test_check_diff_carries_lengths():
     print("edit_demo: diff, отдаваемый Проверяющему, несёт длины было/стало")
 
 
+def test_rule_no_op_yields_already():
+    # Ф8 item A: правка типа rule, ничего не изменившая (документ уже
+    # нормализован — как правка 3 "слипшиеся предложения" после того, как
+    # правка 2 того же запроса уже прогнала typography по всему документу),
+    # обязана дать verdict="already", а не "failed": требуемое состояние УЖЕ
+    # в документе, и "не удалось" вводит в заблуждение не меньше ложного
+    # "сделано" (инвариант 5).
+    doc = Document()
+    doc.add_paragraph("Уже нормальный абзац: без лишних пробелов; и без слипшихся предложений.")
+    idx = index(doc)
+    before = [b["text"] for b in doc_map(doc, idx)]
+
+    def fake_navigator(outline_text, request):
+        return {"kind": "global", "rule": "typography", "ids": [], "anchors": []}
+
+    result, doc, idx = run_edit(doc, idx, "раздели слипшиеся предложения", navigator=fake_navigator)
+
+    assert result["verdict"] == "already", result
+    assert result["reason"], "у already обязана быть непустая причина"
+    after = [b["text"] for b in doc_map(doc, idx)]
+    assert after == before, "already не должен менять документ"
+    print(f"edit_demo: rule без изменений даёт already: {result['reason']!r}")
+
+
+def test_non_rule_empty_diff_stays_failed():
+    # Тот же симптом (ops применились, diff пуст), но НЕ через rule — здесь
+    # "already" не полагается (см. правило item A): нет оснований заключить,
+    # что желаемое состояние достигнуто, только что Редактор ничего не
+    # поменял по факту. set_style на тот же стиль, что уже есть, — валидная
+    # операция (validate не запрещает старый==новый для стиля), которая
+    # применяется, но не меняет ТЕКСТ, который сравнивает _diff.
+    doc = Document()
+    doc.add_paragraph("Абзац без изменений текста.")
+    idx = index(doc)
+    before = [b["text"] for b in doc_map(doc, idx)]
+
+    def fake_navigator(outline_text, request):
+        return {"kind": "local", "rule": None, "ids": ["p0"], "anchors": []}
+
+    def fake_editor(fragment_text, request, feedback=None):
+        return {"ops": [{"op": "set_style", "id": "p0", "style": "Normal"}]}
+
+    def fake_checker(request, diff):
+        raise AssertionError("Проверяющий не должен вызываться — diff пуст раньше")
+
+    result, doc, idx = run_edit(
+        doc, idx, "измени абзац",
+        navigator=fake_navigator, editor=fake_editor, checker=fake_checker,
+    )
+
+    assert result["verdict"] == "failed", result
+    assert result["reason"] == "операции применились, но текст не изменился", result
+    after = [b["text"] for b in doc_map(doc, idx)]
+    assert after == before
+    print("edit_demo: non-rule путь с пустым diff остаётся failed (already — только для rule)")
+
+
+def test_quoted_phrase_always_merges_with_navigator_hit():
+    # Ф8 item C: правки 4/8/14 отказывались с «во фрагменте только один
+    # случай», потому что дословная цитата «ёлочками» из текста правки
+    # искалась ТОЛЬКО как запасной путь — когда Навигатор не назвал ни
+    # одного id/anchor'а. Навигатор чаще называет ОДИН случай (тот, что
+    # увидел первым), и запасной путь никогда не срабатывал, хотя цитата
+    # реально встречается в нескольких местах документа (правка 8 — три
+    # разных написания года, каждое в «ёлочках», в трёх разных блоках).
+    # Теперь цитата всегда доливает совпадения, а не только когда всё
+    # остальное пусто.
+    doc = Document()
+    doc.add_paragraph("Первое: термин встречается тут.")
+    doc.add_paragraph("Второе предложение без искомого слова.")
+    doc.add_paragraph("Третье: термин встречается снова тут.")
+    doc.add_paragraph("Четвёртое: термин встречается и здесь тоже.")
+    idx = index(doc)
+
+    seen_fragments = []
+
+    def fake_navigator(outline_text, request):
+        # Навигатор нашёл только ОДИН случай (p0) — как измерено на живом Навигаторе.
+        return {"kind": "local", "rule": None, "ids": ["p0"], "anchors": []}
+
+    def fake_editor(fragment_text, request, feedback=None):
+        seen_fragments.append(fragment_text)
+        return {"ops": []}
+
+    request = "Замени везде «термин встречается» на другую формулировку."
+    run_edit(doc, idx, request, navigator=fake_navigator, editor=fake_editor)
+
+    assert seen_fragments, "Редактор обязан быть вызван"
+    fragment_text = seen_fragments[0]
+    assert "p0" in fragment_text, fragment_text
+    assert "p2" in fragment_text, fragment_text
+    assert "p3" in fragment_text, fragment_text
+    print("edit_demo: дословная цитата в «ёлочках» слита с id Навигатора, все 3 случая дошли до фрагмента Редактора")
+
+
+def test_checker_exception_restores_document_and_cleans_snapshot():
+    # Ф8 item D: если Проверяющий падает (оборвался транспорт), патч уже
+    # применён к живому doc, снимок ещё жив. Исключение обязано долететь
+    # наружу ГРОМКО (инвариант 6), но doc обязан вернуться к состоянию ДО
+    # правки — ТОЙ ЖЕ ссылкой, потому что вызывающий не получает новую пару
+    # (result, doc, idx) через return (управление уходит через raise), а
+    # снимок обязан быть удалён, а не течь во временные файлы.
+    doc = Document()
+    doc.add_paragraph("Оригинальный текст абзаца до правки.")
+    idx = index(doc)
+    before = [b["text"] for b in doc_map(doc, idx)]
+
+    def fake_navigator(outline_text, request):
+        return {"kind": "local", "rule": None, "ids": ["p0"], "anchors": []}
+
+    def fake_editor(fragment_text, request, feedback=None):
+        return {"ops": [{"op": "replace_text", "id": "p0", "old": "Оригинальный", "new": "Изменённый"}]}
+
+    def fake_checker(request, diff):
+        raise RuntimeError("обрыв транспорта на проверке (тест)")
+
+    captured = {}
+    real_snapshot = edit_mod._snapshot
+
+    def spy_snapshot(d):
+        path = real_snapshot(d)
+        captured["path"] = path
+        return path
+
+    edit_mod._snapshot = spy_snapshot
+    try:
+        raised = False
+        try:
+            run_edit(
+                doc, idx, "замени 'Оригинальный' на 'Изменённый'",
+                navigator=fake_navigator, editor=fake_editor, checker=fake_checker,
+            )
+        except RuntimeError:
+            raised = True
+    finally:
+        edit_mod._snapshot = real_snapshot
+
+    assert raised, "исключение Проверяющего обязано долететь наружу, а не проглотиться"
+    assert "path" in captured, "снимок обязан был создаваться (ops успели примениться)"
+    assert not os.path.exists(captured["path"]), "снимок обязан быть удалён даже при исключении, а не течь"
+
+    after = [b["text"] for b in doc_map(doc, idx)]
+    assert after == before, "doc (та же ссылка) обязан вернуться к состоянию ДО правки"
+    print("edit_demo: исключение Проверяющего долетает наружу, doc восстановлен на месте, снимок не течёт")
+
+
 def test_live_edit_12():
     # Единственный живой вызов модели во всём демо (см. CLAUDE.md — экономить
     # вызовы не обязательно, но лишний живой вызов делает прогон медленнее и
@@ -229,4 +378,8 @@ if __name__ == "__main__":
     test_resolve_normalizes_integer_id()
     test_ellipsis_truncation_retries_to_full_text()
     test_check_diff_carries_lengths()
+    test_rule_no_op_yields_already()
+    test_non_rule_empty_diff_stays_failed()
+    test_quoted_phrase_always_merges_with_navigator_hit()
+    test_checker_exception_restores_document_and_cleans_snapshot()
     test_live_edit_12()
