@@ -1,4 +1,4 @@
-"""FastAPI-сервер: загрузка .docx, правка запросом (пока заглушка), скачивание."""
+"""FastAPI-сервер: загрузка .docx, правка запросом (полный цикл edit.run_edit), скачивание."""
 
 import json
 import time
@@ -9,6 +9,8 @@ from docx import Document
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 
+from docx_editor import edit as edit_mod
+from docx_editor.llm import _env
 from docx_editor.parse import doc_map, index
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -42,17 +44,48 @@ async def upload(file: UploadFile = File(...)):
 
 @app.post("/edit")
 async def edit(prompt: str = Form(...), session: str = Form(...)):
-    """Правка поверх out/{session}.docx. Ф1: заглушка — planning, затем пустой result."""
-    _session_path(session)  # проверка, что сессия существует
+    """Правка поверх out/{session}.docx: запрос делится на атомарные правки
+    (edit.split), каждая проходит полный цикл edit.run_edit по очереди —
+    правки видят результат предыдущих (см. BUILD_PLAN: без параллельного
+    исполнения). Итог сохраняется на диск, чтобы /preview и /download
+    отдавали то, что реально получилось."""
+    path = _session_path(session)
+    doc = Document(str(path))
+    idx = index(doc)
+    tasks = edit_mod.split(prompt)
+    model = _env()["LLM_MODEL"]
 
     def stream():
-        started = time.perf_counter()
+        nonlocal doc, idx
+        started = prev = time.perf_counter()
         yield json.dumps({"type": "planning"}) + "\n"
+
+        done, failed = [], []
+        for task_n, task in enumerate(tasks, start=1):
+            result, doc, idx = edit_mod.run_edit(doc, idx, task)
+            doc.save(str(path))  # сразу после правки — файл и событие не должны расходиться
+            now = time.perf_counter()
+            text = "; ".join(result["applied"]) if result["verdict"] == "done" else result["reason"]
+            (done if result["verdict"] == "done" else failed).append(text)
+            yield json.dumps({
+                "type": "op",
+                "status": "done" if result["verdict"] == "done" else "failed",
+                "text": text,
+                "task": task_n,
+                "task_text": task,
+                "model": model,
+                "at": round((now - started) * 1000),
+                "dt": round((now - prev) * 1000),
+                "verdict": result["verdict"],
+                "blocks": doc_map(doc, idx),
+            }) + "\n"
+            prev = now
+
         yield json.dumps({
             "type": "result",
             "session": session,
-            "done": [],
-            "failed": [],
+            "done": done,
+            "failed": failed,
             "at": round((time.perf_counter() - started) * 1000),
         }) + "\n"
 
