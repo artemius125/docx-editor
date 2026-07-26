@@ -1,8 +1,8 @@
-"""Валидация патча (до применения) и применение девяти операций к живому документу.
+"""Валидация патча (до применения) и применение десяти операций к живому документу.
 
-Патч — список операций из контракта BUILD_PLAN.md (кроме normalize, она в Ф3):
-replace_text, set_text, insert_after, delete, move_after, set_style,
-create_table, set_cell, replace_all.
+Патч — список операций из контракта BUILD_PLAN.md: replace_text, set_text,
+insert_after, delete, move_after, set_style, create_table, set_cell, normalize,
+replace_all.
 """
 
 from docx.enum.style import WD_STYLE_TYPE
@@ -13,9 +13,10 @@ from docx.text.paragraph import Paragraph
 
 _OPS = {
     "replace_text", "set_text", "insert_after", "delete", "move_after",
-    "set_style", "create_table", "set_cell", "replace_all",
+    "set_style", "create_table", "set_cell", "normalize", "replace_all",
 }
 _PARAGRAPH_ONLY = {"replace_text", "set_text", "set_style"}
+_NORMALIZE_RULES = {"typography", "quotes"}
 
 
 def _by_id(blocks):
@@ -112,6 +113,11 @@ def validate(blocks, op, doc):
         err = _style_error(op.get("style"), doc)
         if err:
             return err
+
+    if name == "normalize":
+        rule = op.get("rule")
+        if rule not in _NORMALIZE_RULES:
+            return f"неизвестное правило {rule!r}; допустимые: {sorted(_NORMALIZE_RULES)}"
 
     return None
 
@@ -283,6 +289,14 @@ def _op_replace_all(doc, idx, op):
     return f"Заменено {total} вхождений «{old}» на «{new}» в {blocks_touched} блоках (включая ячейки таблиц)"
 
 
+def _op_normalize(doc, idx, op):
+    # Ленивый импорт: rules.py импортирует _ptext/_replace_span из этого модуля,
+    # импорт на верхнем уровне создал бы цикл.
+    from docx_editor.rules import quotes, typography
+
+    return typography(doc) if op["rule"] == "typography" else quotes(doc)
+
+
 _HANDLERS = {
     "replace_text": _op_replace_text,
     "set_text": _op_set_text,
@@ -292,10 +306,11 @@ _HANDLERS = {
     "set_style": _op_set_style,
     "create_table": _op_create_table,
     "set_cell": _op_set_cell,
+    "normalize": _op_normalize,
     "replace_all": _op_replace_all,
 }
 
 
 def apply(doc, idx, op):
-    """Применяет одну из девяти операций (патч уже прошёл validate), возвращает описание."""
+    """Применяет одну из десяти операций (патч уже прошёл validate), возвращает описание."""
     return _HANDLERS[op["op"]](doc, idx, op)
