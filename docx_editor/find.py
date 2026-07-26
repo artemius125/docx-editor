@@ -1,0 +1,71 @@
+"""Детерминированный поиск по блокам документа: подстрока, regex, первое
+упоминание, компактное оглавление для Навигатора и фрагмент с соседями.
+
+Индекс заранее не строим — документ 35 тыс. знаков, линейного прохода
+достаточно (см. BUILD_PLAN: эмбеддинги и BM25 сознательно не нужны).
+"""
+
+import re
+
+_PREFIX = 20
+
+
+def _texts(block):
+    """Текстовые поля блока, по которым ищем: текст абзаца или все ячейки таблицы."""
+    if block["kind"] == "p":
+        return [block["text"]]
+    return [cell for row in block["rows"] for cell in row]
+
+
+def by_text(blocks, needle):
+    """id блоков в порядке документа, где needle встречается как подстрока
+    (с учётом ячеек таблиц, регистр важен — как в patch._op_replace_all)."""
+    return [b["id"] for b in blocks if any(needle in t for t in _texts(b))]
+
+
+def by_regex(blocks, pattern):
+    """То же самое, но needle — регулярное выражение (строка или re.Pattern)."""
+    rx = re.compile(pattern)
+    return [b["id"] for b in blocks if any(rx.search(t) for t in _texts(b))]
+
+
+def first_mention(blocks, term):
+    """Первый по порядку документа блок с term, или None. Основа для «расшифруй
+    при первом упоминании» (правка 14 из приёмочного списка)."""
+    hits = by_text(blocks, term)
+    return hits[0] if hits else None
+
+
+def outline(blocks):
+    """Компактная карта документа — единственное, что видит Навигатор.
+
+    Заголовочные стили (Heading*/Title) — текст целиком, их мало и они
+    короткие. Остальное — id и обрезанный префикс текста: в приёмочном
+    документе заголовков нет вовсе (все 116 абзацев стилем Normal), и без
+    сжатого превью обычных абзацев оглавление было бы пустым и бесполезным
+    именно на нём.
+    """
+    lines = []
+    for b in blocks:
+        if b["kind"] == "t":
+            ncols = len(b["rows"][0]) if b["rows"] else 0
+            lines.append(f'{b["id"]} [table {len(b["rows"])}x{ncols}]')
+            continue
+        style, text = b["style"], b["text"]
+        if style.startswith("Heading") or style == "Title":
+            lines.append(f'{b["id"]} [{style}] {text}')
+        else:
+            prefix = text[:_PREFIX] + "…" if len(text) > _PREFIX else text
+            lines.append(f'{b["id"]} {prefix}')
+    return "\n".join(lines)
+
+
+def fragment(blocks, ids, around=1):
+    """Найденные блоки плюс around соседей с каждой стороны, в порядке
+    документа, без дублей при пересекающихся диапазонах."""
+    ids = set(ids)
+    wanted = set()
+    for i, b in enumerate(blocks):
+        if b["id"] in ids:
+            wanted.update(range(max(0, i - around), min(len(blocks), i + around + 1)))
+    return [blocks[i] for i in sorted(wanted)]
