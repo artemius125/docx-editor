@@ -41,6 +41,30 @@ def _style_error(style, doc):
     return f"стиль {style!r} не найден; доступны стили абзацев: {', '.join(names)}"
 
 
+_ELLIPSIS = ("…", "...")
+
+
+def _ends_with_ellipsis(text):
+    return (text or "").rstrip().endswith(_ELLIPSIS)
+
+
+def _ellipsis_truncation(old_text, new_text):
+    """True — new/text обрывается многоточием, а исходный текст им не
+    оканчивался: похоже на обрезанный хвост абзаца, выданный за полный текст
+    (находка Ф8 — модель укоротила абзац 456→332 знака, дописав «…»,
+    и Проверяющий это пропустил, потому что смысловая правка была на месте)."""
+    return _ends_with_ellipsis(new_text) and not _ends_with_ellipsis(old_text)
+
+
+def _ellipsis_error(block_id):
+    return (
+        f"{block_id}: текст обрывается многоточием («…» или «...»), хотя исходный текст "
+        f"им не оканчивался — похоже, конец абзаца потерян при сокращении. Пришли текст "
+        f"ЦЕЛИКОМ, без обрезания хвоста; многоточие в конце допустимо только тогда, когда "
+        f"оно было в исходном тексте."
+    )
+
+
 def validate(blocks, op, doc):
     """None — патч валиден; иначе русский текст ошибки для повторной попытки модели.
 
@@ -62,6 +86,9 @@ def validate(blocks, op, doc):
             return f"блок {block_id!r} не найден в документе"
         if name in _PARAGRAPH_ONLY and by_id[block_id]["kind"] != "p":
             return f"{block_id} — это таблица, {name} работает только с абзацами"
+
+    if name == "set_text" and _ellipsis_truncation(by_id[block_id]["text"], op.get("text")):
+        return _ellipsis_error(block_id)
 
     if name == "insert_after" and op.get("style"):
         err = _style_error(op["style"], doc)
@@ -104,6 +131,8 @@ def validate(blocks, op, doc):
         if name == "replace_text":
             if flex_find(by_id[op["id"]]["text"], old) == -1:
                 return f"в {op['id']} нет текста «{old}»"
+            if _ellipsis_truncation(old, new):
+                return _ellipsis_error(op["id"])
         else:
             found = any(b["kind"] == "p" and flex_find(b["text"], old) != -1 for b in blocks) or any(
                 b["kind"] == "t" and any(flex_find(c, old) != -1 for c in _table_texts(b)) for b in blocks

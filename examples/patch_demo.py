@@ -192,6 +192,41 @@ def test_replace_text_tolerates_nbsp():
     print("patch_demo: replace_text находит и корректно режет спан сквозь U+00A0")
 
 
+def test_set_text_rejects_ellipsis_truncation():
+    # Находка Ф8: живой Редактор ответил set_text, укоротив абзац 456→332
+    # знака и оборвав его буквальным «…» — смысловая правка была на месте,
+    # поэтому Проверяющий сказал ok, а машинная проверка "текст изменился"
+    # такое по устройству не ловит. validate обязан отбить это ДО применения.
+    doc = _build()
+    idx = index(doc)
+    blocks = doc_map(doc, idx)
+
+    bad = {"op": "set_text", "id": "p0", "text": "Первый…"}
+    err = validate(blocks, bad, doc)
+    assert isinstance(err, str) and err, "обрезанный set_text с многоточием обязан быть отбит"
+    assert "p0" in err, err
+
+    # многоточие тремя точками — тот же случай
+    bad_dots = {"op": "set_text", "id": "p0", "text": "Первый..."}
+    assert isinstance(validate(blocks, bad_dots, doc), str)
+
+    # replace_text — та же защита, new короче old и обрывается многоточием
+    bad_rt = {"op": "replace_text", "id": "p3", "old": "Срок 30 дней истекает.", "new": "Срок 30…"}
+    assert isinstance(validate(blocks, bad_rt, doc), str)
+
+    # легитимный случай: исходный текст УЖЕ оканчивается многоточием —
+    # запрет не должен срабатывать на нём (в приёмочном документе таких
+    # абзацев 0, но правило не должно бить по ним, если появятся)
+    doc2 = Document()
+    doc2.add_paragraph("Абзац с оборванной мыслью…")
+    idx2 = index(doc2)
+    blocks2 = doc_map(doc2, idx2)
+    legit = {"op": "set_text", "id": "p0", "text": "Абзац с другой оборванной мыслью…"}
+    assert validate(blocks2, legit, doc2) is None, validate(blocks2, legit, doc2)
+
+    print("patch_demo: обрезание абзаца с многоточием в конце отбито, легитимное многоточие пропущено")
+
+
 if __name__ == "__main__":
     test_ops()
     test_invalid()
@@ -199,3 +234,4 @@ if __name__ == "__main__":
     test_create_table_has_borders()
     test_real_doc_style_error()
     test_replace_text_tolerates_nbsp()
+    test_set_text_rejects_ellipsis_truncation()

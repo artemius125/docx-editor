@@ -110,6 +110,77 @@ def test_resolve_normalizes_integer_id():
     print("edit_demo: целочисленный id от Навигатора (0) нормализован в p0 и резолвится")
 
 
+def test_ellipsis_truncation_retries_to_full_text():
+    # Фикстура реального провала приёмки (Ф8, правка 18/p35): живой Редактор
+    # ответил set_text, укоротив абзац и оборвав его буквальным «…» —
+    # смысловая правка была на месте, поэтому Проверяющий сказал ok, а
+    # машинная сверка "текст изменился" такое по устройству не ловит.
+    # validate (Layer 1) обязан отбить обрезанный ответ ДО применения и
+    # вернуть Редактору текст ошибки; получив обратную связь, Редактор
+    # обязан прислать текст ЦЕЛИКОМ — и цикл обязан ПРОЙТИ ретраем, а не
+    # просто честно отказать.
+    doc = Document()
+    original = "Первое предложение абзаца. Второе предложение абзаца, длиннее первого для правдоподобия."
+    doc.add_paragraph(original)
+    idx = index(doc)
+
+    truncated = "Первое предложение абзаца. Второе предложение…"
+    full = "Первое предложение абзаца полностью исправлено. Второе предложение абзаца, длиннее первого для правдоподобия."
+
+    feedbacks = []
+
+    def fake_navigator(outline_text, request):
+        return {"kind": "local", "rule": None, "ids": ["p0"], "anchors": []}
+
+    def fake_editor(fragment_text, request, feedback=None):
+        feedbacks.append(feedback)
+        if feedback is None:
+            return {"ops": [{"op": "set_text", "id": "p0", "text": truncated}]}
+        return {"ops": [{"op": "set_text", "id": "p0", "text": full}]}
+
+    def fake_checker(request, diff):
+        return {"ok": True, "reason": "ok"}
+
+    result, doc, idx = run_edit(
+        doc, idx, "исправь первое предложение",
+        navigator=fake_navigator, editor=fake_editor, checker=fake_checker,
+    )
+
+    assert result["verdict"] == "done", result
+    assert result["iter"] == 2, "guard обязан отбить первый ответ и провести настоящий ретрай, а не убить правку"
+    after_text = next(b["text"] for b in doc_map(doc, idx) if b["id"] == "p0")
+    assert after_text == full, after_text
+    assert not after_text.rstrip().endswith(("…", "...")), "результат не должен обрываться многоточием"
+    assert len(after_text) >= len(original), "текст не должен схлопнуться короче исходного"
+    assert len(feedbacks) == 2 and feedbacks[0] is None and feedbacks[1], \
+        "второй вызов редактора обязан нести текст ошибки валидатора"
+    print(f"edit_demo: обрезанный set_text отбит validate, ретрай дал полный текст, iter={result['iter']}")
+
+
+def test_check_diff_carries_lengths():
+    # Layer 2 (Ф8): _check обязан показывать Проверяющему длины "было"/"стало",
+    # иначе числовой сигнал "текст вдвое короче" молча сгниёт при рефакторинге.
+    from docx_editor.edit import _check
+
+    seen = {}
+
+    def fake_llm_chat(messages):
+        seen["user"] = messages[1]["content"]
+        return {"ok": True, "reason": "ok"}
+
+    import docx_editor.llm as llm_module
+    real_chat = llm_module.chat
+    llm_module.chat = fake_llm_chat
+    try:
+        diff = [{"id": "p35", "before": "а" * 456, "after": "б" * 332}]
+        _check("правка", diff)
+    finally:
+        llm_module.chat = real_chat
+
+    assert "456" in seen["user"] and "332" in seen["user"], seen["user"]
+    print("edit_demo: diff, отдаваемый Проверяющему, несёт длины было/стало")
+
+
 def test_live_edit_12():
     # Единственный живой вызов модели во всём демо (см. CLAUDE.md — экономить
     # вызовы не обязательно, но лишний живой вызов делает прогон медленнее и
@@ -156,4 +227,6 @@ if __name__ == "__main__":
     test_fallback_search_then_honest_refusal()
     test_rollback_on_checker_reject()
     test_resolve_normalizes_integer_id()
+    test_ellipsis_truncation_retries_to_full_text()
+    test_check_diff_carries_lengths()
     test_live_edit_12()
