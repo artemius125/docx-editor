@@ -258,6 +258,7 @@
   .msg-ops li { overflow-wrap: anywhere; }
   .msg-ops li.done { color: var(--success); }
   .msg-ops li.failed { color: var(--danger); }
+  .msg-ops li.rolled { color: var(--muted-text); }
   .msg-ops li .op-meta {
     color: var(--muted-text);
     font-family: ui-monospace, Menlo, Consolas, monospace;
@@ -522,10 +523,11 @@ function statusLine(msg) {
 }
 
 function renderOpLine(o) {
-  const cls = o.status === "failed" ? "failed" : "done";
+  const cls = o.verdict === "rolled_back" ? "rolled" : (o.status === "failed" ? "failed" : "done");
   const taskParts = [];
   if (o.task !== undefined) taskParts.push(`№${o.task}`);
   if (o.model === "fallback") taskParts.push("резерв");
+  if (o.verdict === "rolled_back") taskParts.push("откат");
   const taskMeta = taskParts.length ? `<span class="op-meta">${taskParts.join(" · ")}</span>` : "";
   if (debugMode) {
     const metaParts = [];
@@ -547,7 +549,9 @@ function renderAgentMsg(msg) {
     : "";
   let summaryHtml = "";
   if (msg.status === "done" && msg.result) {
-    summaryHtml = `<div class="msg-summary">Готово: сделано ${msg.result.done}, не удалось ${msg.result.failed}.</div>`;
+    const r = msg.result;
+    const rolledPart = r.rolledBack ? `, откачено проверкой ${r.rolledBack}` : "";
+    summaryHtml = `<div class="msg-summary">Готово: сделано ${r.done}, не удалось ${r.failed}${rolledPart}.</div>`;
   }
   return `<div class="msg agent">${statusHtml}${opsHtml}${summaryHtml}</div>`;
 }
@@ -668,7 +672,7 @@ async function consumeEdit(res, agentMsg) {
         renderChatHistory();
       } else if (evt.type === "op") {
         agentMsg.status = "working";
-        agentMsg.ops.push({ status: evt.status, op: evt.op, text: evt.text, at: evt.at, dt: evt.dt, task: evt.task, model: evt.model });
+        agentMsg.ops.push({ status: evt.status, op: evt.op, text: evt.text, at: evt.at, dt: evt.dt, task: evt.task, model: evt.model, verdict: evt.verdict });
         applyPaperUpdate(evt.blocks);
         renderChatHistory();
         await new Promise(resolve => setTimeout(resolve, OP_PACE_MS));
@@ -680,7 +684,10 @@ async function consumeEdit(res, agentMsg) {
         const shown = new Set(agentMsg.ops.map(o => o.text));
         for (const t of evt.done) if (!shown.has(t)) agentMsg.ops.push({ status: "done", op: null, text: t });
         for (const t of evt.failed) if (!shown.has(t)) agentMsg.ops.push({ status: "failed", op: null, text: t });
-        agentMsg.result = { done: evt.done.length, failed: evt.failed.length };
+        // rolled_back тоже попадает в evt.failed на сервере (см. server.py) —
+        // выделяем его отдельно, чтобы откат Проверяющего не читался как провал.
+        const rolledBack = agentMsg.ops.filter(o => o.verdict === "rolled_back").length;
+        agentMsg.result = { done: evt.done.length, failed: evt.failed.length - rolledBack, rolledBack };
         renderChatHistory();
         refreshJournal();
       }
