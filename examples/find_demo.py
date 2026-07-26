@@ -80,6 +80,15 @@ def test_by_regex():
     print("find_demo: by_regex находит десятичные числа")
 
 
+def test_by_text_tolerates_nbsp():
+    # p31 в реальном документе: "Оператор\xa0$\top$\xa0представляет..." — цитата
+    # обычными пробелами не матчится как подстрока (61 из 116 абзацев содержат
+    # U+00A0 посреди предложения, 147 вхождений всего), но by_text обязан её найти
+    blocks = _load()
+    assert "p31" in find.by_text(blocks, "Оператор $\\top$ представляет")
+    print("find_demo: by_text находит цитату сквозь U+00A0 в середине предложения")
+
+
 def test_outline_is_compact_and_valid():
     blocks = _load()
     o = find.outline(blocks)
@@ -104,5 +113,6 @@ if __name__ == "__main__":
     test_anchors_hit_every_edit()
     test_first_mention_picks_earliest()
     test_by_regex()
+    test_by_text_tolerates_nbsp()
     test_outline_is_compact_and_valid()
     test_fragment_dedupes_overlap()

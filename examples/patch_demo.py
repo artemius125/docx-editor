@@ -165,9 +165,37 @@ def test_real_doc_style_error():
     print("patch_demo: set_style(List Bullet) на реальном документе честно отказан")
 
 
+def test_replace_text_tolerates_nbsp():
+    # документ реально содержит U+00A0 посреди предложений (находка Ф4: 61 из
+    # 116 абзацев, 147 вхождений), а цитата в патче от модели набрана обычным
+    # пробелом. old написан обычным пробелом, в абзаце — U+00A0.
+    doc = Document()
+    doc.add_paragraph("слово\xa0слово синее небо.")
+    idx = index(doc)
+    blocks = doc_map(doc, idx)
+
+    op = {"op": "replace_text", "id": "p0", "old": "слово слово", "new": "два слова"}
+    assert validate(blocks, op, doc) is None
+    apply(doc, idx, op)
+    blocks = doc_map(doc, idx)
+    # результат целиком, не только начало: неверный end() обрежет или откусит
+    # лишнее от хвоста абзаца — падать должно громко, а не тихо на префиксе
+    assert blocks[0]["text"] == "два слова синее небо.", blocks[0]["text"]
+
+    # точное совпадение (быстрый путь) не сломано
+    op2 = {"op": "replace_text", "id": "p0", "old": "синее небо", "new": "ясное небо"}
+    assert validate(blocks, op2, doc) is None
+    apply(doc, idx, op2)
+    blocks = doc_map(doc, idx)
+    assert blocks[0]["text"] == "два слова ясное небо.", blocks[0]["text"]
+
+    print("patch_demo: replace_text находит и корректно режет спан сквозь U+00A0")
+
+
 if __name__ == "__main__":
     test_ops()
     test_invalid()
     test_hyperlink()
     test_create_table_has_borders()
     test_real_doc_style_error()
+    test_replace_text_tolerates_nbsp()

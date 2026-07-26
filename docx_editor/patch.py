@@ -11,6 +11,8 @@ from docx.oxml.ns import qn
 from docx.table import Table
 from docx.text.paragraph import Paragraph
 
+from docx_editor.find import _flex_span, flex_find
+
 _OPS = {
     "replace_text", "set_text", "insert_after", "delete", "move_after",
     "set_style", "create_table", "set_cell", "normalize", "replace_all",
@@ -100,11 +102,11 @@ def validate(blocks, op, doc):
         if old == new:
             return f"old и new совпадают («{old}») — пустая операция, нечего менять"
         if name == "replace_text":
-            if old not in by_id[op["id"]]["text"]:
+            if flex_find(by_id[op["id"]]["text"], old) == -1:
                 return f"в {op['id']} нет текста «{old}»"
         else:
-            found = any(b["kind"] == "p" and old in b["text"] for b in blocks) or any(
-                b["kind"] == "t" and any(old in c for c in _table_texts(b)) for b in blocks
+            found = any(b["kind"] == "p" and flex_find(b["text"], old) != -1 for b in blocks) or any(
+                b["kind"] == "t" and any(flex_find(c, old) != -1 for c in _table_texts(b)) for b in blocks
             )
             if not found:
                 return f"текст «{old}» не найден нигде в документе"
@@ -187,12 +189,15 @@ def _register(idx, prefix, el):
 def _op_replace_text(doc, idx, op):
     el = idx[op["id"]]
     full = _ptext(el)
-    pos = full.find(op["old"])
-    if pos == -1:
+    span = _flex_span(full, op["old"])
+    if span is None:
         # validate должен был отсечь это раньше; если добрались сюда — громко падаем,
         # а не режем абзац по отрицательному смещению (см. находку про гиперссылки)
         raise ValueError(f"текст {op['old']!r} не найден в {op['id']} на момент применения")
-    _replace_span(el, pos, pos + len(op["old"]), op["new"])
+    # end берётся из реального совпадения (_flex_span), а не из len(op["old"]):
+    # из-за разночтений в пробелах (обычный ↔ U+00A0) найденный в документе
+    # фрагмент может быть длиннее или короче исходного needle
+    _replace_span(el, span[0], span[1], op["new"])
     return f"В {op['id']} заменено «{op['old']}» на «{op['new']}»"
 
 
@@ -275,15 +280,15 @@ def _op_replace_all(doc, idx, op):
         full = _ptext(p_el)
         matches, pos = [], 0
         while True:
-            i = full.find(old, pos)
-            if i == -1:
+            span = _flex_span(full[pos:], old)
+            if span is None:
                 break
-            matches.append(i)
-            pos = i + len(old)
+            matches.append((pos + span[0], pos + span[1]))
+            pos += span[1]
         if not matches:
             continue
-        for m_start in reversed(matches):
-            _replace_span(p_el, m_start, m_start + len(old), new)
+        for m_start, m_end in reversed(matches):
+            _replace_span(p_el, m_start, m_end, new)
         total += len(matches)
         blocks_touched += 1
     return f"Заменено {total} вхождений «{old}» на «{new}» в {blocks_touched} блоках (включая ячейки таблиц)"

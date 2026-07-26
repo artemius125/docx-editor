@@ -17,10 +17,41 @@ def _texts(block):
     return [cell for row in block["rows"] for cell in row]
 
 
+def _flex_span(haystack, needle):
+    """(start, end) реального совпадения needle в haystack, или None.
+
+    Сначала точный str.find (точные совпадения матчатся как раньше, без
+    изменений). Документ пестрит U+00A0 не только перед пунктуацией (см.
+    находку Ф3), а вообще между случайными словами середины предложения —
+    61 из 116 абзацев, 147 вхождений. Цитата в правке или в ответе модели
+    набрана обычными пробелами и как подстрока не находится. Поэтому если
+    точный поиск промахнулся, needle режется по пробельным разрывам и
+    собирается в regex, где любой их пробельный разрыв (обычный пробел,
+    U+00A0, таб, перевод строки — всё это `\\s`) матчится с любым другим.
+    end берётся из реального совпадения, а не из len(needle): пробельный
+    разрыв может быть длиннее или короче исходного.
+    """
+    pos = haystack.find(needle)
+    if pos != -1:
+        return pos, pos + len(needle)
+    parts = [re.escape(p) for p in re.split(r"\s+", needle) if p]
+    if not parts:
+        return None
+    m = re.search(r"\s+".join(parts), haystack)
+    return (m.start(), m.end()) if m else None
+
+
+def flex_find(haystack, needle):
+    """Индекс needle в haystack с учётом пробельных различий, или -1."""
+    span = _flex_span(haystack, needle)
+    return span[0] if span else -1
+
+
 def by_text(blocks, needle):
     """id блоков в порядке документа, где needle встречается как подстрока
-    (с учётом ячеек таблиц, регистр важен — как в patch._op_replace_all)."""
-    return [b["id"] for b in blocks if any(needle in t for t in _texts(b))]
+    (с учётом ячеек таблиц и пробельных различий, регистр важен — как в
+    patch._op_replace_all)."""
+    return [b["id"] for b in blocks if any(flex_find(t, needle) != -1 for t in _texts(b))]
 
 
 def by_regex(blocks, pattern):
