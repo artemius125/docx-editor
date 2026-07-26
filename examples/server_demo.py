@@ -42,9 +42,15 @@ PROMPT_CRASH = (
     f"2. Правка, которая {CRASH_MARKER} (тест громких ошибок)."
 )
 
+# Правка 3 (отдельная сессия) — Редактор сначала предлагает "old", которого
+# в блоке p7 нет (проваливает validate), затем, получив фидбэк, отвечает
+# правильно — проверяет, что журнал честно пишет iter=2 (а не декоративную 1).
+RETRY_MARKER = "запуск с ретраем редактора"
+
 _REQUIRED_OP_FIELDS = {
     "type", "status", "text", "task", "task_text", "model", "at", "dt", "blocks", "verdict",
 }
+_JOURNAL_FIELDS = {"task", "task_text", "model", "iter", "verdict", "reason", "ids", "reply"}
 
 
 def _fake_chat(messages):
@@ -56,6 +62,12 @@ def _fake_chat(messages):
             raise RuntimeError("сбой навигатора (тест громких ошибок)")
         return {"kind": "local", "rule": None, "ids": ["p999"], "anchors": ["текст, которого точно нет"]}
     if "редактор" in system:
+        if "не прошла проверку" in user:
+            # ретрай после фидбэка о невалидной операции — исправленный, валидный ответ
+            return {"ops": [{"op": "replace_text", "id": "p7", "old": OLD_TEXT, "new": NEW_TEXT}]}
+        if RETRY_MARKER in user:
+            # первый ответ Редактора нарочно невалиден: такого "old" в p7 нет
+            return {"ops": [{"op": "replace_text", "id": "p7", "old": "текст, которого нет в блоке p7", "new": NEW_TEXT}]}
         return {"ops": [{"op": "replace_text", "id": "p7", "old": OLD_TEXT, "new": NEW_TEXT}]}
     if "проверяющий" in system:
         return {"ok": True, "reason": "текст заменён корректно"}
@@ -112,7 +124,22 @@ def main():
     assert result["done"] == [done_evt["text"]]
     assert result["failed"] == [failed_evt["text"]]
 
-    assert client.get("/logs").json() == []
+    # Журнал (docx_editor/log.py): одна запись на правку, тем же порядком и
+    # с тем же вердиктом, что уже проверен по событиям потока.
+    records = client.get(f"/logs?session={session}").json()
+    assert len(records) == 2, records
+    assert [r["task"] for r in records] == [1, 2], records
+    assert records[0]["verdict"] == done_evt["verdict"], records[0]
+    assert records[1]["verdict"] == failed_evt["verdict"], records[1]
+    assert records[1]["reason"], "у отказа в журнале должна быть непустая причина"
+    for r in records:
+        assert _JOURNAL_FIELDS <= r.keys(), r.keys()
+
+    # reply — разобранный JSON-ответ ролей, сериализованный в строку: у done
+    # виден реальный ответ Редактора (что он предложил), у failed Навигатор
+    # промахнулся и Редактора вообще не звали ("editor": null, а не {}).
+    assert NEW_TEXT in records[0]["reply"], records[0]["reply"]
+    assert '"editor": null' in records[1]["reply"], records[1]["reply"]
 
     dl = client.get(f"/download/{session}")
     assert dl.status_code == 200
@@ -124,13 +151,18 @@ def main():
         assert NEW_TEXT in doc.paragraphs[7].text, "правка не дошла до файла на диске"
 
     print("server_demo: ok")
+    return session
 
 
-def test_crash_does_not_lose_saved_progress():
+def test_crash_does_not_lose_saved_progress(main_session=None):
     """Правка 2 роняет Навигатора. Инвариант 6 — падение обязано долететь
     наружу, а не превратиться в тихий result. Инвариант 5 — правка 1 к этому
     моменту уже сохранена на диск (save внутри цикла, а не после него), так
-    что /download отдаёт файл С этой правкой, а не старую версию."""
+    что /download отдаёт файл С этой правкой, а не старую версию.
+
+    main_session (если передан) — сессия из main(), уже несущая 2 записи
+    журнала: используется, чтобы доказать, что session-фильтр в /logs
+    реально фильтрует, а не просто игнорирует параметр."""
     llm.chat = _fake_chat
     client = TestClient(app)
     with open(DOC, "rb") as f:
@@ -153,9 +185,54 @@ def test_crash_does_not_lose_saved_progress():
         doc = Document(tmp.name)
         assert NEW_TEXT in doc.paragraphs[7].text, "правка 1 обязана была сохраниться на диск до падения правки 2"
 
-    print("server_demo: падение внутри /edit долетает наружу, правка 1 уже на диске")
+    # Крэш-сессия получила ровно одну запись журнала (правка 1, done) — правка
+    # 2 упала внутри run_edit до того, как /edit успел её залогировать.
+    crash_logs = client.get(f"/logs?session={session}").json()
+    assert len(crash_logs) == 1, crash_logs
+    assert crash_logs[0]["verdict"] == "done", crash_logs[0]
+    assert all(r["session"] == session for r in crash_logs), crash_logs
+
+    if main_session is not None:
+        # Фильтрация по session реальна: запись крэш-сессии не утекла в хвост
+        # первой сессии (main()), и наоборот — обе сессии сосуществуют в одном
+        # общем out/log.jsonl к этому моменту.
+        main_logs = client.get(f"/logs?session={main_session}").json()
+        assert len(main_logs) == 2, main_logs
+        assert all(r["session"] == main_session for r in main_logs), main_logs
+        assert not any(CRASH_MARKER in r["task_text"] for r in main_logs), main_logs
+
+    print("server_demo: падение внутри /edit долетает наружу, правка 1 уже на диске, журнал фильтрует по сессии")
+
+
+def test_journal_iter_retry():
+    """Редактор ошибается с первого раза ("old" не найден в p7), _apply_ops
+    делает один ретрай с фидбэком, второй ответ уже валиден: правка проходит
+    (verdict=done), а журнал обязан честно отразить это как iter=2 — иначе
+    поле было бы декоративной константой."""
+    llm.chat = _fake_chat
+    client = TestClient(app)
+    with open(DOC, "rb") as f:
+        data = f.read()
+    files = {"file": ("doc.docx", io.BytesIO(data), "application/octet-stream")}
+    session = client.post("/upload", files=files).json()["session"]
+
+    prompt = f"1. Замени «{OLD_TEXT}» на «{NEW_TEXT}» ({RETRY_MARKER})."
+    edit = client.post("/edit", data={"prompt": prompt, "session": session})
+    assert edit.status_code == 200
+    events = [json.loads(line) for line in edit.text.splitlines() if line.strip()]
+    op_evt = next(e for e in events if e["type"] == "op")
+    assert op_evt["verdict"] == "done", op_evt
+
+    records = client.get(f"/logs?session={session}").json()
+    assert len(records) == 1, records
+    assert _JOURNAL_FIELDS <= records[0].keys(), records[0].keys()
+    assert records[0]["verdict"] == "done", records[0]
+    assert records[0]["iter"] == 2, records[0]
+
+    print("server_demo: ретрай Редактора отражён в журнале честно — iter=2")
 
 
 if __name__ == "__main__":
-    main()
-    test_crash_does_not_lose_saved_progress()
+    session_from_main = main()
+    test_crash_does_not_lose_saved_progress(session_from_main)
+    test_journal_iter_retry()

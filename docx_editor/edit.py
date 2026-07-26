@@ -113,12 +113,22 @@ def _dedupe(ids):
     return out
 
 
+def _normalize_id(raw):
+    """Приводит id от Навигатора к канонической форме блоков ("p12", "t3"):
+    модель то возвращает голое число (112 вместо "p112"), то путает регистр
+    префикса ("P112") — код, не промпт, отвечает за форму (находка Ф5, тот
+    же класс, что и id внутри цитаты якоря). Голое число получает префикс p,
+    иначе просто нижний регистр; итог сверяется с реальными id вызывающим."""
+    s = str(raw).strip()
+    return f"p{s}" if s.isdigit() else s.lower()
+
+
 def _resolve(blocks, nav, request):
     """id из Навигатора (провалидированные) + попадания по якорям → id блоков.
     Пусто — запасной поиск по дословным цитатам из текста правки (заказчик
     пишет их в «ёлочках»). Пусто и там — [] означает честный отказ выше."""
     real_ids = {b["id"] for b in blocks}
-    ids = [i for i in (nav.get("ids") or []) if i in real_ids]
+    ids = [n for n in (_normalize_id(i) for i in (nav.get("ids") or [])) if n in real_ids]
     for anchor in nav.get("anchors") or []:
         ids += find.by_text(blocks, _strip_anchor(anchor))
     if ids:
@@ -166,7 +176,9 @@ def _apply_ops(doc, idx, ops, fragment_text, request, editor):
     """Применяет ops по очереди; на невалидной операции — один ретрай к
     Редактору с текстом ошибки (editor=None — ретрая нет, путь rule). Второй
     провал (или провал без Редактора) останавливает применение немедленно.
-    Возвращает (описания применённых операций, причина отказа-или-None)."""
+    Возвращает (описания применённых операций, причина отказа-или-None,
+    tries) — tries=2, если к Редактору пришлось обращаться повторно
+    (для журнала правки, поле "iter"), иначе 1."""
     applied, retried, i = [], False, 0
     while i < len(ops):
         op = ops[i]
@@ -176,65 +188,79 @@ def _apply_ops(doc, idx, ops, fragment_text, request, editor):
             i += 1
             continue
         if retried or editor is None:
-            return applied, err
+            return applied, err, 2 if retried else 1
         retried = True
         feedback = f'Операция {op} не прошла проверку: {err}. Пришли исправленный {{"ops": [...]}}.'
         reply = editor(fragment_text, request, feedback=feedback) or {}
         ops = _clean_ops(reply.get("ops"))
         if not ops:
-            return applied, reply.get("note") or err
+            return applied, reply.get("note") or err, 2
         i = 0
-    return applied, None
+    return applied, None, 2 if retried else 1
 
 
-def _failed(reason):
-    return {"verdict": "failed", "reason": reason, "applied": [], "ids": []}
+def _failed(reason, nav=None, editor_reply=None, tries=1):
+    """reply/iter обязаны быть в каждой записи, включая честные отказы —
+    именно они интереснее всего в журнале для разбора «куда целился Навигатор»."""
+    return {
+        "verdict": "failed", "reason": reason, "applied": [], "ids": [],
+        "iter": tries, "reply": {"nav": nav, "editor": editor_reply},
+    }
 
 
 def run_edit(doc, idx, request, navigator=_navigate, editor=_edit_llm, checker=_check):
     """Один цикл правки. Возвращает (result, doc, idx) — после отката
     (verdict != "done" после применения) doc/idx уже перечитаны из снимка,
-    старые ссылки вызывающего использовать нельзя."""
+    старые ссылки вызывающего использовать нельзя.
+
+    result содержит "reply": {"nav": ..., "editor": ...} — РАЗОБРАННЫЙ JSON-
+    ответ ролей (llm.chat парсит его сам, сырое тело HTTP нигде не хранится),
+    "editor": None, когда Редактора не звали вообще (путь rule), а не {} —
+    это разные вещи для разбора; и "iter" — 1 или 2 (был ли ретрай Редактора
+    внутри _apply_ops), настоящее число попыток, а не декоративная константа."""
     blocks = doc_map(doc, idx)
     nav = navigator(find.outline(blocks), request) or {}
     rule = nav.get("rule")
 
     if rule:
         # Правки типа rule идут мимо Редактора — код нормализует сам, LLM не зовём.
-        ops, fragment_text, use_editor = [{"op": "normalize", "rule": rule}], "", None
+        ops, fragment_text, use_editor, editor_reply = [{"op": "normalize", "rule": rule}], "", None, None
     else:
         ids = _resolve(blocks, nav, request)
         if not ids:
             reason = "не нашёл, где это править: ни id и якоря Навигатора, ни дословные цитаты из текста правки не нашли места в документе"
-            return _failed(reason), doc, idx
+            return _failed(reason, nav), doc, idx
         fragment_text = render(find.fragment(blocks, ids, around=1))
-        reply = editor(fragment_text, request) or {}
-        ops = _clean_ops(reply.get("ops"))
+        editor_reply = editor(fragment_text, request) or {}
+        ops = _clean_ops(editor_reply.get("ops"))
         if not ops:
-            return _failed(reply.get("note") or "редактор не смог предложить операции для этой правки"), doc, idx
+            return _failed(editor_reply.get("note") or "редактор не смог предложить операции для этой правки", nav, editor_reply), doc, idx
         use_editor = editor
 
     snapshot_path = _snapshot(doc)
     blocks_before = doc_map(doc, idx)
-    applied, err = _apply_ops(doc, idx, ops, fragment_text, request, use_editor)
+    applied, err, tries = _apply_ops(doc, idx, ops, fragment_text, request, use_editor)
 
     if not applied:
         doc, idx = _restore(snapshot_path)
-        return _failed(err or "ни одна операция не применилась"), doc, idx
+        return _failed(err or "ни одна операция не применилась", nav, editor_reply, tries), doc, idx
 
     diff = _diff(blocks_before, doc_map(doc, idx))
     if not diff:
         doc, idx = _restore(snapshot_path)
-        return _failed("операции применились, но текст не изменился"), doc, idx
+        return _failed("операции применились, но текст не изменился", nav, editor_reply, tries), doc, idx
 
     verdict = checker(request, diff) or {}
     ids_touched = [d["id"] for d in diff]
+    reply = {"nav": nav, "editor": editor_reply}
     if verdict.get("ok"):
         os.remove(snapshot_path)
-        return {"verdict": "done", "reason": verdict.get("reason", ""), "applied": applied, "ids": ids_touched}, doc, idx
+        return {"verdict": "done", "reason": verdict.get("reason", ""), "applied": applied, "ids": ids_touched,
+                 "iter": tries, "reply": reply}, doc, idx
 
     doc, idx = _restore(snapshot_path)
-    return {"verdict": "rolled_back", "reason": verdict.get("reason", ""), "applied": applied, "ids": ids_touched}, doc, idx
+    return {"verdict": "rolled_back", "reason": verdict.get("reason", ""), "applied": applied, "ids": ids_touched,
+             "iter": tries, "reply": reply}, doc, idx
 
 
 _ITEM_MARKER = re.compile(r"^(?:\*\*(\d+)\.\*\*|(\d+)[.)]|[-*])\s+")

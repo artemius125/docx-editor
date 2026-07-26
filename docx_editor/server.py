@@ -10,6 +10,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 
 from docx_editor import edit as edit_mod
+from docx_editor import log
 from docx_editor.llm import _env
 from docx_editor.parse import doc_map, index
 
@@ -64,6 +65,18 @@ async def edit(prompt: str = Form(...), session: str = Form(...)):
         for task_n, task in enumerate(tasks, start=1):
             result, doc, idx = edit_mod.run_edit(doc, idx, task)
             doc.save(str(path))  # сразу после правки — файл и событие не должны расходиться
+            log.append(session, {
+                "task": task_n,
+                "task_text": task,
+                "model": model,
+                "iter": result["iter"],
+                "verdict": result["verdict"],
+                "reason": result["reason"],
+                "ids": result["ids"],
+                # renderLogRecord кладёт reply прямо в <pre> и ждёт строку —
+                # это РАЗОБРАННЫЙ JSON-ответ Навигатора/Редактора, не сырое тело HTTP.
+                "reply": json.dumps(result["reply"], ensure_ascii=False),
+            })
             now = time.perf_counter()
             text = "; ".join(result["applied"]) if result["verdict"] == "done" else result["reason"]
             (done if result["verdict"] == "done" else failed).append(text)
@@ -94,8 +107,8 @@ async def edit(prompt: str = Form(...), session: str = Form(...)):
 
 @app.get("/logs")
 def logs(session: str | None = None, n: int = 50):
-    """Журнал правок. Ф1: журнала ещё нет — пустой хвост."""
-    return []
+    """Хвост журнала правок (docx_editor/log.py), опционально по сессии."""
+    return log.tail(session, n)
 
 
 @app.get("/preview/{session}")
