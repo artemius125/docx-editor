@@ -6,6 +6,7 @@ create_table, set_cell, replace_all.
 """
 
 from docx.enum.style import WD_STYLE_TYPE
+from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.table import Table
 from docx.text.paragraph import Paragraph
@@ -23,6 +24,18 @@ def _by_id(blocks):
 
 def _table_texts(block):
     return [cell for row in block["rows"] for cell in row]
+
+
+def _paragraph_style_names(doc):
+    return [s.name for s in doc.styles if s.type == WD_STYLE_TYPE.PARAGRAPH]
+
+
+def _style_error(style, doc):
+    """None — стиль есть в документе; иначе текст ошибки со списком доступных."""
+    names = _paragraph_style_names(doc)
+    if style in names:
+        return None
+    return f"стиль {style!r} не найден; доступны стили абзацев: {', '.join(names)}"
 
 
 def validate(blocks, op, doc):
@@ -46,6 +59,11 @@ def validate(blocks, op, doc):
             return f"блок {block_id!r} не найден в документе"
         if name in _PARAGRAPH_ONLY and by_id[block_id]["kind"] != "p":
             return f"{block_id} — это таблица, {name} работает только с абзацами"
+
+    if name == "insert_after" and op.get("style"):
+        err = _style_error(op["style"], doc)
+        if err:
+            return err
 
     if name == "move_after":
         after = op.get("after")
@@ -91,17 +109,29 @@ def validate(blocks, op, doc):
                 return f"текст «{old}» не найден нигде в документе"
 
     if name == "set_style":
-        style = op.get("style")
-        names = [s.name for s in doc.styles if s.type == WD_STYLE_TYPE.PARAGRAPH]
-        if style not in names:
-            return f"стиль {style!r} не найден; доступны стили абзацев: {', '.join(names)}"
+        err = _style_error(op.get("style"), doc)
+        if err:
+            return err
 
     return None
 
 
+def _runs(p_el):
+    """Все раны абзаца в порядке документа, включая раны внутри w:hyperlink.
+
+    p_el.r_lst — это только раны верхнего уровня; текст гиперссылки в него
+    не попадает, а p.text (то, что видит validate и модель) гиперссылки
+    включает. Расхождение офсетов между _ptext и p.text — гарантированная
+    порча документа (find возвращает -1 или не то смещение). iter() обходит
+    поддерево в порядке документа, поэтому раны внутри w:hyperlink встают
+    на своё естественное место и офсеты снова совпадают с p.text.
+    """
+    return list(p_el.iter(qn("w:r")))
+
+
 def _ptext(p_el):
     """Текст абзаца, собранный ровно из тех же ранов, что и _replace_span."""
-    return "".join(r.text for r in p_el.r_lst)
+    return "".join(r.text for r in _runs(p_el))
 
 
 def _replace_span(p_el, start, end, new_text):
@@ -112,7 +142,9 @@ def _replace_span(p_el, start, end, new_text):
     границе, а раны целиком внутри диапазона стираются, чужие раны снаружи
     не трогаются вовсе.
     """
-    runs = p_el.r_lst
+    if start < 0 or end < start:
+        raise ValueError(f"недопустимый диапазон замены [{start}:{end})")
+    runs = _runs(p_el)
     if not runs:
         p_el.add_r().text = new_text
         return
@@ -150,6 +182,10 @@ def _op_replace_text(doc, idx, op):
     el = idx[op["id"]]
     full = _ptext(el)
     pos = full.find(op["old"])
+    if pos == -1:
+        # validate должен был отсечь это раньше; если добрались сюда — громко падаем,
+        # а не режем абзац по отрицательному смещению (см. находку про гиперссылки)
+        raise ValueError(f"текст {op['old']!r} не найден в {op['id']} на момент применения")
     _replace_span(el, pos, pos + len(op["old"]), op["new"])
     return f"В {op['id']} заменено «{op['old']}» на «{op['new']}»"
 
@@ -186,11 +222,27 @@ def _op_set_style(doc, idx, op):
     return f"Стиль {op['id']} изменён на {op['style']!r}"
 
 
+def _add_borders(tbl):
+    """Одиночные границы прямо в tblPr. В контракте create_table нет поля
+    style, а из именованных табличных стилей в документе часто есть только
+    Normal Table (без рамок) — рассчитывать на style="Table Grid" нельзя,
+    его может не быть (KeyError). Ставим границы всегда, без опций."""
+    borders = OxmlElement("w:tblBorders")
+    for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
+        el = OxmlElement(f"w:{edge}")
+        el.set(qn("w:val"), "single")
+        el.set(qn("w:sz"), "4")
+        el.set(qn("w:color"), "auto")
+        borders.append(el)
+    tbl.tblPr.append(borders)
+
+
 def _op_create_table(doc, idx, op):
     ref = idx[op["after"]]
     rows = op["rows"]
     ncols = len(rows[0])
     table = doc.add_table(rows=len(rows), cols=ncols)
+    _add_borders(table._tbl)
     for r, row_vals in enumerate(rows):
         for c, val in enumerate(row_vals):
             table.cell(r, c).text = val

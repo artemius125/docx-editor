@@ -1,6 +1,7 @@
 """Приёмка patch.py: девять операций на маленьком документе + валидатор невалидных патчей."""
 
 from docx import Document
+from docx.oxml.ns import qn
 
 from docx_editor.parse import doc_map, index
 from docx_editor.patch import apply, validate
@@ -101,6 +102,10 @@ def test_invalid():
     err = validate(blocks, {"op": "set_style", "id": "p0", "style": "НесуществующийСтиль"}, doc)
     assert isinstance(err, str) and "Normal" in err
 
+    # insert_after с несуществующим стилем — тот же класс ошибки, что и set_style
+    err_ins = validate(blocks, {"op": "insert_after", "id": "p0", "text": "x", "style": "НесуществующийСтиль"}, doc)
+    assert isinstance(err_ins, str) and "Normal" in err_ins
+
     apply(doc, idx, {"op": "create_table", "after": "p0", "rows": [["a", "b"]]})
     blocks = doc_map(doc, idx)
     table_id = [b["id"] for b in blocks if b["kind"] == "t"][0]
@@ -109,6 +114,43 @@ def test_invalid():
     assert validate(blocks, {"op": "replace_text", "id": "p0", "old": "Первый", "new": "Другой"}, doc) is None
 
     print("patch_demo: невалидные патчи отбиты валидатором")
+
+
+def test_hyperlink():
+    # текст гиперссылки лежит в w:hyperlink/w:r — не в r_lst абзаца верхнего
+    # уровня. p.text (то, что видит validate) его включает, поэтому apply
+    # обязан ходить по тем же ранам, иначе offset'ы разъезжаются и
+    # _replace_span молча портит абзац (см. находку в BUILD_PLAN).
+    doc = Document()
+    p = doc.add_paragraph("см. ")
+    hl = p._p.makeelement(qn("w:hyperlink"), {})
+    r = p._p.makeelement(qn("w:r"), {})
+    t = p._p.makeelement(qn("w:t"), {})
+    t.text = "документацию"
+    r.append(t)
+    hl.append(r)
+    p._p.append(hl)
+
+    idx = index(doc)
+    blocks = doc_map(doc, idx)
+    assert blocks[0]["text"] == "см. документацию"
+
+    op = {"op": "replace_text", "id": "p0", "old": "документацию", "new": "инструкцию"}
+    assert validate(blocks, op, doc) is None
+    apply(doc, idx, op)
+    blocks = doc_map(doc, idx)
+    assert blocks[0]["text"] == "см. инструкцию", blocks[0]["text"]
+
+    print("patch_demo: replace_text через w:hyperlink не портит абзац")
+
+
+def test_create_table_has_borders():
+    doc = _build()
+    idx = index(doc)
+    apply(doc, idx, {"op": "create_table", "after": "p0", "rows": [["a", "b"], ["c", "d"]]})
+    tbl = next(el for tid, el in idx.items() if tid.startswith("t"))
+    assert tbl.tblPr.find(qn("w:tblBorders")) is not None, "нет w:tblBorders — таблица без рамок"
+    print("patch_demo: create_table ставит рамки прямо в XML")
 
 
 def test_real_doc_style_error():
@@ -126,4 +168,6 @@ def test_real_doc_style_error():
 if __name__ == "__main__":
     test_ops()
     test_invalid()
+    test_hyperlink()
+    test_create_table_has_borders()
     test_real_doc_style_error()
