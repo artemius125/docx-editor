@@ -1,6 +1,5 @@
 """Раннер демо: находит examples/*_demo.py, запускает параллельно, тихо."""
 
-import os
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -11,9 +10,8 @@ ROOT = DEMOS_DIR.parent
 
 
 def run(path: Path):
-    env = {**os.environ, "PYTHONPATH": str(ROOT)}
     result = subprocess.run([sys.executable, str(path)], capture_output=True,
-                             text=True, cwd=ROOT, env=env)
+                             text=True, cwd=ROOT)
     return path, result
 
 

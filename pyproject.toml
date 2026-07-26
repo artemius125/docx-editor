@@ -1,0 +1,12 @@
+[project]
+name = "docx-editor"
+version = "0.1"
+requires-python = ">=3.12"
+dependencies = ["python-docx", "fastapi", "uvicorn", "httpx", "python-multipart"]
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["docx_editor"]
