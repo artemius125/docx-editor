@@ -6,10 +6,14 @@ edit.py зовёт модель через docx_editor.llm.chat как атри�
 передачи фейковых navigator/editor/checker через HTTP-контракт (там их нет).
 """
 
+import asyncio
 import io
 import json
 import tempfile
+import time
 
+import httpx
+import uvicorn
 from docx import Document
 from fastapi.testclient import TestClient
 
@@ -52,6 +56,13 @@ RETRY_MARKER = "запуск с ретраем редактора"
 # verdict=already, а не как провал.
 ALREADY_MARKER = "уже нормально по типографике"
 
+# Правка 5 (отдельная сессия) — Ф10: Навигатор нарочно спит NAV_SLEEP_SECONDS,
+# дольше интервала пинга (5с) в server.py, чтобы гарантированно поймать пинг
+# ДО первого op-события — доказательство, что поток не молчит, пока run_edit
+# считает в фоновом потоке.
+SLOW_MARKER = "медленная правка с пингом"
+NAV_SLEEP_SECONDS = 6
+
 _REQUIRED_OP_FIELDS = {
     "type", "status", "text", "task", "task_text", "model", "at", "dt", "blocks", "verdict",
 }
@@ -61,6 +72,9 @@ _JOURNAL_FIELDS = {"task", "task_text", "model", "iter", "verdict", "reason", "i
 def _fake_chat(messages):
     system, user = messages[0]["content"], messages[1]["content"]
     if "навигатор" in system:
+        if SLOW_MARKER in user:
+            time.sleep(NAV_SLEEP_SECONDS)
+            return {"kind": "local", "rule": None, "ids": ["p7"], "anchors": []}
         if OLD_TEXT in user:
             return {"kind": "local", "rule": None, "ids": ["p7"], "anchors": []}
         if CRASH_MARKER in user:
@@ -277,8 +291,78 @@ def test_already_streams_as_done():
     print("server_demo: already-правка стримится как status=done (verdict=already) и попадает в done итога")
 
 
+async def _run_ping_scenario():
+    """Ф10: TestClient (используемый везде выше) буферизует всё тело ответа
+    целиком и не даёт увидеть, КОГДА пришла каждая строка — для этого нужен
+    настоящий сокет. httpx.ASGITransport тоже не годится: он дожидается
+    завершения всего ASGI-приложения ДО того, как вернуть Response, и все
+    строки NDJSON приходят клиенту одним пакетом с одинаковой временной
+    меткой (проверено отдельно — send() в ASGITransport ничего не отдаёт
+    наружу, пока стрим не закрыт). Поэтому здесь настоящий uvicorn на
+    127.0.0.1 со случайным портом и настоящий httpx.AsyncClient поверх TCP —
+    только так видно реальный интервал между байтами, ту самую паузу,
+    которую рвёт облачный туннель."""
+    config = uvicorn.Config(app, host="127.0.0.1", port=0, log_level="warning")
+    server = uvicorn.Server(config)
+    server_task = asyncio.create_task(server.serve())
+    try:
+        while not server.started:
+            await asyncio.sleep(0.01)
+        port = server.servers[0].sockets[0].getsockname()[1]
+
+        # таймаут httpx по умолчанию — 5с на чтение, ровно интервал пинга: без
+        # явного увеличения клиент сам оборвётся на ожидании следующего байта,
+        # той самой паузой, которую в проде рвёт облачный туннель.
+        async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}", timeout=30.0) as client:
+            with open(DOC, "rb") as f:
+                data = f.read()
+            files = {"file": ("doc.docx", io.BytesIO(data), "application/octet-stream")}
+            session = (await client.post("/upload", files=files)).json()["session"]
+
+            timeline = []
+            t0 = time.perf_counter()
+            prompt = f"1. {SLOW_MARKER}."
+            async with client.stream("POST", "/edit", data={"prompt": prompt, "session": session}) as resp:
+                assert resp.status_code == 200
+                async for raw in resp.aiter_lines():
+                    if raw.strip():
+                        timeline.append((time.perf_counter() - t0, json.loads(raw)))
+    finally:
+        server.should_exit = True
+        await server_task
+
+    types = [evt["type"] for _, evt in timeline]
+    assert "op" in types, types
+    first_op = types.index("op")
+    assert "ping" in types[:first_op], f"пинга не было до первого op-события: {types}"
+
+    op_evt = next(evt for _, evt in timeline if evt["type"] == "op")
+    assert _REQUIRED_OP_FIELDS <= op_evt.keys(), op_evt.keys()
+    assert op_evt["verdict"] == "done", op_evt
+    assert op_evt["status"] == "done", op_evt
+
+    result_evt = timeline[-1][1]
+    assert result_evt["type"] == "result", result_evt
+    assert result_evt["done"] == [op_evt["text"]], result_evt
+    assert result_evt["failed"] == [], result_evt
+
+    gaps = [b - a for (a, _), (b, _) in zip(timeline, timeline[1:])]
+    max_gap = max(gaps)
+    assert max_gap < 6.5, f"пауза между строками потока превысила лимит пинга: {gaps}"
+
+    print(
+        f"server_demo: во время {NAV_SLEEP_SECONDS}с сна Навигатора пришло "
+        f"{types.count('ping')} пинг(а/ов) до op, макс. пауза между строками {max_gap:.2f}с"
+    )
+
+
+def test_ping_keeps_stream_alive_during_slow_edit():
+    asyncio.run(_run_ping_scenario())
+
+
 if __name__ == "__main__":
     session_from_main = main()
     test_crash_does_not_lose_saved_progress(session_from_main)
     test_already_streams_as_done()
     test_journal_iter_retry()
+    test_ping_keeps_stream_alive_during_slow_edit()
