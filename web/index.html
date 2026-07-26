@@ -1,0 +1,740 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>docx-agent</title>
+<style>
+  /* ЦВЕТА: только здесь, только через var(--...) — светлая тема в :root,
+     тёмная в @media ниже переопределяет одни и те же имена. Нигде больше в
+     файле (CSS, inline-style, JS) литеральных цветов быть не должно. Лист
+     документа (--paper и соседние ниже) в обеих темах остаётся белым —
+     настоящие документы печатаются на белой бумаге, поэтому тёмный блок их
+     не трогает. */
+  :root {
+    color-scheme: light;
+
+    --header-bg: #ffffff;
+    --border: #dde1e6;
+    --text: #1a1a1a;
+    --muted-text: #6b7280;
+    --canvas-bg: #dfe3e8;
+    --chat-bg: #f7f8fa;
+    --bubble-border: #e2e5ea;
+
+    --accent: #2563eb;
+    --accent-hover: #1d4fd1;
+    --accent-text: #ffffff;
+    --accent-disabled: #9db8ef;
+    --input-bg: #ffffff;
+    --input-border: #ccced3;
+    --link: #2563eb;
+
+    --switch-track-off: #c7cbd1;
+    --switch-thumb: #ffffff;
+
+    --success: #16803c;
+    --danger: #c0362c;
+
+    /* лист документа — см. комментарий выше, в тёмной теме не меняются */
+    --paper: #ffffff;
+    --ink: #1f2328;
+    --paper-shadow: rgba(15, 23, 42, .22);
+    --table-border: #ccced3;
+    --table-header-bg: #eef1f5;
+    --highlight: #fff3b0;
+    --bid-color: #9aa1ab;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      color-scheme: dark;
+
+      --header-bg: #1b1e24;
+      --border: #2c2f37;
+      --text: #e6e6e6;
+      --muted-text: #9aa1ab;
+      --canvas-bg: #111317;
+      --chat-bg: #1b1e24;
+      --bubble-border: #333844;
+
+      --accent: #3b6fe0;
+      --accent-hover: #4d7ef0;
+      --accent-text: #ffffff;
+      --accent-disabled: #3a4252;
+      --input-bg: #242830;
+      --input-border: #3a3f4a;
+      --link: #6ea1ff;
+
+      --switch-track-off: #3a3f4a;
+      --switch-thumb: #e6e6e6;
+
+      --success: #4fbf72;
+      --danger: #e2635a;
+    }
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    height: 100%;
+    margin: 0;
+    overflow: hidden;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    color: var(--text);
+    background: var(--canvas-bg);
+  }
+
+  #app {
+    height: 100dvh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  /* ---------- шапка ---------- */
+  header.topbar {
+    flex: none;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    padding: .6rem 1.1rem;
+    background: var(--header-bg);
+    border-bottom: 1px solid var(--border);
+  }
+  .brand { font-weight: 700; font-size: 1.05rem; }
+  .topbar-controls { display: flex; align-items: center; gap: 1.1rem; }
+  a.download-link {
+    color: var(--link);
+    font-size: .88rem;
+    text-decoration: none;
+    font-weight: 600;
+  }
+  a.download-link:hover { text-decoration: underline; }
+
+  .switch-label {
+    display: flex; align-items: center; gap: .5rem;
+    font-size: .85rem; color: var(--text);
+    cursor: pointer; user-select: none;
+  }
+  .switch-label input { position: absolute; opacity: 0; width: 0; height: 0; }
+  .switch {
+    position: relative;
+    width: 2.2rem; height: 1.25rem;
+    border-radius: 999px;
+    background: var(--switch-track-off);
+    transition: background .15s;
+    flex: none;
+  }
+  .switch::before {
+    content: "";
+    position: absolute; top: 2px; left: 2px;
+    width: 1rem; height: 1rem; border-radius: 50%;
+    background: var(--switch-thumb);
+    transition: left .15s;
+  }
+  .switch-label input:checked + .switch { background: var(--accent); }
+  .switch-label input:checked + .switch::before { left: calc(100% - 1.125rem); }
+
+  /* ---------- рабочая область ---------- */
+  main.workspace {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    overflow: hidden;
+  }
+
+  /* ---------- холст с листом документа (2/3) ---------- */
+  .canvas {
+    flex: 2 1 0;
+    min-width: 0;
+    overflow-y: auto;
+    overflow-x: auto;
+    background: var(--canvas-bg);
+  }
+  .canvas-inner {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 2.2rem 1rem;
+    min-height: 100%;
+  }
+  .paper {
+    position: relative;
+    width: 21cm;
+    max-width: calc(100vw - 2rem);
+    min-height: 29.7cm;
+    background: var(--paper);
+    color: var(--ink);
+    padding: 2cm;
+    box-shadow: 0 .4rem 1.4rem var(--paper-shadow);
+    font-family: Georgia, "Times New Roman", serif;
+    font-size: 1rem;
+    line-height: 1.5;
+  }
+  .paper.empty {
+    display: flex; align-items: center; justify-content: center;
+    color: var(--muted-text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    font-size: .95rem;
+    min-height: 20rem;
+  }
+
+  .block-wrap { position: relative; }
+  .bid-mark {
+    position: absolute;
+    left: -1.6rem;
+    top: .15rem;
+    font-family: ui-monospace, Menlo, Consolas, monospace;
+    font-size: .65rem;
+    color: var(--bid-color);
+    white-space: nowrap;
+    user-select: none;
+  }
+
+  .hl { background: var(--highlight); border-radius: .15rem; padding: 0 .1rem; }
+
+  .p-title { font-size: 2.1rem; font-weight: 700; margin: 0 0 1.2rem; line-height: 1.2; }
+  .p-h1 { font-size: 1.6rem; font-weight: 700; margin: 1.6rem 0 .8rem; line-height: 1.25; }
+  .p-h2 { font-size: 1.35rem; font-weight: 700; margin: 1.3rem 0 .6rem; line-height: 1.3; }
+  .p-h3 { font-size: 1.15rem; font-weight: 600; margin: 1.1rem 0 .5rem; line-height: 1.3; }
+  .p-normal { margin: 0 0 .6rem; min-height: 1.5em; }
+  .p-bullet, .p-number {
+    margin: 0 0 .3rem; padding-left: 1.4rem; position: relative; min-height: 1.5em;
+  }
+  .p-bullet::before { content: "•"; position: absolute; left: .2rem; }
+  .p-number { counter-increment: listnum; }
+  .p-number.list-start { counter-reset: listnum; }
+  .p-number::before { content: counter(listnum) "."; position: absolute; left: 0; }
+
+  .doc-table-wrap { max-width: 100%; overflow-x: auto; margin: .8rem 0; }
+  table.doc-table { border-collapse: collapse; width: 100%; font-size: .95rem; }
+  table.doc-table td { border: 1px solid var(--table-border); padding: .4rem .6rem; vertical-align: top; }
+  table.doc-table tr:first-child td { background: var(--table-header-bg); font-weight: 700; }
+
+  /* ---------- колонка чата (1/3) ---------- */
+  .chat {
+    flex: 1 1 0;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    background: var(--chat-bg);
+    border-left: 1px solid var(--border);
+    overflow: hidden;
+  }
+  .chat-history {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 1rem;
+    display: flex;
+    flex-direction: column;
+    gap: .7rem;
+  }
+  .chat-empty { color: var(--muted-text); font-size: .88rem; margin: auto; text-align: center; }
+
+  .msg { max-width: 92%; font-size: .92rem; line-height: 1.45; }
+  .msg.user, .msg.agent { border-radius: .9rem; padding: .55rem .8rem; }
+  .msg.user {
+    align-self: flex-end;
+    background: var(--accent);
+    color: var(--accent-text);
+    border-bottom-right-radius: .2rem;
+    max-width: 85%;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+  .msg.agent {
+    align-self: flex-start;
+    background: var(--input-bg);
+    color: var(--text);
+    border: 1px solid var(--bubble-border);
+    border-bottom-left-radius: .2rem;
+  }
+  .msg-status { color: var(--muted-text); font-size: .85rem; font-style: italic; }
+  .msg-status.error { color: var(--danger); font-style: normal; }
+  .msg-ops { list-style: none; margin: .35rem 0 0; padding: 0; display: flex; flex-direction: column; gap: .2rem; }
+  .msg-ops li { overflow-wrap: anywhere; }
+  .msg-ops li.done { color: var(--success); }
+  .msg-ops li.failed { color: var(--danger); }
+  .msg-ops li .op-meta {
+    color: var(--muted-text);
+    font-family: ui-monospace, Menlo, Consolas, monospace;
+    font-size: .78rem;
+    margin-right: .35rem;
+  }
+  .msg-summary { margin-top: .35rem; font-size: .85rem; color: var(--muted-text); }
+
+  /* ---------- журнал (режим отладки) ---------- */
+  .debug-journal {
+    flex: none;
+    max-height: 30%;
+    overflow-y: auto;
+    padding: .5rem .9rem;
+    border-top: 1px solid var(--border);
+    background: var(--chat-bg);
+    font-size: .8rem;
+  }
+  .debug-entry { padding: .35rem 0; border-bottom: 1px solid var(--bubble-border); }
+  .debug-entry:last-child { border-bottom: none; }
+  .debug-entry-meta { color: var(--muted-text); font-family: ui-monospace, Menlo, Consolas, monospace; }
+  .debug-verdict { font-weight: 600; }
+  .debug-verdict.done { color: var(--success); }
+  .debug-verdict.partial, .debug-verdict.error { color: var(--danger); }
+  .debug-verdict.refused { color: var(--muted-text); }
+  .debug-entry-reason { margin-top: .15rem; }
+  .debug-entry-reply { margin-top: .25rem; }
+  .debug-entry-reply summary { cursor: pointer; color: var(--link); }
+  .debug-entry-reply pre {
+    margin: .3rem 0 0;
+    max-height: 10rem;
+    overflow: auto;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    background: var(--input-bg);
+    border: 1px solid var(--input-border);
+    border-radius: 6px;
+    padding: .4rem .55rem;
+  }
+
+  /* ---------- ввод: файл + текст + кнопка ---------- */
+  .chat-input-area {
+    flex: none;
+    border-top: 1px solid var(--border);
+    padding: .7rem;
+    display: flex;
+    flex-direction: column;
+    gap: .5rem;
+  }
+  #fileRow { display: flex; flex-direction: column; gap: .25rem; }
+  #fileRow p.hint { margin: 0; font-size: .78rem; color: var(--muted-text); }
+  input[type=file], textarea#prompt {
+    color: var(--text);
+    background: var(--input-bg);
+    border: 1px solid var(--input-border);
+  }
+  input[type=file] { font-size: .82rem; border-radius: 6px; padding: .35rem; }
+  #sessionNote { font-size: .78rem; color: var(--muted-text); }
+  textarea#prompt {
+    width: 100%;
+    min-height: 3.4rem;
+    max-height: 8rem;
+    resize: vertical;
+    font: inherit;
+    font-size: .92rem;
+    padding: .55rem .7rem;
+    border-radius: 8px;
+  }
+  button#submit {
+    align-self: flex-end;
+    padding: .5rem 1.2rem;
+    font: inherit; font-weight: 600; font-size: .92rem;
+    border: none; border-radius: 7px;
+    background: var(--accent);
+    color: var(--accent-text);
+    cursor: pointer;
+  }
+  button#submit:hover:not(:disabled) { background: var(--accent-hover); }
+  button#submit:disabled { background: var(--accent-disabled); cursor: wait; }
+</style>
+</head>
+<body>
+<div id="app">
+  <header class="topbar">
+    <div class="brand">docx-agent</div>
+    <div class="topbar-controls">
+      <a id="downloadLink" class="download-link" href="#" download style="display:none">Скачать .docx</a>
+      <label class="switch-label">
+        <input type="checkbox" id="debugToggle">
+        <span class="switch"></span>
+        Режим отладки
+      </label>
+    </div>
+  </header>
+
+  <main class="workspace">
+    <section class="canvas">
+      <div class="canvas-inner">
+        <div id="paper" class="paper empty">Загрузите .docx справа, чтобы увидеть документ</div>
+      </div>
+    </section>
+
+    <aside class="chat">
+      <div id="chatHistory" class="chat-history">
+        <div class="chat-empty">Опишите правку и, если это первое сообщение, приложите файл .docx</div>
+      </div>
+      <div id="debugJournal" class="debug-journal" style="display:none"></div>
+      <div class="chat-input-area">
+        <div id="fileRow">
+          <input type="file" id="file" accept=".docx">
+          <p class="hint">Файл нужен только для первой правки; дальше сессия сохраняется.</p>
+        </div>
+        <div id="sessionNote" style="display:none">Документ загружен — правки применяются поверх текущей сессии.</div>
+        <textarea id="prompt" placeholder="Например: замени срок 30 дней на 45 дней"></textarea>
+        <button id="submit">Отправить</button>
+      </div>
+    </aside>
+  </main>
+</div>
+
+<script>
+const OP_PACE_MS = 350; // пауза между рендером соседних op-событий, чтобы правки было видно глазом
+
+const fileInput = document.getElementById("file");
+const fileRow = document.getElementById("fileRow");
+const sessionNote = document.getElementById("sessionNote");
+const promptInput = document.getElementById("prompt");
+const submitBtn = document.getElementById("submit");
+const chatHistoryEl = document.getElementById("chatHistory");
+const paperEl = document.getElementById("paper");
+const downloadLink = document.getElementById("downloadLink");
+const debugToggle = document.getElementById("debugToggle");
+const debugJournalEl = document.getElementById("debugJournal");
+
+const HEADING_STYLE_CLASS = {
+  "Title": "p-title",
+  "Heading 1": "p-h1",
+  "Heading 2": "p-h2",
+  "Heading 3": "p-h3",
+  "List Bullet": "p-bullet",
+  "List Number": "p-number",
+};
+
+// Дружелюбная формулировка по имени операции — только для обычного режима;
+// в режиме отладки показывается сырой текст из ops.apply/OpError как есть.
+const OP_LABELS = {
+  replace_text: "Текст изменён",
+  replace_all: "Текст заменён по всему документу",
+  set_text: "Текст абзаца заменён целиком",
+  delete: "Блок удалён",
+  insert_after: "Вставлен новый абзац",
+  insert_before: "Вставлен новый абзац",
+  move_after: "Блок перемещён",
+  move_before: "Блок перемещён",
+  format: "Форматирование обновлено",
+  set_style: "Стиль изменён",
+  to_table: "Абзацы собраны в таблицу",
+  create_table: "Таблица создана",
+  set_cell: "Ячейка таблицы изменена",
+  typography: "Типографика применена по всему документу",
+};
+
+let session = null;
+let debugMode = localStorage.getItem("docxAgentDebug") === "1";
+debugToggle.checked = debugMode;
+
+// Вся история чата хранится в JS-структуре и перерисовывается целиком —
+// это позволяет переключать режим отладки мгновенно, без повторного запроса.
+let messages = [];
+
+// Состояние документа для подсветки изменений и перерисовки листа при
+// переключении режима отладки, без пересчёта диффа.
+let prevBlocks = null;   // id -> сигнатура блока; null = ещё нет базы для сравнения
+let lastBlocks = null;   // последнее полученное состояние блоков документа
+let lastChangedIds = new Set(); // id блоков, изменившихся относительно prevBlocks на момент последнего расчёта
+
+function escapeHtml(s) {
+  const d = document.createElement("div");
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+// ---------- лист документа ----------
+
+function renderRuns(runs, text) {
+  const pieces = (runs && runs.length) ? runs : (text ? [{ text }] : []);
+  if (!pieces.length) return "&nbsp;";
+  return pieces.map(r => {
+    let html = escapeHtml(r.text);
+    if (r.u) html = `<u>${html}</u>`;
+    if (r.i) html = `<i>${html}</i>`;
+    if (r.b) html = `<b>${html}</b>`;
+    return html;
+  }).join("");
+}
+
+function renderParagraph(b, changed) {
+  const cls = HEADING_STYLE_CLASS[b.style] || "p-normal";
+  const isListNumber = b.style === "List Number";
+  const startClass = isListNumber && !prevWasListNumber ? " list-start" : "";
+  prevWasListNumber = isListNumber;
+
+  let inner = renderRuns(b.runs, b.text);
+  if (changed) inner = `<span class="hl">${inner}</span>`;
+
+  const alignStyle = b.align ? ` style="text-align:${b.align}"` : "";
+  return `<div class="${cls}${startClass}"${alignStyle}>${inner}</div>`;
+}
+
+function renderTable(b, changed) {
+  const rows = b.rows.map(row => {
+    const cells = row.map(c => {
+      const text = escapeHtml(c);
+      return `<td>${changed ? `<span class="hl">${text}</span>` : text}</td>`;
+    }).join("");
+    return `<tr>${cells}</tr>`;
+  }).join("");
+  return `<div class="doc-table-wrap"><table class="doc-table">${rows}</table></div>`;
+}
+
+let prevWasListNumber = false;
+
+function drawPaper() {
+  if (!lastBlocks) {
+    paperEl.className = "paper empty";
+    paperEl.innerHTML = "";
+    paperEl.textContent = "Загрузите .docx справа, чтобы увидеть документ";
+    return;
+  }
+  paperEl.className = "paper";
+  prevWasListNumber = false;
+  paperEl.innerHTML = lastBlocks.map(b => {
+    const changed = lastChangedIds.has(b.id);
+    const content = b.kind === "p" ? renderParagraph(b, changed) : renderTable(b, changed);
+    const bid = debugMode ? `<span class="bid-mark">${escapeHtml(b.id)}</span>` : "";
+    return `<div class="block-wrap">${bid}${content}</div>`;
+  }).join("");
+}
+
+function applyPaperUpdate(blocks) {
+  const baseline = prevBlocks === null;
+  const newMap = {};
+  const changed = new Set();
+  for (const b of blocks) {
+    const sig = b.kind === "p" ? b.text : b.rows.map(r => r.join("\t")).join("\n");
+    if (!baseline && prevBlocks[b.id] !== sig) changed.add(b.id);
+    newMap[b.id] = sig;
+  }
+  prevBlocks = newMap;
+  lastBlocks = blocks;
+  lastChangedIds = baseline ? new Set() : changed;
+  drawPaper();
+}
+
+// ---------- чат ----------
+
+function statusLine(msg) {
+  if (msg.status === "planning") return "Модель составляет план…";
+  if (msg.status === "working") return "Применяю правки…";
+  if (msg.status === "error") return msg.errorText || "Ошибка";
+  return "";
+}
+
+function renderOpLine(o) {
+  const cls = o.status === "failed" ? "failed" : "done";
+  const taskParts = [];
+  if (o.task !== undefined) taskParts.push(`№${o.task}`);
+  if (o.model === "fallback") taskParts.push("резерв");
+  const taskMeta = taskParts.length ? `<span class="op-meta">${taskParts.join(" · ")}</span>` : "";
+  if (debugMode) {
+    const metaParts = [];
+    if (o.op) metaParts.push(escapeHtml(o.op));
+    if (o.at !== undefined) metaParts.push(`t+${o.at}мс (+${o.dt}мс)`);
+    const meta = metaParts.length ? `<span class="op-meta">${metaParts.join(" · ")}</span>` : "";
+    return `<li class="${cls}">${taskMeta}${meta}${escapeHtml(o.text)}</li>`;
+  }
+  return `<li class="${cls}">${taskMeta}${escapeHtml(OP_LABELS[o.op] || o.text)}</li>`;
+}
+
+function renderAgentMsg(msg) {
+  const status = statusLine(msg);
+  const statusHtml = status
+    ? `<div class="msg-status${msg.status === "error" ? " error" : ""}">${escapeHtml(status)}</div>`
+    : "";
+  const opsHtml = msg.ops.length
+    ? `<ul class="msg-ops">${msg.ops.map(renderOpLine).join("")}</ul>`
+    : "";
+  let summaryHtml = "";
+  if (msg.status === "done" && msg.result) {
+    summaryHtml = `<div class="msg-summary">Готово: сделано ${msg.result.done}, не удалось ${msg.result.failed}.</div>`;
+  }
+  return `<div class="msg agent">${statusHtml}${opsHtml}${summaryHtml}</div>`;
+}
+
+function renderChatHistory() {
+  if (!messages.length) {
+    chatHistoryEl.innerHTML = '<div class="chat-empty">Опишите правку и, если это первое сообщение, приложите файл .docx</div>';
+    return;
+  }
+  chatHistoryEl.innerHTML = messages.map(msg => {
+    if (msg.role === "user") {
+      return `<div class="msg user">${escapeHtml(msg.text)}</div>`;
+    }
+    return renderAgentMsg(msg);
+  }).join("");
+  chatHistoryEl.scrollTop = chatHistoryEl.scrollHeight;
+}
+
+function updateDownloadLink() {
+  if (session) {
+    downloadLink.href = `/download/${session}`;
+    downloadLink.style.display = "inline-block";
+  } else {
+    downloadLink.style.display = "none";
+  }
+}
+
+// ---------- отладка ----------
+
+// Журнал (docx_agent/log.py) под транскриптом чата — только в режиме
+// отладки: модель, вердикт, причина и сырой ответ модели (раскрывается).
+function renderLogRecord(r) {
+  const meta = [r.task != null ? `задача №${r.task}` : null, r.model, `итерация ${r.iter}`]
+    .filter(Boolean).join(" · ");
+  const reason = r.reason ? `<div class="debug-entry-reason">${escapeHtml(r.reason)}</div>` : "";
+  const reply = r.reply
+    ? `<details class="debug-entry-reply"><summary>сырой ответ модели</summary><pre>${escapeHtml(r.reply)}</pre></details>`
+    : "";
+  return `<div class="debug-entry">
+    <span class="debug-entry-meta">${escapeHtml(meta)}</span>
+    — <span class="debug-verdict ${escapeHtml(r.verdict)}">${escapeHtml(r.verdict)}</span>
+    ${reason}${reply}
+  </div>`;
+}
+
+async function refreshJournal() {
+  if (!debugMode || !session) {
+    debugJournalEl.style.display = "none";
+    return;
+  }
+  try {
+    const res = await fetch(`/logs?session=${encodeURIComponent(session)}&n=50`);
+    if (!res.ok) return;
+    const records = await res.json();
+    debugJournalEl.style.display = records.length ? "block" : "none";
+    debugJournalEl.innerHTML = records.map(renderLogRecord).join("");
+  } catch (err) {
+    // Отладочная панель — не основной путь, сбой её обновления не должен мешать работе.
+  }
+}
+
+debugToggle.addEventListener("change", () => {
+  debugMode = debugToggle.checked;
+  localStorage.setItem("docxAgentDebug", debugMode ? "1" : "0");
+  renderChatHistory();
+  drawPaper();
+  refreshJournal();
+});
+
+// ---------- загрузка файла: рендер до какой-либо правки ----------
+
+fileInput.addEventListener("change", async () => {
+  const file = fileInput.files[0];
+  if (!file) return;
+  const form = new FormData();
+  form.append("file", file);
+  try {
+    const res = await fetch("/upload", { method: "POST", body: form });
+    if (!res.ok) {
+      messages.push({ role: "agent", status: "error", ops: [], errorText: `Ошибка загрузки ${res.status}: ${await res.text()}` });
+      renderChatHistory();
+      return;
+    }
+    const data = await res.json();
+    session = data.session;
+    prevBlocks = null;
+    applyPaperUpdate(data.blocks);
+    updateDownloadLink();
+    refreshJournal();
+    fileRow.style.display = "none";
+    sessionNote.style.display = "block";
+  } catch (err) {
+    messages.push({ role: "agent", status: "error", ops: [], errorText: `Сбой загрузки: ${err}` });
+    renderChatHistory();
+  }
+});
+
+// ---------- отправка правки ----------
+
+async function consumeEdit(res, agentMsg) {
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+
+  while (true) {
+    const { done: streamDone, value } = await reader.read();
+    if (value) buf += decoder.decode(value, { stream: true });
+
+    let nl;
+    while ((nl = buf.indexOf("\n")) >= 0) {
+      const line = buf.slice(0, nl);
+      buf = buf.slice(nl + 1);
+      if (!line.trim()) continue;
+      const evt = JSON.parse(line);
+
+      if (evt.type === "planning") {
+        agentMsg.status = "planning";
+        renderChatHistory();
+      } else if (evt.type === "op") {
+        agentMsg.status = "working";
+        agentMsg.ops.push({ status: evt.status, op: evt.op, text: evt.text, at: evt.at, dt: evt.dt, task: evt.task, model: evt.model });
+        applyPaperUpdate(evt.blocks);
+        renderChatHistory();
+        await new Promise(resolve => setTimeout(resolve, OP_PACE_MS));
+      } else if (evt.type === "result") {
+        agentMsg.status = "done";
+        // done/failed уже показаны по мере стриминга op-событий, кроме
+        // случаев, когда итерация вообще не дошла до apply (невалидный JSON
+        // от модели, осознанный отказ) — такие тексты добавляем сейчас.
+        const shown = new Set(agentMsg.ops.map(o => o.text));
+        for (const t of evt.done) if (!shown.has(t)) agentMsg.ops.push({ status: "done", op: null, text: t });
+        for (const t of evt.failed) if (!shown.has(t)) agentMsg.ops.push({ status: "failed", op: null, text: t });
+        agentMsg.result = { done: evt.done.length, failed: evt.failed.length };
+        renderChatHistory();
+        refreshJournal();
+      }
+    }
+
+    if (streamDone) break;
+  }
+}
+
+submitBtn.addEventListener("click", async () => {
+  const prompt = promptInput.value.trim();
+  if (!prompt) return;
+  if (!session) {
+    messages.push({ role: "agent", status: "error", ops: [], errorText: "Сначала выберите файл." });
+    renderChatHistory();
+    return;
+  }
+
+  const form = new FormData();
+  form.append("prompt", prompt);
+  form.append("session", session);
+
+  messages.push({ role: "user", text: prompt });
+  const agentMsg = { role: "agent", status: "planning", ops: [] };
+  messages.push(agentMsg);
+  renderChatHistory();
+
+  promptInput.value = "";
+  submitBtn.disabled = true;
+
+  try {
+    const res = await fetch("/edit", { method: "POST", body: form });
+    if (!res.ok) {
+      agentMsg.status = "error";
+      agentMsg.errorText = `Ошибка ${res.status}: ${await res.text()}`;
+      renderChatHistory();
+      return;
+    }
+    await consumeEdit(res, agentMsg);
+  } catch (err) {
+    agentMsg.status = "error";
+    agentMsg.errorText = `Сбой запроса: ${err}`;
+    renderChatHistory();
+  } finally {
+    submitBtn.disabled = false;
+  }
+});
+
+promptInput.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) {
+    e.preventDefault();
+    submitBtn.click();
+  }
+});
+</script>
+</body>
+</html>
