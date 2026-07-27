@@ -311,19 +311,58 @@ def _diff(before, after):
     return changed
 
 
-def _apply_ops(doc, idx, ops, fragment_text, request, editor):
+_ID_FIELDS = {
+    # Поля операции, которые называют id блока (контракт — см. _EDIT_PROMPT).
+    # normalize и replace_all сюда не входят: normalize — путь rule, Редактора
+    # там нет вовсе; replace_all документ-широкая ПО КОНТРАКТУ и id не несёт.
+    "replace_text": ("id",), "set_text": ("id",), "insert_after": ("id",),
+    "delete": ("id",), "move_after": ("id", "after"), "set_style": ("id",),
+    "create_table": ("after",), "set_cell": ("id",),
+}
+
+
+def _out_of_lane(op, fragment_ids):
+    """id первого поля операции, которое ссылается на блок ВНЕ fragment_ids
+    (фрагмент, показанный Редактору в этом вызове, плюс id блоков, созданных
+    ЭТИМ ЖЕ батчем — см. пополнение fragment_ids в _apply_ops), или None."""
+    for field in _ID_FIELDS.get(op.get("op"), ()):
+        val = op.get(field)
+        if val is not None and val not in fragment_ids:
+            return val
+    return None
+
+
+def _apply_ops(doc, idx, ops, fragment_text, request, editor, fragment_ids=None):
     """Применяет ops по очереди; на невалидной операции — один ретрай к
     Редактору с текстом ошибки (editor=None — ретрая нет, путь rule). Второй
     провал (или провал без Редактора) останавливает применение немедленно.
     Возвращает (описания применённых операций, причина отказа-или-None,
     tries) — tries=2, если к Редактору пришлось обращаться повторно
-    (для журнала правки, поле "iter"), иначе 1."""
+    (для журнала правки, поле "iter"), иначе 1.
+
+    fragment_ids=None — гвард выключен (путь rule: editor=None, id-полей у
+    normalize нет). Иначе — set id блоков фрагмента, который видел Редактор;
+    операция вне этого множества отклоняется ДО patch.validate, тем же текстом
+    ошибки и тем же единственным ретраем, что и любая другая невалидная
+    операция (находка: validate звали с картой ВСЕГО документа, поэтому id
+    любого существующего блока проходил, даже если Редактор его не видел).
+    Успешно применённая операция пополняет fragment_ids id-ами, которые
+    patch.apply мог только что создать (_register кладёт их прямо в idx) —
+    иначе insert_after/create_table внутри своего же батча не смогли бы
+    сослаться на блок, который сами только что создали."""
     applied, retried, i = [], False, 0
     while i < len(ops):
         op = ops[i]
-        err = patch.validate(doc_map(doc, idx), op, doc)
+        out = _out_of_lane(op, fragment_ids) if fragment_ids is not None else None
+        err = (
+            f"блок {out!r} вне фрагмента, показанного в этом вызове — правь только то, что было показано"
+            if out is not None else patch.validate(doc_map(doc, idx), op, doc)
+        )
         if err is None:
+            before_ids = set(idx)
             applied.append(patch.apply(doc, idx, op))
+            if fragment_ids is not None:
+                fragment_ids |= set(idx) - before_ids
             i += 1
             continue
         if retried or editor is None:
@@ -483,14 +522,16 @@ def _run_clusters(doc, idx, blocks, ids, request, editor, checker, nav, fallthro
 
     applied_all, editor_replies, tries_total = [], [], 0
     for cluster_ids in clusters:
-        fragment_text = render(find.fragment(doc_map(doc, idx), cluster_ids, around=1))
+        frag_blocks = find.fragment(doc_map(doc, idx), cluster_ids, around=1)
+        fragment_text = render(frag_blocks)
+        fragment_ids = {b["id"] for b in frag_blocks}
         reply = editor(fragment_text, request) or {}
         editor_replies.append(reply)
         tries_total += 1
         ops = _clean_ops(reply.get("ops"))
         if not ops:
             continue
-        applied, err, cluster_tries = _apply_ops(doc, idx, ops, fragment_text, request, editor)
+        applied, err, cluster_tries = _apply_ops(doc, idx, ops, fragment_text, request, editor, fragment_ids)
         tries_total += cluster_tries - 1  # первый вызов кластера уже посчитан выше, тут доучитывается только ретрай
         applied_all += applied
         if err is not None:

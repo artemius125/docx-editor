@@ -691,6 +691,135 @@ def test_many_scattered_targets_no_cap():
     print(f"edit_demo: {n_targets} разнесённых целей — {len(calls)} вызовов Редактора, кэп на 12 отсутствует")
 
 
+def test_out_of_lane_op_blocked_document_unchanged():
+    # Находка: _apply_ops звал patch.validate с картой ВСЕГО документа, поэтому
+    # операция на любой существующий id проходила, даже если Редактор видел
+    # только свой фрагмент. Редактор, которому показали окрестность p0, но
+    # который отвечает операцией на далёкий p9, обязан быть отклонён кодом, а
+    # не применён — документ должен остаться побайтово как был, verdict != done.
+    doc = Document()
+    for i in range(10):
+        doc.add_paragraph(f"Абзац {i}: обычный текст.")
+    idx = index(doc)
+    before = [b["text"] for b in doc_map(doc, idx)]
+
+    def fake_navigator(outline_text, request):
+        return {"kind": "local", "rule": None, "ids": ["p0"], "anchors": []}
+
+    def fake_editor(fragment_text, request, feedback=None):
+        assert "p9 " not in fragment_text, "p9 не должен попадать во фрагмент вокруг p0"
+        return {"ops": [{"op": "replace_text", "id": "p9", "old": "обычный", "new": "чужой"}]}
+
+    def fake_checker(request, diff):
+        raise AssertionError("Проверяющий не должен вызываться — операция вне фрагмента обязана быть отклонена раньше")
+
+    result, doc, idx = run_edit(
+        doc, idx, "замени 'обычный' на 'чужой' в p0",
+        navigator=fake_navigator, editor=fake_editor, checker=fake_checker,
+    )
+
+    assert result["verdict"] != "done", result
+    assert "вне фрагмента" in result["reason"], result
+    after = [b["text"] for b in doc_map(doc, idx)]
+    assert after == before, "документ обязан остаться побайтово как был — блок вне фрагмента не должен меняться"
+    print(f"edit_demo: операция на блок вне фрагмента отклонена, документ не тронут: {result['reason']!r}")
+
+
+def test_out_of_lane_retry_recovers_within_fragment():
+    # Тот же случай, но Редактор, получив ошибку об "вне фрагмента" как
+    # feedback, на ретрае отвечает верно — в пределах СВОЕГО фрагмента.
+    # Единственный существующий ретрай внутри _apply_ops обязан это спасти.
+    doc = Document()
+    for i in range(10):
+        doc.add_paragraph(f"Абзац {i}: обычный текст.")
+    idx = index(doc)
+
+    def fake_navigator(outline_text, request):
+        return {"kind": "local", "rule": None, "ids": ["p0"], "anchors": []}
+
+    def fake_editor(fragment_text, request, feedback=None):
+        if feedback is None:
+            return {"ops": [{"op": "replace_text", "id": "p9", "old": "обычный", "new": "чужой"}]}
+        assert "вне фрагмента" in feedback, feedback
+        return {"ops": [{"op": "replace_text", "id": "p0", "old": "обычный", "new": "исправленный"}]}
+
+    def fake_checker(request, diff):
+        return {"ok": True, "reason": "ok"}
+
+    result, doc, idx = run_edit(
+        doc, idx, "замени 'обычный' на 'исправленный' в p0",
+        navigator=fake_navigator, editor=fake_editor, checker=fake_checker,
+    )
+
+    assert result["verdict"] == "done", result
+    p9_text = next(b["text"] for b in doc_map(doc, idx) if b["id"] == "p9")
+    assert "чужой" not in p9_text, p9_text
+    p0_text = next(b["text"] for b in doc_map(doc, idx) if b["id"] == "p0")
+    assert "исправленный" in p0_text, p0_text
+    print("edit_demo: после ретрая с feedback Редактор попал в свой фрагмент, verdict=done")
+
+
+def test_replace_all_not_blocked_by_lane_guard():
+    # replace_all документ-широкая ПО КОНТРАКТУ и id не несёт — гвард обязан
+    # её пропускать, хотя формально она меняет блоки вне показанного фрагмента.
+    doc = Document()
+    for i in range(10):
+        doc.add_paragraph(f"Абзац {i}: обычный текст.")
+    idx = index(doc)
+
+    def fake_navigator(outline_text, request):
+        return {"kind": "local", "rule": None, "ids": ["p0"], "anchors": []}
+
+    def fake_editor(fragment_text, request, feedback=None):
+        return {"ops": [{"op": "replace_all", "old": "обычный", "new": "новый"}]}
+
+    def fake_checker(request, diff):
+        return {"ok": True, "reason": "ok"}
+
+    result, doc, idx = run_edit(
+        doc, idx, "замени 'обычный' на 'новый' везде",
+        navigator=fake_navigator, editor=fake_editor, checker=fake_checker,
+    )
+
+    assert result["verdict"] == "done", result
+    p9_text = next(b["text"] for b in doc_map(doc, idx) if b["id"] == "p9")
+    assert "новый" in p9_text, p9_text
+    print("edit_demo: replace_all не заблокирован гвардом фрагмента, применился по всему документу")
+
+
+def test_op_on_block_created_in_same_batch_applies():
+    # insert_after создаёт свежий id — операция на него в ТОМ ЖЕ батче обязана
+    # быть разрешена, хотя этого id не было во фрагменте, который видел
+    # Редактор изначально (см. пополнение fragment_ids в _apply_ops).
+    doc = Document()
+    doc.add_paragraph("Первый абзац.")
+    doc.add_paragraph("Второй абзац.")
+    idx = index(doc)
+
+    def fake_navigator(outline_text, request):
+        return {"kind": "local", "rule": None, "ids": ["p0"], "anchors": []}
+
+    def fake_editor(fragment_text, request, feedback=None):
+        return {"ops": [
+            {"op": "insert_after", "id": "p0", "text": "Новый абзац.", "style": "Normal"},
+            {"op": "set_style", "id": "p2", "style": "Heading 1"},
+        ]}
+
+    def fake_checker(request, diff):
+        return {"ok": True, "reason": "ok"}
+
+    result, doc, idx = run_edit(
+        doc, idx, "вставь абзац после первого и сделай его заголовком",
+        navigator=fake_navigator, editor=fake_editor, checker=fake_checker,
+    )
+
+    assert result["verdict"] == "done", result
+    new_block = next(b for b in doc_map(doc, idx) if b["id"] == "p2")
+    assert new_block["text"] == "Новый абзац.", new_block
+    assert new_block["style"] == "Heading 1", new_block
+    print("edit_demo: операция на блок, созданный этим же батчем, применилась, verdict=done")
+
+
 if __name__ == "__main__":
     test_split_real_file()
     test_fallback_search_then_honest_refusal()
@@ -712,3 +841,7 @@ if __name__ == "__main__":
     test_empty_ops_cluster_skipped_others_apply()
     test_invalid_cluster_aborts_whole_edit()
     test_many_scattered_targets_no_cap()
+    test_out_of_lane_op_blocked_document_unchanged()
+    test_out_of_lane_retry_recovers_within_fragment()
+    test_replace_all_not_blocked_by_lane_guard()
+    test_op_on_block_created_in_same_batch_applies()
