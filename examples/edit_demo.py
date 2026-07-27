@@ -7,6 +7,8 @@
 import os
 
 from docx import Document
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
 
 from docx_editor import edit as edit_mod
 from docx_editor import find, patch
@@ -393,6 +395,35 @@ def test_diff_move_and_insert():
     spurious = [d for d in insert_diff if "перемещ" in d.get("note", "")]
     assert not spurious, insert_diff
     print("edit_demo: move_after даёт ровно одну запись в diff, insert_after не даёт ложных move-записей")
+
+
+def test_set_list_level_diff_reaches_checker():
+    # Ф15: set_list_level не трогает текст абзаца вовсе, только w:ilvl —
+    # без сравнения b.get("list") != a.get("list") в _struct_note (уже было
+    # у Ф11 для style/level/list) правка была бы невидима Проверяющему, как
+    # раньше были невидимы set_style/move_after. Это и проверяем: без вызова
+    # модели, прямо по _diff.
+    from docx_editor.edit import _diff
+
+    doc = Document()
+    p = doc.add_paragraph("Пункт списка")
+    pPr = p._p.get_or_add_pPr()
+    numPr = OxmlElement("w:numPr")
+    ilvl_el = OxmlElement("w:ilvl")
+    ilvl_el.set(qn("w:val"), "0")
+    numId_el = OxmlElement("w:numId")
+    numId_el.set(qn("w:val"), "5")
+    numPr.append(ilvl_el)
+    numPr.append(numId_el)
+    pPr.append(numPr)
+    idx = index(doc)
+    before = doc_map(doc, idx)
+
+    patch.apply(doc, idx, {"op": "set_list_level", "id": "p0", "ilvl": 1})
+    diff = _diff(before, doc_map(doc, idx))
+    assert diff, "set_list_level обязан дать непустой diff — иначе Проверяющий его не увидит"
+    assert "список" in diff[0].get("note", ""), diff
+    print(f"edit_demo: set_list_level дошёл до diff'а с note={diff[0]['note']!r}")
 
 
 def test_rule_fallthrough_to_editor_done():
@@ -1121,6 +1152,7 @@ if __name__ == "__main__":
     test_checker_exception_restores_document_and_cleans_snapshot()
     test_set_style_diff_reaches_checker()
     test_diff_move_and_insert()
+    test_set_list_level_diff_reaches_checker()
     test_rule_fallthrough_to_editor_done()
     test_rule_fallthrough_editor_declines_stays_already()
     test_edit_12_on_real_doc_fixture()

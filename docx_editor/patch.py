@@ -371,6 +371,34 @@ def _op_set_style(doc, idx, op):
     return f"Стиль {op['id']} изменён на {op['style']!r}"
 
 
+def _op_set_format(doc, idx, op):
+    el = idx[op["id"]]
+    span = _flex_span(_ptext(el), op["old"])
+    if span is None:
+        # validate должен был отсечь это раньше (см. _op_replace_text) — громко падаем.
+        raise ValueError(f"текст {op['old']!r} не найден в {op['id']} на момент применения")
+    for r in _split_span_runs(el, *span):
+        font = Font(r)
+        if op.get("b") is not None:
+            font.bold = op["b"]
+        if op.get("i") is not None:
+            font.italic = op["i"]
+        if op.get("u") is not None:
+            font.underline = op["u"]
+    flags = ", ".join(f"{k}={op[k]}" for k in ("b", "i", "u") if op.get(k) is not None)
+    return f"В {op['id']} для «{op['old']}» установлено форматирование: {flags}"
+
+
+def _op_set_list_level(doc, idx, op):
+    numPr = idx[op["id"]].find(qn("w:pPr")).find(qn("w:numPr"))
+    ilvl_el = numPr.find(qn("w:ilvl"))
+    if ilvl_el is None:
+        ilvl_el = OxmlElement("w:ilvl")
+        numPr.insert(0, ilvl_el)  # w:numId уже стоит первым или единственным — не трогаем
+    ilvl_el.set(qn("w:val"), str(op["ilvl"]))
+    return f"Уровень списка {op['id']} изменён на {op['ilvl']}"
+
+
 def _add_borders(tbl):
     """Одиночные границы прямо в tblPr. В контракте create_table нет поля
     style, а из именованных табличных стилей в документе часто есть только
@@ -451,9 +479,11 @@ _HANDLERS = {
     "set_cell": _op_set_cell,
     "normalize": _op_normalize,
     "replace_all": _op_replace_all,
+    "set_format": _op_set_format,
+    "set_list_level": _op_set_list_level,
 }
 
 
 def apply(doc, idx, op):
-    """Применяет одну из десяти операций (патч уже прошёл validate), возвращает описание."""
+    """Применяет одну из операций контракта (патч уже прошёл validate), возвращает описание."""
     return _HANDLERS[op["op"]](doc, idx, op)

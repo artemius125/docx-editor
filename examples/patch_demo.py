@@ -1,6 +1,7 @@
 """Приёмка patch.py: девять операций на маленьком документе + валидатор невалидных патчей."""
 
 from docx import Document
+from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 
 from docx_editor.parse import doc_map, index
@@ -258,7 +259,122 @@ def test_replace_text_rejects_mid_word_cut():
     legit = {"op": "replace_text", "id": "p0", "old": "энкодеры", "new": "энкодера"}
     assert validate(blocks2, legit, doc2) is None, validate(blocks2, legit, doc2)
 
-    print("patch_demo: обрыв «old» посреди слова отбит (replace_text и replace_all), легитимный суффикс пропущен")
+    # set_format — тот же класс защиты, что и replace_text/replace_all (Ф15)
+    doc3 = Document()
+    doc3.add_paragraph("которые требуют серьёзных вычислительных ресурсов")
+    idx3 = index(doc3)
+    blocks3 = doc_map(doc3, idx3)
+    err_fmt = validate(blocks3, {"op": "set_format", "id": "p0", "old": "которые требуют с", "i": True}, doc3)
+    assert isinstance(err_fmt, str) and "слова" in err_fmt, err_fmt
+
+    print("patch_demo: обрыв «old» посреди слова отбит (replace_text, replace_all, set_format), легитимный суффикс пропущен")
+
+
+def _add_numpr(p, ilvl, num_id):
+    """Помечает абзац как элемент списка: w:pPr/w:numPr/{w:ilvl,w:numId} —
+    ровно то, что parse._list читает из XML (Ф15: у _build() списков нет,
+    их приходится собирать вручную, как test_hyperlink собирает гиперссылку)."""
+    pPr = p._p.get_or_add_pPr()
+    numPr = OxmlElement("w:numPr")
+    ilvl_el = OxmlElement("w:ilvl")
+    ilvl_el.set(qn("w:val"), str(ilvl))
+    numId_el = OxmlElement("w:numId")
+    numId_el.set(qn("w:val"), str(num_id))
+    numPr.append(ilvl_el)
+    numPr.append(numId_el)
+    pPr.append(numPr)
+
+
+def test_set_format():
+    # p3: "Срок 30 дней истекает." — "30 дней" лежит ровно на границах трёх
+    # ранов разного начертания ("3" bold, "0 дн" italic, "ей" bold+underline);
+    # соседи ("Срок " и " истекает.") без форматирования вовсе.
+    doc = _build()
+    idx = index(doc)
+    blocks = doc_map(doc, idx)
+    original_text = blocks[3]["text"]
+
+    op = {"op": "set_format", "id": "p3", "old": "30 дней", "i": True}
+    assert validate(blocks, op, doc) is None
+    apply(doc, idx, op)
+    blocks = doc_map(doc, idx)
+    assert blocks[3]["text"] == original_text, "set_format не должен менять текст"
+
+    runs = doc.paragraphs[3].runs
+    assert runs[0].text == "Срок " and not runs[0].italic, "сосед слева получил курсив по ошибке"
+    assert runs[-1].text == " истекает." and not runs[-1].italic, "сосед справа получил курсив по ошибке"
+    assert all(r.italic for r in runs[1:-1]), [(r.text, r.italic) for r in runs]
+    assert "".join(r.text for r in runs[1:-1]) == "30 дней"
+    assert runs[1].bold and runs[3].bold and runs[3].underline, "старое форматирование внутри спана не должно было слететь"
+
+    # false снимает то, что было true: "3" и "ей" были bold
+    op2 = {"op": "set_format", "id": "p3", "old": "30 дней", "b": False}
+    assert validate(blocks, op2, doc) is None
+    apply(doc, idx, op2)
+    runs = doc.paragraphs[3].runs
+    assert not any(r.bold for r in runs[1:-1]), [(r.text, r.bold) for r in runs]
+    assert all(r.italic for r in runs[1:-1]), "i не был указан в этой операции — не должен был тронуться"
+    assert runs[3].underline, "u не был указан — не должен был слететь"
+
+    print("patch_demo: set_format ставит и снимает начертание ровно на спане, соседи и текст не тронуты")
+
+
+def test_set_format_splits_run_boundary():
+    # p0: "Первый абзац." — один ран целиком. old="рвый абзац" начинается и
+    # заканчивается ВНУТРИ этого рана — set_format обязан физически разрезать
+    # ран (не просто переписать текст, как делает _replace_span), иначе
+    # префикс/суффикс получат чужое форматирование вместе со спаном.
+    doc = _build()
+    idx = index(doc)
+    blocks = doc_map(doc, idx)
+
+    op = {"op": "set_format", "id": "p0", "old": "рвый абзац", "b": True}
+    assert validate(blocks, op, doc) is None
+    apply(doc, idx, op)
+    blocks = doc_map(doc, idx)
+    assert blocks[0]["text"] == "Первый абзац.", blocks[0]["text"]
+
+    runs = doc.paragraphs[0].runs
+    assert "".join(r.text for r in runs) == "Первый абзац."
+    assert not runs[0].bold and runs[0].text == "Пе"
+    assert not runs[-1].bold and runs[-1].text == "."
+    middle = runs[1:-1]
+    assert "".join(r.text for r in middle) == "рвый абзац"
+    assert all(r.bold for r in middle)
+
+    print("patch_demo: set_format физически режет ран по границам спана")
+
+
+def test_set_format_rejects_no_flags():
+    doc = _build()
+    idx = index(doc)
+    blocks = doc_map(doc, idx)
+    err = validate(blocks, {"op": "set_format", "id": "p0", "old": "Первый"}, doc)
+    assert isinstance(err, str) and err, "без b/i/u операция не меняет ничего — обязан быть отказ"
+    print("patch_demo: set_format без b/i/u отбит валидатором")
+
+
+def test_set_list_level():
+    doc = _build()
+    doc.add_paragraph("Пункт списка")
+    idx = index(doc)
+    blocks = doc_map(doc, idx)
+    list_id = blocks[-1]["id"]
+    _add_numpr(doc.paragraphs[-1], ilvl=0, num_id=5)
+    blocks = doc_map(doc, idx)
+    assert blocks[-1]["list"] == {"ilvl": 0, "numId": 5}, blocks[-1]["list"]
+
+    op = {"op": "set_list_level", "id": list_id, "ilvl": 1}
+    assert validate(blocks, op, doc) is None
+    apply(doc, idx, op)
+    blocks = doc_map(doc, idx)
+    assert blocks[-1]["list"] == {"ilvl": 1, "numId": 5}, "numId обязан уцелеть, меняется только ilvl"
+
+    # p0 в списке не состоит вовсе — сменить уровень нельзя
+    err = validate(blocks, {"op": "set_list_level", "id": "p0", "ilvl": 1}, doc)
+    assert isinstance(err, str) and "списк" in err, err
+
+    print("patch_demo: set_list_level меняет ilvl и сохраняет numId, отказан на абзаце вне списка")
 
 
 if __name__ == "__main__":
@@ -270,3 +386,7 @@ if __name__ == "__main__":
     test_replace_text_tolerates_nbsp()
     test_set_text_rejects_ellipsis_truncation()
     test_replace_text_rejects_mid_word_cut()
+    test_set_format()
+    test_set_format_splits_run_boundary()
+    test_set_format_rejects_no_flags()
+    test_set_list_level()
