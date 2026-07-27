@@ -227,6 +227,40 @@ def test_set_text_rejects_ellipsis_truncation():
     print("patch_demo: обрезание абзаца с многоточием в конце отбито, легитимное многоточие пропущено")
 
 
+def test_replace_text_rejects_mid_word_cut():
+    # Ф12: render() резал абзац ровно на границе в 300 знаков — "old" от
+    # модели заканчивался посреди слова, _flex_span его честно находил (он
+    # РЕАЛЬНО есть в документе), и хвост слова оставался приклеен к новому
+    # тексту («...новых мощностей, херьёзных...»). validate обязан отбивать
+    # такой "old" ДО применения: правая граница совпадения должна быть
+    # границей слова, а не серединой.
+    doc = Document()
+    doc.add_paragraph("которые требуют серьёзных вычислительных ресурсов")
+    idx = index(doc)
+    blocks = doc_map(doc, idx)
+
+    cut = {"op": "replace_text", "id": "p0", "old": "которые требуют с", "new": "которые требуют новых"}
+    err = validate(blocks, cut, doc)
+    assert isinstance(err, str) and "слова" in err, err
+
+    # replace_all — та же защита (Ф12: тот же класс дефекта у replace_all)
+    err_all = validate(blocks, {"op": "replace_all", "old": "которые требуют с", "new": "которые требуют новых"}, doc)
+    assert isinstance(err_all, str) and "слова" in err_all, err_all
+
+    # легитимный случай: правка суффикса внутри более длинного слова —
+    # ЛЕВАЯ граница совпадения приходится на середину слова (как и в обрыве
+    # выше), а ПРАВАЯ — на настоящий конец слова; гвард смотрит только на
+    # правую и не должен сработать
+    doc2 = Document()
+    doc2.add_paragraph("Современные кросс-энкодеры работают быстро.")
+    idx2 = index(doc2)
+    blocks2 = doc_map(doc2, idx2)
+    legit = {"op": "replace_text", "id": "p0", "old": "энкодеры", "new": "энкодера"}
+    assert validate(blocks2, legit, doc2) is None, validate(blocks2, legit, doc2)
+
+    print("patch_demo: обрыв «old» посреди слова отбит (replace_text и replace_all), легитимный суффикс пропущен")
+
+
 if __name__ == "__main__":
     test_ops()
     test_invalid()
@@ -235,3 +269,4 @@ if __name__ == "__main__":
     test_real_doc_style_error()
     test_replace_text_tolerates_nbsp()
     test_set_text_rejects_ellipsis_truncation()
+    test_replace_text_rejects_mid_word_cut()

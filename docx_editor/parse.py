@@ -119,10 +119,6 @@ def doc_map(doc, idx):
     return blocks
 
 
-def _truncate(text):
-    return text[:300] + "…" if len(text) > 300 else text
-
-
 def _truncate_span(text):
     return text[:60] + "…" if len(text) > 60 else text
 
@@ -166,11 +162,20 @@ def render(blocks):
     't3 [table 2x2] r0c0:a | r0c1:b ;; r1c0:c | r1c1:d' — r{row}c{col} даёт
     модели явный адрес ячейки для set_cell. Тег в [] несёт метаданные
     (стиль/level/list/оформление), текст после [] — дословный текст блока
-    без изменений: patch.validate ищет в нём "old" буквально (находка Ф10)."""
+    без изменений: patch.validate ищет в нём "old" буквально (находка Ф10).
+
+    Текст блока БЕЗ усечения (Ф12): раньше резался на 300 знаках + «…», и
+    модель добросовестно копировала обрубок в "old" — _flex_span его
+    находил (он ДЕЙСТВИТЕЛЬНО есть в документе), а хвост разорванного слова
+    оставался приклеен к новому тексту. Бюджетное основание для 300 знаков
+    было верно, когда во фрагмент шёл весь документ; с кластеризацией по
+    соседству (edit.py) фрагмент — 2-3 блока, экономить контекст здесь не на
+    чем. find.outline() покрывает ВЕСЬ документ и режет короткий префикс —
+    это другой потребитель с другим бюджетом, его не трогаем."""
     lines = []
     for b in blocks:
         if b["kind"] == "p":
-            lines.append(f'{b["id"]} [{_tag(b)}] {_truncate(b["text"])}')
+            lines.append(f'{b["id"]} [{_tag(b)}] {b["text"]}')
         else:
             rows = b["rows"]
             ncols = len(rows[0]) if rows else 0
@@ -178,6 +183,6 @@ def render(blocks):
                 " | ".join(f"r{r}c{c}:{cell}" for c, cell in enumerate(row))
                 for r, row in enumerate(rows)
             ]
-            body = _truncate(" ;; ".join(row_strs))
+            body = " ;; ".join(row_strs)
             lines.append(f'{b["id"]} [table {len(rows)}x{ncols}] {body}')
     return "\n".join(lines)

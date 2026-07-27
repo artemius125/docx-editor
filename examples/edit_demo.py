@@ -9,9 +9,9 @@ import os
 from docx import Document
 
 from docx_editor import edit as edit_mod
-from docx_editor import patch
+from docx_editor import find, patch
 from docx_editor.edit import run_edit, split
-from docx_editor.parse import doc_map, index
+from docx_editor.parse import doc_map, index, render
 
 REAL_DOC = "/home/artem/Загрузки/Архитектура_ColBERT.docx"
 EDITS_FILE = "/home/artem/Загрузки/Правки_ColBERT_20.md"
@@ -820,6 +820,294 @@ def test_op_on_block_created_in_same_batch_applies():
     print("edit_demo: операция на блок, созданный этим же батчем, применилась, verdict=done")
 
 
+def test_render_full_text_outline_stays_short():
+    # Ф12: 50 из 116 абзацев ColBERT-документа длиннее 300 знаков — render()
+    # обязан отдавать их ЦЕЛИКОМ (иначе Редактор режет цитату на границе
+    # обрыва и рвёт слово пополам), а find.outline() по-прежнему режет
+    # коротким префиксом — это другой потребитель (покрывает ВЕСЬ документ
+    # для Навигатора) с другим бюджетом, его не трогаем.
+    doc = Document(REAL_DOC)
+    idx = index(doc)
+    blocks = doc_map(doc, idx)
+    long_blocks = [b for b in blocks if b["kind"] == "p" and len(b["text"]) > 300 and b["level"] is None]
+    assert len(long_blocks) >= 30, f"ожидали много длинных абзацев без level, получили {len(long_blocks)}"
+    b = long_blocks[0]
+
+    rendered = render([b])
+    assert b["text"] in rendered, "render() обязан отдавать длинный абзац целиком, без обрыва"
+
+    outline_line = find.outline([b])
+    assert b["text"][:20] in outline_line and "…" in outline_line, outline_line
+    assert len(outline_line) < len(rendered), "outline() обязан оставаться короче полного render()"
+    print(f"edit_demo: render() отдал абзац {b['id']} ({len(b['text'])} зн.) целиком, "
+          f"outline() по-прежнему режет коротким префиксом ({len(outline_line)} зн.)")
+
+
+def test_defect1_mid_word_cut_rejected():
+    # Ф12: даже без 300-знакового обрыва в render() модель МОЖЕТ обрубить
+    # цитату сама (см. отчёт строителя) — гвард в patch.validate обязан
+    # ловить это независимо от источника обрыва, через единственный ретрай
+    # _apply_ops, и не дать словам склеиться.
+    doc = Document()
+    doc.add_paragraph("Для больших чисел используют специальные методы, "
+                       "которые требуют серьёзных вычислительных ресурсов.")
+    idx = index(doc)
+    before = doc_map(doc, idx)[0]["text"]
+
+    def fake_navigator(outline_text, request):
+        return {"kind": "local", "rule": None, "ids": ["p0"], "anchors": []}
+
+    def fake_editor(fragment_text, request, feedback=None):
+        if feedback is None:
+            # "old" обрублен ровно посреди слова «серьёзных» — так же, как
+            # раньше обрубал старый _truncate на границе в 300 знаков
+            return {"ops": [{"op": "replace_text", "id": "p0",
+                              "old": "которые требуют с", "new": "которые требуют больших мощностей, х"}]}
+        assert "слова" in feedback, feedback
+        return {"ops": [], "note": "не могу процитировать целым словом"}
+
+    def fake_checker(request, diff):
+        raise AssertionError("Проверяющий не должен вызываться — обрубленная цитата обязана быть отбита раньше")
+
+    result, doc, idx = run_edit(
+        doc, idx, "замени методы на более мощные",
+        navigator=fake_navigator, editor=fake_editor, checker=fake_checker,
+    )
+
+    assert result["verdict"] != "done", result
+    after = doc_map(doc, idx)[0]["text"]
+    assert after == before, after
+    assert "херьёзных" not in after, after
+    print("edit_demo: обрубленная посреди слова цитата отбита, слово не склеилось")
+
+
+def test_defect2_batch_collision_colbert11():
+    # Реальный случай ColBERT edit 11 (см. отчёт строителя), один батч:
+    # 1) «Кросс-энкодер» → «Кросс-энкодер (Cross-Encoder, англ.)»
+    # 2) «Cross-Encoder» → «Кросс-энкодер»  ← матчит ВНУТРИ вставки шага 1
+    # без гварда даёт «Кросс-энкодер, англ.)» → склейку вида «...энкодерs».
+    doc = Document()
+    doc.add_paragraph("Кросс-энкодер — важная архитектура поиска.")
+    idx = index(doc)
+
+    def fake_navigator(outline_text, request):
+        return {"kind": "local", "rule": None, "ids": ["p0"], "anchors": []}
+
+    def fake_editor(fragment_text, request, feedback=None):
+        if feedback is None:
+            return {"ops": [
+                {"op": "replace_text", "id": "p0", "old": "Кросс-энкодер",
+                 "new": "Кросс-энкодер (или Cross-Encoder, англ.)"},
+                {"op": "replace_text", "id": "p0", "old": "Cross-Encoder", "new": "Кросс-энкодер"},
+            ]}
+        assert "батча" in feedback, feedback
+        return {"ops": [], "note": "op2 бьёт по собственному выводу op1 — оставляю как есть"}
+
+    def fake_checker(request, diff):
+        raise AssertionError("Проверяющий не должен вызываться — батч обязан провалиться раньше")
+
+    result, doc, idx = run_edit(
+        doc, idx, "добавь англоязычный термин рядом с русским",
+        navigator=fake_navigator, editor=fake_editor, checker=fake_checker,
+    )
+
+    text = doc_map(doc, idx)[0]["text"]
+    assert "Кросс-энкодерs" not in text and "энкодерыs" not in text, text
+    print(f"edit_demo: op2 не смог откусить от вывода op1 в том же батче, verdict={result['verdict']!r}")
+
+
+def test_defect2_batch_collision_replace_all():
+    # Реальный случай ColBERT edit 7: op1 этого же батча вписывает «Bi-encoders»,
+    # а op2 (replace_all «Bi-encoder»→«Bi-encoders») находит «Bi-encoder» как
+    # префикс СВЕЖЕГО вывода op1 и без гварда даёт «Bi-encoderss».
+    doc = Document()
+    doc.add_paragraph("Bi-encoder — базовая архитектура.")
+    doc.add_paragraph("Второй абзац без термина.")
+    idx = index(doc)
+
+    def fake_navigator(outline_text, request):
+        return {"kind": "local", "rule": None, "ids": ["p0"], "anchors": []}
+
+    def fake_editor(fragment_text, request, feedback=None):
+        if feedback is None:
+            return {"ops": [
+                {"op": "replace_text", "id": "p1", "old": "Второй абзац",
+                 "new": "Второй абзац, известный как Bi-encoders"},
+                {"op": "replace_all", "old": "Bi-encoder", "new": "Bi-encoders"},
+            ]}
+        assert "батча" in feedback, feedback
+        return {"ops": [], "note": "replace_all бьёт по только что вписанному Bi-encoders"}
+
+    def fake_checker(request, diff):
+        raise AssertionError("Проверяющий не должен вызываться — батч обязан провалиться раньше")
+
+    result, doc, idx = run_edit(
+        doc, idx, "приведи термин к множественному числу",
+        navigator=fake_navigator, editor=fake_editor, checker=fake_checker,
+    )
+
+    texts = " ".join(b["text"] for b in doc_map(doc, idx))
+    assert "Bi-encoderss" not in texts, texts
+    print(f"edit_demo: replace_all не тронул Bi-encoders, вписанный op1 этого же батча, verdict={result['verdict']!r}")
+
+
+def test_new_containing_old_still_applies():
+    # "new", включающий "old" целиком (добавили пояснение в скобках), — сам
+    # по себе легитимная правка: под подозрение попадает только ПОЗДНЕЙШАЯ
+    # операция, которая матчит этот вывод (см. тесты выше), а не эта.
+    doc = Document()
+    doc.add_paragraph("Кросс-энкодер — важная архитектура поиска.")
+    idx = index(doc)
+
+    def fake_navigator(outline_text, request):
+        return {"kind": "local", "rule": None, "ids": ["p0"], "anchors": []}
+
+    def fake_editor(fragment_text, request, feedback=None):
+        return {"ops": [{"op": "replace_text", "id": "p0",
+                          "old": "Кросс-энкодер", "new": "Кросс-энкодер (Cross-Encoder)"}]}
+
+    def fake_checker(request, diff):
+        return {"ok": True, "reason": "ok"}
+
+    result, doc, idx = run_edit(
+        doc, idx, "добавь англоязычный термин в скобках",
+        navigator=fake_navigator, editor=fake_editor, checker=fake_checker,
+    )
+    assert result["verdict"] == "done", result
+    print("edit_demo: new, включающий old целиком, применился без ложного срабатывания гварда")
+
+
+def test_variant_inventory_appears_for_multiple_targets():
+    # Change 1 (Ф13): при дроблении на кластеры Редактор кластера видит
+    # только тот вариант, что уже в нём, и "унифицирует" правку к нему же
+    # (ColBERT 7/15). Инвентарь вариантов с частотами обязан попасть в
+    # fragment_text КАЖДОГО кластера, когда в документе больше одного
+    # варианта с реальными попаданиями.
+    doc = Document()
+    doc.add_paragraph("Bi-encoder — первая архитектура.")
+    doc.add_paragraph("Абзац без термина.")
+    doc.add_paragraph("Bi-encoder встречается снова здесь.")
+    doc.add_paragraph("Абзац без термина.")
+    doc.add_paragraph("А тут пишут Bi-Encoders с большой буквы.")
+    idx = index(doc)
+
+    seen = []
+
+    def fake_navigator(outline_text, request):
+        return {"kind": "local", "rule": None, "ids": ["p0"], "anchors": []}
+
+    def fake_editor(fragment_text, request, feedback=None):
+        seen.append(fragment_text)
+        return {"ops": []}
+
+    request = "Термин пишется то как «Bi-encoder», то как «Bi-Encoders» — выбери один вариант и поставь везде."
+    run_edit(doc, idx, request, navigator=fake_navigator, editor=fake_editor)
+
+    assert seen, "Редактор обязан быть вызван"
+    assert "Найдено в документе:" in seen[0], seen[0]
+    assert "«Bi-encoder» — 2 блока" in seen[0], seen[0]
+    assert "«Bi-Encoders» — 1 блок" in seen[0], seen[0]
+    print("edit_demo: инвентарь вариантов с частотами дошёл до фрагмента Редактора")
+
+
+def test_variant_inventory_absent_for_single_target():
+    # Тот же механизм, но с ОДНИМ вариантом-целью — секция обязана
+    # отсутствовать, иначе это шум в обычной точечной правке.
+    doc = Document()
+    doc.add_paragraph("Bi-encoder — единственное упоминание.")
+    idx = index(doc)
+
+    seen = []
+
+    def fake_navigator(outline_text, request):
+        return {"kind": "local", "rule": None, "ids": ["p0"], "anchors": []}
+
+    def fake_editor(fragment_text, request, feedback=None):
+        seen.append(fragment_text)
+        return {"ops": []}
+
+    request = "Замени «Bi-encoder» на более подробное объяснение."
+    run_edit(doc, idx, request, navigator=fake_navigator, editor=fake_editor)
+
+    assert seen, "Редактор обязан быть вызван"
+    assert "Найдено в документе:" not in seen[0], seen[0]
+    print("edit_demo: инвентарь не появляется для одноцелевой правки")
+
+
+def test_collision_feedback_lets_retry_succeed():
+    # Change 2: гвард самоколлизии (Ф12, дефект 2) обязан не просто отказывать,
+    # а подсказывать выход — текст ошибки называет, ЧТО написала более ранняя
+    # операция батча. Редактор, который прочитал совет и на ретрае процитировал
+    # ДРУГОЙ, нетронутый кусок блока вместо повторного поиска только что
+    # написанного текста, обязан пройти единственный ретрай и получить done.
+    doc = Document()
+    doc.add_paragraph("Кросс-энкодер — важная архитектура поиска. Также известен как CE.")
+    idx = index(doc)
+
+    def fake_navigator(outline_text, request):
+        return {"kind": "local", "rule": None, "ids": ["p0"], "anchors": []}
+
+    def fake_editor(fragment_text, request, feedback=None):
+        if feedback is None:
+            return {"ops": [
+                {"op": "replace_text", "id": "p0", "old": "Кросс-энкодер",
+                 "new": "Кросс-энкодер (или Cross-Encoder, англ.)"},
+                {"op": "replace_text", "id": "p0", "old": "Cross-Encoder", "new": "CE"},
+            ]}
+        assert "более ранняя операция" in feedback and "батча" in feedback, feedback
+        # Совет учтён: цитируем ДРУГОЙ, нетронутый кусок блока, а не текст,
+        # который только что записала op1.
+        return {"ops": [{"op": "replace_text", "id": "p0", "old": "как CE.", "new": "как Cross-Encoder."}]}
+
+    def fake_checker(request, diff):
+        return {"ok": True, "reason": "ok"}
+
+    result, doc, idx = run_edit(
+        doc, idx, "добавь англоязычный термин и распиши сокращение",
+        navigator=fake_navigator, editor=fake_editor, checker=fake_checker,
+    )
+
+    assert result["verdict"] == "done", result
+    text = doc_map(doc, idx)[0]["text"]
+    assert text == ("Кросс-энкодер (или Cross-Encoder, англ.) — важная архитектура поиска. "
+                     "Также известен как Cross-Encoder."), text
+    print(f"edit_demo: после совета в тексте ошибки самоколлизии ретрай прошёл, verdict={result['verdict']!r}")
+
+
+def test_partial_cluster_processing_not_done():
+    # Change 3 (Ф13): набор кластеров зафиксирован ДО мутации (p0 и p7 —
+    # два непересекающихся кластера). Кластер p0 честно применяет операцию,
+    # но она не даёт diff (set_style на тот же стиль) — цель не обработана
+    # по факту, хотя кластер p7 реально поменял текст. Итог не должен быть
+    # done, и документ обязан остаться побайтово как был.
+    doc = Document()
+    for i in range(10):
+        doc.add_paragraph(f"Абзац {i}: обычный текст.")
+    idx = index(doc)
+    before = [b["text"] for b in doc_map(doc, idx)]
+
+    def fake_navigator(outline_text, request):
+        return {"kind": "local", "rule": None, "ids": ["p0", "p7"], "anchors": []}
+
+    def fake_editor(fragment_text, request, feedback=None):
+        if "p0 " in fragment_text:
+            return {"ops": [{"op": "set_style", "id": "p0", "style": "Normal"}]}
+        return {"ops": [{"op": "replace_text", "id": "p7", "old": "обычный", "new": "другой"}]}
+
+    def fake_checker(request, diff):
+        raise AssertionError("Проверяющий не должен вызываться — частичная обработка решается кодом")
+
+    result, doc, idx = run_edit(
+        doc, idx, "поправь два места",
+        navigator=fake_navigator, editor=fake_editor, checker=fake_checker,
+    )
+
+    assert result["verdict"] != "done", result
+    after = [b["text"] for b in doc_map(doc, idx)]
+    assert after == before, "документ обязан остаться побайтово как был при частичной обработке кластеров"
+    print(f"edit_demo: частично обработанный набор кластеров не даёт done, verdict={result['verdict']!r}")
+
+
 if __name__ == "__main__":
     test_split_real_file()
     test_fallback_search_then_honest_refusal()
@@ -845,3 +1133,12 @@ if __name__ == "__main__":
     test_out_of_lane_retry_recovers_within_fragment()
     test_replace_all_not_blocked_by_lane_guard()
     test_op_on_block_created_in_same_batch_applies()
+    test_render_full_text_outline_stays_short()
+    test_defect1_mid_word_cut_rejected()
+    test_defect2_batch_collision_colbert11()
+    test_defect2_batch_collision_replace_all()
+    test_new_containing_old_still_applies()
+    test_variant_inventory_appears_for_multiple_targets()
+    test_variant_inventory_absent_for_single_target()
+    test_collision_feedback_lets_retry_succeed()
+    test_partial_cluster_processing_not_done()

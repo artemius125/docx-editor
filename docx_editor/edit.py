@@ -12,6 +12,7 @@ import re
 import tempfile
 
 from docx import Document
+from docx.oxml.ns import qn
 
 from docx_editor import find, llm, patch
 from docx_editor.parse import doc_map, index, render
@@ -48,6 +49,10 @@ _EDIT_PROMPT = """Ты — редактор документа .docx. Тебе �
 жирный/курсивный/подчёркнутый» или, если оформлена только часть, «жирным:
 «кусок текста»»). Текст ПОСЛЕ закрывающей ] — дословный текст блока: "old"
 обязан быть процитирован буквально из него, метки из [] в "old" не входят.
+Если перед фрагментом отдельной строкой стоит «Найдено в документе: ...» —
+это посчитанные кодом варианты написания термина по всему документу (не
+часть текста для правки); канонический вариант выбирается ОДИН раз и
+действует во всех фрагментах этой правки, а не только в показанном здесь.
 Верни ТОЛЬКО JSON {"ops": [...]} — операции над блоками ИЗ ЭТОГО ФРАГМЕНТА.
 Если правку нельзя выразить перечисленными операциями — не подменяй её
 похожей и не изобретай новую: верни {"ops": [], "note": "почему нельзя"},
@@ -176,6 +181,35 @@ def _normalize_id(raw):
     иначе просто нижний регистр; итог сверяется с реальными id вызывающим."""
     s = str(raw).strip()
     return f"p{s}" if s.isdigit() else s.lower()
+
+
+def _block_word(n):
+    """Русское склонение «блок» под число попаданий — 1 блок, 2 блока, 5 блоков."""
+    if n % 10 == 1 and n % 100 != 11:
+        return "блок"
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return "блока"
+    return "блоков"
+
+
+def _variant_inventory(blocks, nav, request):
+    """Change 1 (Ф13): при дроблении на кластеры Редактор видит ОДИН кластер и
+    "унифицирует" правку вида «выбери одно написание и поставь везде» к тому
+    варианту, который уже стоит в этом кластере — он не знает, что есть
+    другие. Инвентарь строится ОДИН раз до цикла кластеров, теми же
+    источниками, что и _resolve (якоря Навигатора + дословные цитаты из
+    текста правки), и частотами через find.by_text — лишнего вызова модели
+    не требует. Вариант с нулём попаданий отбрасывается (найден не по
+    тексту документа, а домыслен), а если различных вариантов с попаданиями
+    меньше двух — для одноцелевой правки это шум, возвращается "".
+    """
+    variants = _dedupe([_strip_anchor(a) for a in (nav.get("anchors") or [])] + _quotes(request))
+    counts = [(v, len(find.by_text(blocks, v))) for v in variants]
+    counts = [(v, n) for v, n in counts if n > 0]
+    if len(counts) < 2:
+        return ""
+    parts = ", ".join(f'«{v}» — {n} {_block_word(n)}' for v, n in counts)
+    return f"Найдено в документе: {parts}"
 
 
 def _resolve(blocks, nav, request):
@@ -332,6 +366,90 @@ def _out_of_lane(op, fragment_ids):
     return None
 
 
+def _collision_source(targets, written):
+    """op, который записал диапазон, пересекающийся с targets, или None — тот
+    же обход, что раньше делал _overlaps, но Change 2 требует не только факт
+    коллизии, а и ВИНОВНИКА: текст ошибки обязан назвать более раннюю
+    операцию батча, которая написала этот текст, а не просто отказать."""
+    for el, s, e in targets:
+        for ws, we, wop in written.get(el, []):
+            if s < we and ws < e:
+                return wop
+    return None
+
+
+def _shift_written(ranges, start, end, new_len):
+    """Диапазоны батча (Ф12, дефект 2) после замены [start:end) на текст
+    длины new_len в том же абзаце: что было раньше start — не двигается, что
+    было не раньше end — сдвигается на дельту длины. Внутрь [start:end)
+    записанный ранее диапазон попасть не может — _op_targets проверяется на
+    пересечение ДО применения, поэтому операция, которая задела бы такой
+    диапазон, отклоняется раньше, чем эта замена вообще случится. Каждый
+    диапазон несёт op, который его записал (Change 2) — нужен для текста
+    ошибки, сама логика сдвига его не касается."""
+    delta = new_len - (end - start)
+    return [(s, e, o) if e <= start else (s + delta, e + delta, o) for s, e, o in ranges]
+
+
+def _op_targets(doc, idx, op):
+    """[(el, start, end)] — что операция replace_text/set_text/replace_all
+    прочитает и заменит в ТЕКУЩЕМ тексте абзаца(-ев) ДО применения. Нужен
+    дважды за вызов: сверить с written (эта же операция не должна попасть
+    на диапазон, который в этом батче только что записала более ранняя
+    операция), а после успешного apply — тем же списком дополнить written.
+    Остальные операции (insert_after/delete/move_after/set_style/set_cell/
+    create_table/normalize) текст по поиску не ищут — для них []."""
+    name, old = op.get("op"), op.get("old")
+    if name == "replace_text":
+        el = idx.get(op.get("id"))
+        el = el if el is not None and el.tag == qn("w:p") else None
+        span = find._flex_span(patch._ptext(el), old) if el is not None else None
+        return [(el, *span)] if span else []
+    if name == "set_text":
+        el = idx.get(op.get("id"))
+        el = el if el is not None and el.tag == qn("w:p") else None
+        return [(el, 0, len(patch._ptext(el)))] if el is not None else []
+    if name == "replace_all":
+        out = []
+        for el in doc.element.body.iter(qn("w:p")):
+            text, pos = patch._ptext(el), 0
+            while True:
+                span = find._flex_span(text[pos:], old)
+                if span is None:
+                    break
+                out.append((el, pos + span[0], pos + span[1]))
+                pos += span[1]
+        return out
+    return []
+
+
+def _record_batch_write(op, targets, written):
+    """Дописывает written диапазоном, который операция реально только что
+    записала — targets обходятся в ОБРАТНОМ порядке: несколько вхождений в
+    одном абзаце (replace_all) идут по убыванию позиции, как и сама замена в
+    patch._op_replace_all, иначе сдвиг съедет не в ту сторону."""
+    new_text = op["text"] if op.get("op") == "set_text" else op["new"]
+    for el, start, end in reversed(targets):
+        written[el] = _shift_written(written.get(el, []), start, end, len(new_text)) + [(start, start + len(new_text), op)]
+
+
+def _own_output_error(op, source_op):
+    """Change 2: голый отказ убивал правку — Редактор не понимал, что делать
+    дальше, и на единственном ретрае обычно сдавался (ops: []), проваливая
+    весь батч (Математика edit 1). Текст называет, ЧТО написала более ранняя
+    операция, и даёт ровно два законных выхода: переписать её так, чтобы она
+    сразу дала итоговый текст, либо процитировать в old другой, нетронутый
+    кусок блока — один короткий абзац, читает его 26B модель, не лекция."""
+    where = f"{op['id']}: " if op.get("id") else ""
+    written_text = source_op["text"] if source_op.get("op") == "set_text" else source_op.get("new")
+    return (
+        f'{where}текст «{op.get("old")}», который эта операция ищет, только что написала более ранняя '
+        f'операция этого же батча (она записала «{written_text}»). Редактировать собственный вывод внутри '
+        f'одного батча нельзя: либо перепиши ТУ раннюю операцию так, чтобы она сразу дала нужный итоговый '
+        f'текст, либо процитируй в old другой, ещё не тронутый кусок блока.'
+    )
+
+
 def _apply_ops(doc, idx, ops, fragment_text, request, editor, fragment_ids=None):
     """Применяет ops по очереди; на невалидной операции — один ретрай к
     Редактору с текстом ошибки (editor=None — ретрая нет, путь rule). Второй
@@ -349,20 +467,31 @@ def _apply_ops(doc, idx, ops, fragment_text, request, editor, fragment_ids=None)
     Успешно применённая операция пополняет fragment_ids id-ами, которые
     patch.apply мог только что создать (_register кладёт их прямо в idx) —
     иначе insert_after/create_table внутри своего же батча не смогли бы
-    сослаться на блок, который сами только что создали."""
-    applied, retried, i = [], False, 0
+    сослаться на блок, который сами только что создали.
+
+    written (Ф12, дефект 2) — диапазоны текста, которые внутри ЭТОГО вызова
+    уже записала более ранняя операция батча; replace_text/replace_all,
+    чей матч пересёкся с ними, отклоняются тем же путём, что и любая другая
+    невалидная операция, — до того, как patch.apply вообще увидит op."""
+    applied, retried, i, written = [], False, 0, {}
     while i < len(ops):
         op = ops[i]
         out = _out_of_lane(op, fragment_ids) if fragment_ids is not None else None
+        targets = _op_targets(doc, idx, op) if out is None else []
+        collision = _collision_source(targets, written) if out is None else None
         err = (
             f"блок {out!r} вне фрагмента, показанного в этом вызове — правь только то, что было показано"
-            if out is not None else patch.validate(doc_map(doc, idx), op, doc)
+            if out is not None
+            else _own_output_error(op, collision) if collision is not None
+            else patch.validate(doc_map(doc, idx), op, doc)
         )
         if err is None:
             before_ids = set(idx)
             applied.append(patch.apply(doc, idx, op))
             if fragment_ids is not None:
                 fragment_ids |= set(idx) - before_ids
+            if targets:
+                _record_batch_write(op, targets, written)
             i += 1
             continue
         if retried or editor is None:
@@ -515,15 +644,39 @@ def _run_clusters(doc, idx, blocks, ids, request, editor, checker, nav, fallthro
     шаги дробятся, обязательство — нет. Кластер, где Редактор честно вернул
     пустые ops, — пропускается, не проваливает правку (другим кластерам ещё
     есть что делать); кластер, чьи ops не прошли валидацию даже после ретрая
-    внутри _apply_ops, — прерывает ВЕСЬ цикл, откатывая единственный снимок."""
+    внутри _apply_ops, — прерывает ВЕСЬ цикл, откатывая единственный снимок.
+
+    Change 1 (Ф13): инвентарь вариантов написания (_variant_inventory)
+    считается ОДИН раз по исходным blocks, до цикла, и кладётся в начало
+    fragment_text КАЖДОГО кластера — иначе Редактор кластера видит только
+    тот вариант, что уже стоит в его фрагменте, и "унифицирует" правку к
+    нему же (ColBERT 7/15, old==new).
+
+    Change 3 (Ф13): набор clusters зафиксирован ВЫШЕ, до первой мутации.
+    done требует, чтобы КАЖДЫЙ кластер этого набора либо дал diff, либо
+    честно вернул пустые ops (skip) — иначе набор целей обработан не
+    полностью, даже если другие кластеры реально что-то поменяли и
+    Проверяющий был бы не против. Кластер, чьи ops применились БЕЗ ошибки,
+    но не дали diff (partial), — не failed (часть правки реально сработала)
+    и не already (документ был не таким же — что-то изменилось), поэтому
+    verdict переиспользует rolled_back: смысл тот же, что при отказе
+    Проверяющего — "применили, но в силу не вступило", документ
+    восстанавливается. Проверяющего в этом случае не зовём — вопрос
+    решает код, а не мнение модели (см. BUILD_PLAN Ф13, "не строить ковёр
+    покрытия требований" — здесь считаются только кластеры, не пункты
+    запроса)."""
     snapshot_path = _snapshot(doc)
     blocks_before = doc_map(doc, idx)
     clusters = _cluster(blocks, ids, around=1)
+    inventory = _variant_inventory(blocks, nav, request)
 
-    applied_all, editor_replies, tries_total = [], [], 0
+    applied_all, editor_replies, tries_total, partial = [], [], 0, False
     for cluster_ids in clusters:
-        frag_blocks = find.fragment(doc_map(doc, idx), cluster_ids, around=1)
+        pre_cluster = doc_map(doc, idx)
+        frag_blocks = find.fragment(pre_cluster, cluster_ids, around=1)
         fragment_text = render(frag_blocks)
+        if inventory:
+            fragment_text = f"{inventory}\n\n{fragment_text}"
         fragment_ids = {b["id"] for b in frag_blocks}
         reply = editor(fragment_text, request) or {}
         editor_replies.append(reply)
@@ -537,6 +690,8 @@ def _run_clusters(doc, idx, blocks, ids, request, editor, checker, nav, fallthro
         if err is not None:
             doc, idx = _restore(snapshot_path)
             return _failed(err, nav, editor_replies, tries_total), doc, idx
+        if not _diff(pre_cluster, doc_map(doc, idx)):
+            partial = True  # ops применились без ошибки, но эта цель по факту не обработана
 
     if not applied_all:
         doc, idx = _restore(snapshot_path)
@@ -544,6 +699,14 @@ def _run_clusters(doc, idx, blocks, ids, request, editor, checker, nav, fallthro
             reason = "нормализация ничего не нашла, и Редактор ни в одном кластере не предложил операций — оба пути согласны, что менять нечего"
             return _already(reason, nav, editor_replies, tries_total), doc, idx
         return _failed("редактор не предложил операций ни в одном из кластеров", nav, editor_replies, tries_total), doc, idx
+
+    diff_all = _diff(blocks_before, doc_map(doc, idx))
+    if partial and diff_all:
+        doc, idx = _restore(snapshot_path)
+        reason = "часть кластеров правки не дала изменений, хотя Редактор предлагал для них операции — цель обработана не полностью"
+        return {"verdict": "rolled_back", "reason": reason, "applied": applied_all,
+                "ids": [d["id"] for d in diff_all], "iter": tries_total,
+                "reply": {"nav": nav, "editor": editor_replies}}, doc, idx
 
     result, doc, idx, tries = _finish(doc, idx, snapshot_path, blocks_before, applied_all, request, checker, nav, editor_replies, tries_total)
     if result is not None:

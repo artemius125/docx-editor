@@ -20,6 +20,10 @@ from fastapi.testclient import TestClient
 import docx_editor.llm as llm
 from docx_editor.server import app
 
+# Настоящая chat() — остальные тесты в файле подменяют llm.chat фикстурой
+# _fake_chat, поэтому ссылку на реальную функцию берём ДО этой подмены.
+_real_chat = llm.chat
+
 DOC = "/home/artem/Загрузки/Архитектура_ColBERT.docx"
 
 # Правка 1 — существующий в документе текст (p7), Навигатор находит его сразу,
@@ -360,9 +364,82 @@ def test_ping_keeps_stream_alive_during_slow_edit():
     asyncio.run(_run_ping_scenario())
 
 
+def _fake_response(status_code, *, json_body=None, text_body=None):
+    request = httpx.Request("POST", "https://fake.test/chat/completions")
+    content = json.dumps(json_body).encode() if json_body is not None else text_body.encode()
+    return httpx.Response(status_code, content=content, request=request)
+
+
+def test_llm_chat_http_error_surfaces_body_and_size():
+    """Находка: raise_for_status() выбрасывает тело ответа, а на живом сбое
+    (400 от litellm) там лежала ЕДИНСТВЕННАЯ причина. llm.chat теперь
+    собирает httpx.HTTPStatusError сам, с телом и размером запроса в тексте."""
+    calls = []
+    server_message = "DISTINCTIVE_CONTEXT_WINDOW_EXCEEDED_MARKER"
+
+    def fake_post(url, **kwargs):
+        calls.append(kwargs)
+        return _fake_response(400, text_body=json.dumps({"error": {"message": server_message}}))
+
+    llm.httpx.post = fake_post
+    try:
+        messages = [{"role": "user", "content": "x" * 123}]
+        try:
+            _real_chat(messages)
+            raised = None
+        except httpx.HTTPStatusError as e:
+            raised = e
+        assert raised is not None, "не-2xx ответ обязан бросать httpx.HTTPStatusError"
+        assert server_message in str(raised), str(raised)
+        assert "123" in str(raised), f"размер запроса (123 знака) не попал в сообщение: {raised}"
+        assert len(calls) == 1, "HTTP-ошибка не должна ретраиться (ретрай — только на обрыве транспорта)"
+    finally:
+        llm.httpx.post = httpx.post
+    print("server_demo: llm.chat на 400 бросает HTTPStatusError с телом ответа и размером запроса")
+
+
+def test_llm_chat_200_still_returns_parsed_json():
+    def fake_post(url, **kwargs):
+        body = {"choices": [{"message": {"content": json.dumps({"ok": True, "n": 1})}}]}
+        return _fake_response(200, json_body=body)
+
+    llm.httpx.post = fake_post
+    try:
+        result = _real_chat([{"role": "user", "content": "hi"}])
+        assert result == {"ok": True, "n": 1}, result
+    finally:
+        llm.httpx.post = httpx.post
+    print("server_demo: llm.chat на 200 по-прежнему отдаёт разобранный JSON")
+
+
+def test_llm_chat_transport_retry_unchanged():
+    """Ретрай остаётся ровно один и только на httpx.TransportError — HTTP-статус
+    (проверено в test_llm_chat_http_error_surfaces_body_and_size) не ретраится."""
+    attempts = []
+
+    def fake_post(url, **kwargs):
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise httpx.ConnectError("boom", request=httpx.Request("POST", url))
+        body = {"choices": [{"message": {"content": json.dumps({"ok": True})}}]}
+        return _fake_response(200, json_body=body)
+
+    llm.httpx.post = fake_post
+    try:
+        result = _real_chat([{"role": "user", "content": "hi"}])
+        assert result == {"ok": True}, result
+        assert len(attempts) == 2, "обрыв транспорта обязан дать ровно один ретрай"
+    finally:
+        llm.httpx.post = httpx.post
+    print("server_demo: ретрай на httpx.TransportError не тронут (1 обрыв -> 1 ретрай -> успех)")
+
+
 if __name__ == "__main__":
     session_from_main = main()
     test_crash_does_not_lose_saved_progress(session_from_main)
     test_already_streams_as_done()
     test_journal_iter_retry()
     test_ping_keeps_stream_alive_during_slow_edit()
+    test_llm_chat_http_error_surfaces_body_and_size()
+    test_llm_chat_200_still_returns_parsed_json()
+    test_llm_chat_transport_retry_unchanged()
