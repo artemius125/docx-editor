@@ -113,6 +113,21 @@ def test_outline_is_compact_and_valid():
           f"(24 реальных заголовка по level, было 2972 знака и 0 заголовков по стилю)")
 
 
+def test_outline_marks_fully_bold_paragraph():
+    # Находка Ф10: заголовок без стиля/level — просто жирный абзац. outline()
+    # обязан пометить его [B], иначе Навигатор не отличит его от тела текста.
+    doc = Document()
+    doc.add_paragraph("Обычный абзац с текстом подлиннее двадцати символов.")
+    p2 = doc.add_paragraph()
+    run = p2.add_run("Заголовок жирным без стиля")
+    run.bold = True
+    idx = index(doc)
+    lines = find.outline(doc_map(doc, idx)).splitlines()
+    assert lines[0].startswith("p0 ") and "[B]" not in lines[0], lines[0]
+    assert lines[1].startswith("p1 [B] "), lines[1]
+    print("find_demo: outline помечает [B] сплошь жирный абзац без стиля заголовка")
+
+
 def test_fragment_dedupes_overlap():
     blocks = _load()
     # p10 и p12 с around=1 дают пересекающиеся диапазоны [p9,p11] и [p11,p13]
@@ -122,10 +137,66 @@ def test_fragment_dedupes_overlap():
     print("find_demo: fragment схлопывает пересекающиеся диапазоны без дублей")
 
 
+MATH_DOC = "/home/artem/Загрузки/Математика как основа.docx"
+
+
+def _load_math():
+    doc = Document(MATH_DOC)
+    idx = index(doc)
+    return doc_map(doc, idx)
+
+
+def test_locate_recovers_drifted_quotes():
+    # Реальный дрейф цитирования из приёмочного корпуса: в правке — запятая
+    # и «нет» без тире, в документе — тире (см. отчёт строителя). Ни точный,
+    # ни пробельно-гибкий поиск такое не находит — только locate.
+    blocks = _load_math()
+    q1 = "Братья имели крайне низкий IQ, уровень развития, сравнимый с маленьким ребёнком"
+    q2 = "Там, где число было простым, они улыбались. Там, где нет, хмурились"
+    assert find.by_text(blocks, q1) == [], "ожидали, что by_text промахнётся мимо дрейфа"
+    assert find.by_text(blocks, q2) == [], "ожидали, что by_text промахнётся мимо дрейфа"
+    assert find.locate(blocks, q1)[0] == "p21", find.locate(blocks, q1)
+    assert find.locate(blocks, q2)[0] == "p25", find.locate(blocks, q2)
+    print("find_demo: locate восстанавливает 2 реальных дрейфа цитирования (p21, p25)")
+
+
+def test_locate_rejects_short_and_unrelated():
+    blocks = _load_math()
+    assert find.locate(blocks, "слон бегемот") == [], "2 токена — короче порога, должно быть пусто"
+    assert find.locate(blocks, "совершенно случайная фраза не из документа никак") == []
+    print("find_demo: locate возвращает [] на короткой и на нерелевантной фразе")
+
+
+def test_locate_never_returns_more_than_one():
+    # Находка (см. docstring locate): жадный вариант измерен вживую на 40 правках
+    # и стоил больше правок, чем принёс (3 выигрыша против 6 регрессий) — якоря
+    # Навигатора короткие и общие, и старый locate возвращал их все, раздувая
+    # фрагмент. "это не просто" — фраза из трёх общих слов документа: жадное
+    # сканирование (совпадение по токенам-подпоследовательности, без учёта
+    # порядка блоков) находит её в 9 блоках документа ['p14', 'p15', 'p17',
+    # 'p18', 'p19', 'p23', 'p26', 'p30', 'p43'], так что проверка неслучайна.
+    # Если locate регрессирует к жадному варианту, это упадёт.
+    blocks = _load_math()
+    hits = find.locate(blocks, "это не просто")
+    assert len(hits) <= 1, f"locate обязан возвращать не больше одного блока: {hits}"
+    print(f"find_demo: locate на заведомо многозначной фразе «это не просто» вернул {hits}, не список из 9")
+
+
+def test_by_text_unchanged_for_exact_substring():
+    blocks = _load_math()
+    assert "p21" in find.by_text(blocks, "Братья имели крайне низкий IQ")
+    print("find_demo: by_text по-прежнему находит точную подстроку без изменений")
+
+
 if __name__ == "__main__":
     test_anchors_hit_every_edit()
     test_first_mention_picks_earliest()
     test_by_regex()
     test_by_text_tolerates_nbsp()
     test_outline_is_compact_and_valid()
+    test_outline_marks_fully_bold_paragraph()
     test_fragment_dedupes_overlap()
+    test_locate_recovers_drifted_quotes()
+    test_locate_rejects_short_and_unrelated()
+    test_locate_never_returns_more_than_one()
+    test_by_text_unchanged_for_exact_substring()

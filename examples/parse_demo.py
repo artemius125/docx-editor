@@ -37,11 +37,42 @@ def main():
     assert len(nested) == 7, f"ожидали 7 вложенных (ilvl=1), получили {len(nested)}"
 
     text = render(blocks)
-    assert text.startswith("p0 [Normal]")
+    # p0 — сам приёмочный случай Ф10: заголовок документа размечен как
+    # обычный жирный абзац (H0 из outlineLvl, оформление — не стиль).
+    assert text.startswith("p0 [Normal, H0, весь жирный]")
 
     print(f"parse_demo: ok, {len(blocks)} блоков, стили {styles}, "
           f"level: {dict(by_level)}, list: {len(with_list)} (вложенных {len(nested)})")
 
 
+def test_render_format_tag():
+    """Находка Ф10: render() был обязан выбросить оформление из тега, чтобы
+    Редактор мог видеть «заголовок — просто жирный абзац». Три случая,
+    которые падают, если это сломается: 1) абзац без level/list/оформления
+    рендерится байт-в-байт как раньше; 2) частичный жирный — текст после ]
+    остаётся дословным, span уходит в тег; 3) сплошной жирный сворачивается
+    в «весь жирный», а не в список фрагментов."""
+    doc = Document()
+    doc.add_paragraph("Обычный абзац.")
+    p2 = doc.add_paragraph()
+    p2.add_run("Обычный текст, ")
+    run = p2.add_run("жирный кусок")
+    run.bold = True
+    p3 = doc.add_paragraph()
+    run3 = p3.add_run("Весь абзац жирный")
+    run3.bold = True
+
+    idx = index(doc)
+    lines = render(doc_map(doc, idx)).splitlines()
+
+    assert lines[0] == "p0 [Normal] Обычный абзац.", lines[0]
+    assert lines[1] == 'p1 [Normal, жирным: «жирный кусок»] Обычный текст, жирный кусок', lines[1]
+    assert lines[2] == "p2 [Normal, весь жирный] Весь абзац жирный", lines[2]
+
+    print("parse_demo: render() — без оформления тег как раньше, частичный жирный "
+          "уходит в span с дословным текстом после ], сплошной — в «весь жирный»")
+
+
 if __name__ == "__main__":
     main()
+    test_render_format_tag()

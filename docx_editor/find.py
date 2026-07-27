@@ -8,6 +8,12 @@
 import re
 
 _PREFIX = 20
+# Порог доли совпавших токенов и минимальная длина фразы для locate() —
+# измерены на двух приёмочных корпусах (Правки_ColBERT_20, Правки_Математика_20),
+# не угаданы: 0.75 находит 9 из 11 реальных промахов flex_find, короче 3 токенов
+# совпадения слишком случайны, чтобы на них полагаться.
+_LOCATE_THRESHOLD = 0.75
+_LOCATE_MIN_TOKENS = 3
 
 
 def _texts(block):
@@ -54,6 +60,57 @@ def by_text(blocks, needle):
     return [b["id"] for b in blocks if any(flex_find(t, needle) != -1 for t in _texts(b))]
 
 
+def _tokens(s):
+    return re.findall(r"\w+", s.lower())
+
+
+def locate(blocks, phrase):
+    """id ОДНОГО блока, где phrase встречается ПРИБЛИЗИТЕЛЬНО — только для
+    НАВИГАЦИИ (выбор блоков для фрагмента), никогда для мутации: patch.validate
+    и patch._op_replace_text по-прежнему используют строгий flex_find/_flex_span
+    без изменений, иначе можно заменить не тот кусок текста.
+
+    Люди цитируют документ неточно (тире вместо запятой и т.п.), и такие
+    цитаты flex_find не находит вовсе. Здесь текст блока и фраза токенизируются
+    (\\w+, без регистра), токены фразы ищутся по порядку в токенах блока
+    жадным продвижением позиции; блок годится, если совпала доля токенов
+    >= _LOCATE_THRESHOLD.
+
+    Раньше возвращались ВСЕ блоки не ниже порога, по убыванию доли — казалось
+    безопасным (Навигатору же нужны варианты). На 40 живых правках это дало
+    3 выигрыша (дрейфнувшая цитата человека), но 6 регрессий: locate — запасной
+    путь для КАЖДОГО якоря/цитаты в _resolve (edit.py), а якоря Навигатора
+    короткие и общие и матчатся сразу во множестве блоков (одна правка ушла с
+    4 резолвленных id на 10). Фрагмент раздувался, и Редактор начинал
+    отказывать по объёму («правка требует синхронного изменения нескольких
+    блоков»). Механизм верный, жадность — нет: "запасной путь, когда точный
+    поиск ничего не нашёл" по-честному значит "фраза живёт в одном конкретном
+    блоке", а не "вот всё, что смутно похоже". Поэтому теперь всегда не больше
+    одного id — лучший по доле; при равенстве долей это настоящая
+    неоднозначность и берётся первый по порядку документа, а не оба сразу
+    (вернуть весь набор при равенстве — тот же дефект, который чинится).
+    [] — если фраза короче _LOCATE_MIN_TOKENS или ни один блок не дотянул до
+    порога.
+    """
+    phrase_tokens = _tokens(phrase)
+    if len(phrase_tokens) < _LOCATE_MIN_TOKENS:
+        return []
+    best_ratio, best_id = 0, None
+    for b in blocks:
+        block_tokens = _tokens(" ".join(_texts(b)))
+        pos = matched = 0
+        for pt in phrase_tokens:
+            try:
+                pos = block_tokens.index(pt, pos) + 1
+                matched += 1
+            except ValueError:
+                pass
+        ratio = matched / len(phrase_tokens)
+        if ratio >= _LOCATE_THRESHOLD and ratio > best_ratio:
+            best_ratio, best_id = ratio, b["id"]
+    return [best_id] if best_id is not None else []
+
+
 def by_regex(blocks, pattern):
     """То же самое, но needle — регулярное выражение (строка или re.Pattern)."""
     rx = re.compile(pattern)
@@ -76,6 +133,9 @@ def outline(blocks):
     находила ноль заголовков и превращала оглавление в плоский список.
     Заголовок — текст целиком с пометкой уровня (H0/H1/H2), чтобы модель
     видела вложенность; обычный абзац — id и обрезанный префикс, как раньше.
+    Абзац без level, но целиком жирный (находка Ф10: «заголовок — это просто
+    жирный абзац») получает пометку [B] — тот же признак, что render() пишет
+    как «весь жирный», но в одну короткую метку, а не в описание.
     """
     lines = []
     for b in blocks:
@@ -87,8 +147,10 @@ def outline(blocks):
         if level is not None:
             lines.append(f'{b["id"]} [H{level}] {text}')
         else:
+            runs = b.get("runs") or []
+            bold = "[B] " if runs and all(r.get("b") for r in runs) else ""
             prefix = text[:_PREFIX] + "…" if len(text) > _PREFIX else text
-            lines.append(f'{b["id"]} {prefix}')
+            lines.append(f'{b["id"]} {bold}{prefix}')
     return "\n".join(lines)
 
 

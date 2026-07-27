@@ -123,14 +123,54 @@ def _truncate(text):
     return text[:300] + "…" if len(text) > 300 else text
 
 
+def _truncate_span(text):
+    return text[:60] + "…" if len(text) > 60 else text
+
+
+_FLAG_ADJ = {"b": "жирный", "i": "курсивный", "u": "подчёркнутый"}
+_FLAG_INSTR = {"b": "жирным", "i": "курсивом", "u": "подчёркнутым"}
+
+
+def _format_note(runs):
+    """Оформление абзаца для тега render(): если флаг стоит на ВСЕХ
+    непустых runs — «весь X» (это и есть «заголовок = жирный абзац» из
+    находки Ф10); иначе — сами размеченные фрагменты текста, обрезанные
+    _truncate_span, чтобы пёстрый абзац не раздул тег."""
+    notes = []
+    for flag in ("b", "i", "u"):
+        flagged = [r for r in runs if r.get(flag)]
+        if not flagged:
+            continue
+        if len(flagged) == len(runs):
+            notes.append(f"весь {_FLAG_ADJ[flag]}")
+        else:
+            spans = ", ".join(f'«{_truncate_span(r["text"])}»' for r in flagged)
+            notes.append(f"{_FLAG_INSTR[flag]}: {spans}")
+    return notes
+
+
+def _tag(b):
+    """Содержимое [] в render(): стиль + то, что реально есть (level/list/
+    оформление). Пустой абзац без ничего этого даёт просто стиль — как раньше."""
+    parts = [b["style"]]
+    if b["level"] is not None:
+        parts.append(f'H{b["level"]}')
+    if b["list"] is not None:
+        parts.append(f'список {b["list"]["ilvl"]}')
+    parts += _format_note(b["runs"])
+    return ", ".join(parts)
+
+
 def render(blocks):
     """Карта для LLM, одна строка на блок: 'p12 [Heading 2] текст' /
     't3 [table 2x2] r0c0:a | r0c1:b ;; r1c0:c | r1c1:d' — r{row}c{col} даёт
-    модели явный адрес ячейки для set_cell."""
+    модели явный адрес ячейки для set_cell. Тег в [] несёт метаданные
+    (стиль/level/list/оформление), текст после [] — дословный текст блока
+    без изменений: patch.validate ищет в нём "old" буквально (находка Ф10)."""
     lines = []
     for b in blocks:
         if b["kind"] == "p":
-            lines.append(f'{b["id"]} [{b["style"]}] {_truncate(b["text"])}')
+            lines.append(f'{b["id"]} [{_tag(b)}] {_truncate(b["text"])}')
         else:
             rows = b["rows"]
             ncols = len(rows[0]) if rows else 0
