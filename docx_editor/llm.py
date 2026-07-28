@@ -51,7 +51,7 @@ def chat(messages: list[dict]) -> dict:
     env = _env()
     url = env["LLM_BASE_URL"].rstrip("/") + "/chat/completions"
     kwargs = dict(
-        headers={"Authorization": f"Bearer {env['AITUNNEL_KEY']}"},
+        headers={"Authorization": f"Bearer {env['LLM_KEY']}"},
         json={
             "model": env["LLM_MODEL"],
             "messages": messages,
