@@ -31,7 +31,11 @@ _NAV_PROMPT = """Ты — навигатор по документу .docx. Те
   остальных случаях rule = null, даже если правка звучит "по всему
   документу". Например, "термин Bi-encoder пишется четырьмя разными
   способами, приведи к одному" — это НЕ rule (это не типографика, а
-  единообразие термина) — это "unify", см. ниже.
+  единообразие термина) — это "unify", см. ниже. "rule" и "unify"
+  взаимоисключающие: kind="unify" ВСЕГДА означает rule=null. "замени е на ё
+  по всему тексту" и "убери запятую в этой фразе" — тоже НЕ rule: rule — это
+  РОВНО два класса выше, никакая другая правка "по всему документу" под них
+  не попадает.
 - "kind" = "unify" — правка требует ОДИНАКОВОГО написания или формата ПО
   ВСЕМУ документу: термин записан несколькими разными способами и их нужно
   привести к одному; годы в нескольких разных форматах; числа через точку
@@ -41,9 +45,11 @@ _NAV_PROMPT = """Ты — навигатор по документу .docx. Те
   способами, приведи к одному"; "годы записаны в трёх разных форматах,
   сделай одинаково"; "числа через точку — замени на запятую по всему
   документу". Отрицательный пример: "замени слово в одном-двух названных
-  местах" — это "local", а не "unify". Для "unify" ids/anchors всё равно
-  заполняются найденными вариантами написания — код использует их, чтобы
-  посчитать частоты.
+  местах" — это "local", а не "unify". Правка, называющая конкретное место
+  (фразу, абзац) — это "local", даже если просит убрать что-то из этого
+  места "везде" внутри него. Для "unify" ids/anchors всё равно заполняются
+  найденными вариантами написания — код использует их, чтобы посчитать
+  частоты.
 - "ids" — id блоков из оглавления, которые точно относятся к правке, если
   видишь их явно. Не пиши id внутрь anchors — это отдельное поле.
 - "anchors" — дословные цитаты ИЗ ТЕКСТА ПРАВКИ, самые специфичные, какие
@@ -251,20 +257,28 @@ def _block_word(n):
     return "блоков"
 
 
+def _variant_counts(blocks, nav, request):
+    """[(вариант, число попаданий)] — те же источники, что и _resolve (якоря
+    Навигатора + дословные цитаты из текста правки), частоты через
+    find.by_text. Вариант с нулём попаданий отбрасывается (найден не по
+    тексту документа, а домыслен). Общая основа для _variant_inventory
+    (строка для промпта Редактора-унификатора) и для _run_unify (Ф18-бис:
+    вердикт проверяется по ЭТОМУ инвентарю, а не по списку пар модели —
+    вариант, который модель не назвала, обязан пропасть из документа тоже)."""
+    variants = _dedupe([_strip_anchor(a) for a in (nav.get("anchors") or [])] + _literals(request))
+    counts = [(v, len(find.by_text(blocks, v))) for v in variants]
+    return [(v, n) for v, n in counts if n > 0]
+
+
 def _variant_inventory(blocks, nav, request):
     """Change 1 (Ф13): при дроблении на кластеры Редактор видит ОДИН кластер и
     "унифицирует" правку вида «выбери одно написание и поставь везде» к тому
     варианту, который уже стоит в этом кластере — он не знает, что есть
-    другие. Инвентарь строится ОДИН раз до цикла кластеров, теми же
-    источниками, что и _resolve (якоря Навигатора + дословные цитаты из
-    текста правки), и частотами через find.by_text — лишнего вызова модели
-    не требует. Вариант с нулём попаданий отбрасывается (найден не по
-    тексту документа, а домыслен), а если различных вариантов с попаданиями
-    меньше двух — для одноцелевой правки это шум, возвращается "".
+    другие. Инвентарь строится ОДИН раз до цикла кластеров и кладётся в
+    начало фрагмента КАЖДОГО кластера. Если различных вариантов с
+    попаданиями меньше двух — для одноцелевой правки это шум, возвращается "".
     """
-    variants = _dedupe([_strip_anchor(a) for a in (nav.get("anchors") or [])] + _literals(request))
-    counts = [(v, len(find.by_text(blocks, v))) for v in variants]
-    counts = [(v, n) for v, n in counts if n > 0]
+    counts = _variant_counts(blocks, nav, request)
     if len(counts) < 2:
         return ""
     parts = ", ".join(f'«{v}» — {n} {_block_word(n)}' for v, n in counts)
@@ -946,18 +960,39 @@ def _run_unify(doc, idx, blocks, nav, request, editor, checker, unifier):
     и весь вердикт делает код (инвариант 1/5) — Проверяющий-LLM на этом пути
     не зовётся вовсе, вердикт — это счёт оставшихся вхождений.
 
-    Инвентарь вариантов (_variant_inventory, переиспользуется, не пишем
-    вторую копию) пуст, если в документе меньше двух реально найденных
-    вариантов — Навигатор промахнулся с маршрутом unify, это обычная
-    локальная (или пустая) правка: тот же путь, что и раньше до Ф18."""
-    inventory = _variant_inventory(blocks, nav, request)
-    if not inventory:
+    Инвентарь (_variant_counts) пуст, если в документе меньше двух реально
+    найденных вариантов — Навигатор промахнулся с маршрутом unify, это
+    обычная локальная (или пустая) правка: тот же путь, что и раньше до Ф18.
+
+    Дефект w13 (ColBERT 7): вердикт "done" сверялся только с ПАРАМИ, которые
+    назвала модель — вариант, который она не назвала (или обрубок вроде
+    "Single-vector" вместо "Single-Vector Bi-encoders"), молча оставался в
+    документе, а код всё равно говорил "заменено". Теперь: (1) применяется
+    только пара, чей old буквально совпадает с посчитанным инвентарём — код
+    посчитал документ, модель нет, невыдуманный вариант не портит текст;
+    (2) все применённые пары обязаны сходиться к ОДНОМУ new — иначе модель
+    не выбрала канон, это честный failed; (3) вердикт проверяется по ВСЕМУ
+    инвентарю, а не по списку пар модели — вариант, не попавший ни в одну
+    применённую пару, тоже обязан пропасть из документа."""
+    counts = _variant_counts(blocks, nav, request)
+    if len(counts) < 2:
         return _run_local(doc, idx, blocks, nav, request, editor, checker)
+    inventory = _variant_inventory(blocks, nav, request)
 
     reply = unifier(inventory, request) or {}
     pairs = [tuple(p) for p in (reply.get("pairs") or []) if isinstance(p, (list, tuple)) and len(p) == 2]
     if not pairs:
         return _failed(reply.get("note") or "модель не предложила ни одной пары для унификации", nav, reply), doc, idx
+
+    variant_set = {v for v, n in counts}
+    pairs = [(old, new) for old, new in pairs if old != new and old in variant_set]
+    if not pairs:
+        return _failed("ни одна пара модели не совпала с реально найденными вариантами написания", nav, reply), doc, idx
+    canonicals = {new for old, new in pairs}
+    if len(canonicals) > 1:
+        reason = "модель не выбрала единый канонический вариант: " + ", ".join(f"«{c}»" for c in canonicals)
+        return _failed(reason, nav, reply), doc, idx
+    canonical = canonicals.pop()
 
     # УБЫВАНИЕ длины old — иначе «Bi-encoder» переписал бы внутренность
     # «Bi-encoders» до того, как до неё дойдёт её собственная пара.
@@ -965,11 +1000,6 @@ def _run_unify(doc, idx, blocks, nav, request, editor, checker, unifier):
     snapshot_path = _snapshot(doc)
     applied, replaced_n = [], 0
     for old, new in pairs:
-        if old == new or not find.by_text(blocks, old):
-            # old==new — пустая пара; old не найден в документе вовсе — модель
-            # назвала невыдуманный вариант, счёт вхождений в конце решит, была
-            # ли это ошибка (design: "не ошибка, финальный счёт решает").
-            continue
         op = {"op": "replace_all", "old": old, "new": new, "word": True}
         err = patch.validate(doc_map(doc, idx), op, doc)
         if err is not None:
@@ -979,8 +1009,13 @@ def _run_unify(doc, idx, blocks, nav, request, editor, checker, unifier):
         m = re.search(r"Заменено (\d+) вхождений", desc)
         replaced_n += int(m.group(1)) if m else 0
 
+    # Вердикт по СВОЕМУ инвентарю (Defect 1), не по списку пар модели.
+    # Вариант, оказавшийся ПОДСТРОКОЙ канонической формы (Defect 2, Математика
+    # 5: канон добавил кавычки вокруг старого текста), не считается
+    # оставшимся — он неизбежно найдётся внутри canonical.
     blocks_after = doc_map(doc, idx)
-    remaining = [old for old, new in pairs if old != new and find.by_regex(blocks_after, _word_pattern(old))]
+    remaining = [v for v, n in counts if v != canonical and v not in canonical
+                 and find.by_regex(blocks_after, _word_pattern(v))]
     if remaining:
         doc, idx = _restore(snapshot_path)
         reason = "не удалось привести к одному написанию, остались варианты: " + ", ".join(f"«{r}»" for r in remaining)
@@ -1038,31 +1073,42 @@ def run_edit(doc, idx, request, navigator=_navigate, editor=_edit_llm, checker=_
     _apply_ops (на пути rule, где Редактора не звали, — 1, как и раньше), не
     декоративная константа.
 
-    Change C: пустой diff у rule — не терминал. Код восстанавливает документ
-    и продолжает ТЕМ ЖЕ запросом обычным локальным путём (_run_local с
-    fallthrough=True) — rule не умеет отличить "уже чисто" от "не умею это
-    делать", это умеет только реальная попытка через Редактора.
+    Change C, расширено дефектом w13: пустой diff у rule ИЛИ rolled_back
+    (Проверяющий отклонил нормализацию — rule ухватил не тот класс дефекта,
+    Математика 2/6) — не терминал. Код продолжает ТЕМ ЖЕ запросом обычным
+    локальным путём (_run_local с fallthrough=True) — rule не умеет отличить
+    "уже чисто"/"не тот класс" от "не умею это делать", это умеет только
+    реальная попытка через Редактора. done у rule — по-прежнему терминал.
 
     Ф18: kind="unify" (навигатор) уходит в _run_unify — там "editor" в reply
     не список ответов по кластерам, а ОДИН ответ unifier (пары "старое"→
-    "новое"), Проверяющий-LLM не зовётся вовсе, вердикт считает код."""
+    "новое"), Проверяющий-LLM не зовётся вовсе, вердикт считает код. unify
+    побеждает rule, даже если Навигатор проставил оба (Defect w13, _NAV_PROMPT
+    объявляет их взаимоисключающими, но модель иногда путает): unify
+    безопасно деградирует до local при тонком инвентаре, а rule на неверно
+    определённой правке портит документ и валит её в rolled_back."""
     blocks = doc_map(doc, idx)
     nav = navigator(find.outline(blocks), request) or {}
     rule = nav.get("rule")
 
+    if nav.get("kind") == "unify":
+        return _run_unify(doc, idx, blocks, nav, request, editor, checker, unifier)
     if not rule:
-        if nav.get("kind") == "unify":
-            return _run_unify(doc, idx, blocks, nav, request, editor, checker, unifier)
         return _run_local(doc, idx, blocks, nav, request, editor, checker)
 
     # Правки типа rule идут мимо Редактора — код нормализует сам, LLM не зовём.
     ops, fragment_text = [{"op": "normalize", "rule": rule}], ""
     result, doc, idx, _tries = _apply_and_check(doc, idx, ops, fragment_text, request, None, nav, None, checker)
-    if result is not None:
+    if result is not None and result.get("verdict") != "rolled_back":
         return result, doc, idx
-    # doc/idx здесь уже НОВАЯ пара из _restore (см. _apply_and_check) — blocks
-    # обязан быть пересчитан на них, старый blocks с прошлого doc использовать нельзя.
-    return _run_local(doc, idx, doc_map(doc, idx), nav, request, editor, checker, fallthrough=True)
+    # doc/idx здесь уже НОВАЯ пара из _restore (см. _finish — и для пустого
+    # diff, и для rolled_back восстановление уже случилось до возврата сюда)
+    # — blocks обязан быть пересчитан на них, старый blocks использовать нельзя.
+    # fallthrough (закрывать already вместо failed, если локальный путь тоже
+    # ничего не нашёл) законен ТОЛЬКО для пустого diff: там rule и Редактор
+    # согласны, что менять нечего. После rolled_back нормализация что-то
+    # изменила, и Проверяющий это отклонил — "менять нечего" было бы неправдой.
+    return _run_local(doc, idx, doc_map(doc, idx), nav, request, editor, checker, fallthrough=result is None)
 
 
 _ITEM_MARKER = re.compile(r"^(?:\*\*(\d+)\.\*\*|(\d+)[.)]|[-*])\s+")

@@ -1778,6 +1778,180 @@ def test_unify_falls_through_to_local_when_inventory_thin():
     print("edit_demo: unify с тонким инвентарём падает обратно на локальный путь")
 
 
+def test_unify_verdict_checks_own_inventory_not_model_reply():
+    # Defect w13 (ColBERT 7): вердикт done сверялся только со списком пар,
+    # который назвала модель — вариант, который она забыла назвать, молча
+    # оставался в документе, а код всё равно говорил "заменено". Три реальных
+    # написания термина, модель называет пары только для ДВУХ из них.
+    doc = Document()
+    doc.add_paragraph("В тексте упомянут Bi-encoder несколько раз.")
+    doc.add_paragraph("Здесь тоже есть Bi-Encoder с большой буквы.")
+    doc.add_paragraph("А тут вариант BiEncoder слитно.")
+    idx = index(doc)
+    before = [b["text"] for b in doc_map(doc, idx)]
+
+    def fake_navigator(outline_text, request):
+        return {"kind": "unify", "rule": None, "ids": [], "anchors": []}
+
+    def fake_unifier(inventory_text, request):
+        assert "Bi-encoder" in inventory_text and "BiEncoder" in inventory_text, inventory_text
+        # "BiEncoder" забыт — ровно дефект ColBERT 7.
+        return {"pairs": [["Bi-encoder", "Bi-Encoder"]], "note": ""}
+
+    def no_editor(*a, **kw):
+        raise AssertionError("Редактор не должен звонить на пути unify")
+
+    def no_checker(*a, **kw):
+        raise AssertionError("Проверяющий-LLM не должен звонить на пути unify")
+
+    request = 'Термин записан как «Bi-encoder», «Bi-Encoder», «BiEncoder» — приведи к одному варианту по всему документу.'
+    result, doc, idx = run_edit(
+        doc, idx, request,
+        navigator=fake_navigator, editor=no_editor, checker=no_checker, unifier=fake_unifier,
+    )
+    assert result["verdict"] == "failed", result
+    assert "BiEncoder" in result["reason"], result["reason"]
+    after = [b["text"] for b in doc_map(doc, idx)]
+    assert after == before, "не названный моделью вариант обязан провалить вердикт и откатить документ"
+    print("edit_demo: unify сверяет done со своим инвентарём, а не со списком пар модели")
+
+
+def test_unify_old_outside_inventory_never_applied():
+    # Defect w13 (ColBERT 7, "Single-vector"→"Bi-encoder"): модель предложила
+    # переписать прилагательное "Single-vector" в термин "Bi-Encoder" — этого
+    # old код не считал (не входит в инвентарь), поэтому применять его нельзя,
+    # даже если find.by_text где-то его находит. Реальные варианты термина при
+    # этом всё равно унифицируются.
+    doc = Document()
+    doc.add_paragraph("Single-vector representations differ from Bi-encoder ones.")
+    doc.add_paragraph("Bi-Encoders are also used widely.")
+    idx = index(doc)
+
+    def fake_navigator(outline_text, request):
+        return {"kind": "unify", "rule": None, "ids": [], "anchors": []}
+
+    def fake_unifier(inventory_text, request):
+        return {"pairs": [["Bi-encoder", "Bi-Encoder"], ["Bi-Encoders", "Bi-Encoder"],
+                           ["Single-vector", "Bi-Encoder"]], "note": ""}
+
+    def no_editor(*a, **kw):
+        raise AssertionError("Редактор не должен звонить на пути unify")
+
+    def no_checker(*a, **kw):
+        raise AssertionError("Проверяющий-LLM не должен звонить на пути unify")
+
+    request = 'Термин записан как «Bi-encoder», «Bi-Encoders» — приведи к одному варианту по всему документу.'
+    result, doc, idx = run_edit(
+        doc, idx, request,
+        navigator=fake_navigator, editor=no_editor, checker=no_checker, unifier=fake_unifier,
+    )
+    assert result["verdict"] == "done", result
+    text = " ".join(b["text"] for b in doc_map(doc, idx))
+    assert "Single-vector representations" in text, "old вне инвентаря обязан быть пропущен, не применён"
+    assert text.count("Bi-Encoder") == 2 and "Bi-encoder" not in text and "Bi-Encoders" not in text, text
+    print("edit_demo: unify пропускает пару, чей old не входит в посчитанный инвентарь")
+
+
+def test_unify_canonical_containing_old_is_done_not_leftover():
+    # Математика 5: канон "«Bi-encoder»" СОДЕРЖИТ старый вариант "Bi-encoder"
+    # как подстроку (модель добавила кавычки) — старый (case-sensitive)
+    # вариант неизбежно "находится" внутри канона, и наивная проверка
+    # остатка ложно откатывала верную правку. Подстрока канона обязана быть
+    # исключена из проверки остатка.
+    doc = Document()
+    doc.add_paragraph("В тексте упомянут Bi-encoder несколько раз.")
+    doc.add_paragraph("Здесь тоже есть bi-encoder с маленькой буквы.")
+    idx = index(doc)
+
+    def fake_navigator(outline_text, request):
+        return {"kind": "unify", "rule": None, "ids": [], "anchors": []}
+
+    def fake_unifier(inventory_text, request):
+        return {"pairs": [["Bi-encoder", "«Bi-encoder»"], ["bi-encoder", "«Bi-encoder»"]], "note": ""}
+
+    def no_editor(*a, **kw):
+        raise AssertionError("Редактор не должен звонить на пути unify")
+
+    def no_checker(*a, **kw):
+        raise AssertionError("Проверяющий-LLM не должен звонить на пути unify")
+
+    request = 'Термин пишется то «Bi-encoder», то «bi-encoder» — возьми в кавычки одинаково по всему документу.'
+    result, doc, idx = run_edit(
+        doc, idx, request,
+        navigator=fake_navigator, editor=no_editor, checker=no_checker, unifier=fake_unifier,
+    )
+    assert result["verdict"] == "done", result
+    text = " ".join(b["text"] for b in doc_map(doc, idx))
+    assert text.count("«Bi-encoder»") == 2, text
+    print("edit_demo: канон, содержащий старый вариант как подстроку, не считается ложным остатком")
+
+
+def test_unify_wins_when_rule_also_set():
+    # Defect w13 (Математика 2/6): после того как в _NAV_PROMPT появился
+    # unify, Навигатор иногда стал ставить rule И kind=unify одновременно.
+    # Путь rule на неверно определённой правке портит документ и валит её в
+    # rolled_back — unify обязан победить, даже если Навигатор проставил оба.
+    doc = Document()
+    doc.add_paragraph("Модель COLBERT показывает высокое качество.")
+    doc.add_paragraph("ColBERT — базовая архитектура.")
+    idx = index(doc)
+
+    def fake_navigator(outline_text, request):
+        return {"kind": "unify", "rule": "typography", "ids": [], "anchors": []}
+
+    def fake_unifier(inventory_text, request):
+        return {"pairs": [["COLBERT", "ColBERT"]], "note": ""}
+
+    def no_editor(*a, **kw):
+        raise AssertionError("Редактор не должен звонить на пути unify")
+
+    def no_checker(*a, **kw):
+        raise AssertionError("Проверяющий-LLM не должен звонить — rule-путь не имеет права запускаться, когда kind=unify")
+
+    request = 'Термин записан как «COLBERT», «ColBERT» — приведи к одному варианту по всему документу.'
+    result, doc, idx = run_edit(
+        doc, idx, request,
+        navigator=fake_navigator, editor=no_editor, checker=no_checker, unifier=fake_unifier,
+    )
+    assert result["verdict"] == "done", result
+    assert result["reason"].startswith("заменено"), "формулировка вердикта обязана быть с пути unify, не rule"
+    print("edit_demo: unify побеждает, даже если Навигатор проставил rule вместе с ним")
+
+
+def test_rule_rolled_back_falls_through_to_local_done():
+    # Defect w13 (Математика 2/6): rule нашёл дефект, но не тот, каким была
+    # правка — normalize поправил посторонний двойной пробел, Проверяющий
+    # справедливо сказал "это не та правка". Раньше rolled_back у rule был
+    # терминальным, и решаемая правка (замена термина) гибла вместе с ним.
+    # Теперь rolled_back продолжает ТЕМ ЖЕ запросом обычный локальный путь.
+    doc = Document()
+    doc.add_paragraph("Тут  двойной пробел, а ниже старый термин, который нужно заменить.")
+    idx = index(doc)
+
+    def fake_navigator(outline_text, request):
+        return {"kind": "local", "rule": "typography", "ids": [], "anchors": []}
+
+    def fake_editor(fragment_text, request, feedback=None):
+        return {"ops": [{"op": "replace_text", "id": "p0", "old": "старый термин", "new": "новый термин"}]}
+
+    def fake_checker(request, diff):
+        text = " ".join(d.get("after", "") for d in diff)
+        if "новый термин" in text:
+            return {"ok": True, "reason": "термин заменён"}
+        return {"ok": False, "reason": "это не та правка — исправился только пробел"}
+
+    result, doc, idx = run_edit(
+        doc, idx, "Замени «старый термин» на «новый термин».",
+        navigator=fake_navigator, editor=fake_editor, checker=fake_checker,
+    )
+
+    assert result["verdict"] == "done", result
+    after_text = next(b["text"] for b in doc_map(doc, idx) if b["id"] == "p0")
+    assert "Тут  двойной пробел" in after_text, "нормализация обязана быть полностью откатана перед локальным путём"
+    assert "новый термин" in after_text and "старый термин" not in after_text, after_text
+    print("edit_demo: rolled_back у rule продолжает локальным путём и доводит правку до done")
+
+
 if __name__ == "__main__":
     test_split_real_file()
     test_fallback_search_then_honest_refusal()
@@ -1831,3 +2005,8 @@ if __name__ == "__main__":
     test_unify_word_flag_protects_plural_form()
     test_unify_empty_pairs_is_honest_failed()
     test_unify_falls_through_to_local_when_inventory_thin()
+    test_unify_verdict_checks_own_inventory_not_model_reply()
+    test_unify_old_outside_inventory_never_applied()
+    test_unify_canonical_containing_old_is_done_not_leftover()
+    test_unify_wins_when_rule_also_set()
+    test_rule_rolled_back_falls_through_to_local_done()
