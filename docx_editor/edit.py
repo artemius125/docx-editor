@@ -609,7 +609,12 @@ def _apply_ops(doc, idx, ops, fragment_text, request, editor, fragment_ids=None,
                 _record_batch_write(op, targets, written)
             i += 1
             continue
-        if _redundant_in_batch(op, idx, written):
+        # пропуск — только для отказов ВАЛИДАТОРА. Операция вне полосы (out)
+        # нарушает другую границу: кластер правит блок, которого ему не
+        # показывали. Общий на всю правку written сделал такие операции
+        # «избыточными» и глушил гвард полосы — поймано демо
+        # test_invalid_cluster_aborts_whole_edit.
+        if out is None and _redundant_in_batch(op, idx, written):
             applied.append(f'пропущена операция {op.get("op")} (old={op.get("old")!r}) — избыточна относительно более ранней операции этого же батча: {err}')
             i += 1
             continue
@@ -818,6 +823,17 @@ def _run_clusters(doc, idx, blocks, ids, request, editor, checker, nav, fallthro
             # Редактора; тупик, ретрай не спасает. Пропускаем кластер честно.
             continue
         fragment_text = render(frag_blocks)
+        # ПАРТИЯ 5: кластеры слепы друг к другу, а текст правки каждый получает
+        # ЦЕЛИКОМ — отсюда двойная работа и откат чужой. Замерено: ColBERT 14
+        # расшифровала MRR@10 дважды в двух кластерах (Проверяющий завернул
+        # всю правку), ColBERT 4 — третий кластер предложил вернуть точку
+        # вместо запятой в числе, которое первый уже исправил. Форма та же,
+        # что у инвентаря вариантов: посчитанная кодом строка в начало
+        # фрагмента, лишнего вызова модели не нужно.
+        if applied_all:
+            done_note = "Уже сделано в этой правке (не повторяй и не отменяй):\n" + "\n".join(
+                f"- {a}" for a in applied_all)
+            fragment_text = f"{done_note}\n\n{fragment_text}"
         if inventory:
             fragment_text = f"{inventory}\n\n{fragment_text}"
         fragment_ids = {b["id"] for b in frag_blocks}

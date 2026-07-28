@@ -5,6 +5,7 @@
 """
 
 import os
+import re
 
 from docx import Document
 from docx.oxml import OxmlElement
@@ -560,7 +561,11 @@ def test_scattered_targets_three_calls_one_verdict():
 
     def fake_editor(fragment_text, request, feedback=None):
         calls.append(fragment_text)
-        present = [t for t in target_ids if f"{t} " in fragment_text]
+        # считаем ТОЛЬКО строки блоков: перед фрагментом код может положить
+        # свои приписки (инвентарь вариантов, «уже сделано в этой правке»),
+        # и цитаты в них не являются целями кластера
+        block_lines = [ln for ln in fragment_text.splitlines() if re.match(r"[pt]\d+ \[", ln)]
+        present = [t for t in target_ids if any(ln.startswith(f"{t} ") for ln in block_lines)]
         assert len(present) == 1, f"кластер обязан нести ровно одну цель: {fragment_text!r}"
         return {"ops": [{"op": "replace_text", "id": present[0], "old": "обычный", "new": "изменённый"}]}
 
@@ -703,7 +708,10 @@ def test_many_scattered_targets_no_cap():
 
     def fake_editor(fragment_text, request, feedback=None):
         calls.append(fragment_text)
-        present = [t for t in target_ids if f"{t} " in fragment_text]
+        # цели считаем по строкам блоков: приписки кода перед фрагментом
+        # (инвентарь вариантов, «уже сделано») целями кластера не являются
+        block_lines = [ln for ln in fragment_text.splitlines() if re.match(r"[pt]\d+ \[", ln)]
+        present = [t for t in target_ids if any(ln.startswith(f"{t} ") for ln in block_lines)]
         assert len(present) == 1, fragment_text
         return {"ops": [{"op": "replace_text", "id": present[0], "old": "наполнитель", "new": "правка"}]}
 
@@ -1542,6 +1550,44 @@ def test_editor_already_gives_already_not_failed():
     print("edit_demo: already на локальном пути отличается от «не умею»")
 
 
+def test_later_clusters_see_what_earlier_ones_did():
+    """ПАРТИЯ 5: кластер видит, что уже сделали предыдущие.
+
+    Замерено: ColBERT 14 расшифровала MRR@10 дважды в двух слепых друг к
+    другу кластерах (Проверяющий завернул всю правку), ColBERT 4 — третий
+    кластер предложил вернуть точку вместо запятой в числе, которое первый
+    уже исправил. Текст правки каждый кластер получает ЦЕЛИКОМ, поэтому без
+    приписки он не может знать, что часть работы сделана.
+    """
+    doc = Document()
+    for i in range(12):
+        doc.add_paragraph(f"Абзац {i}: обычный текст.")
+    idx = index(doc)
+    seen = []
+
+    def fake_navigator(outline_text, request):
+        return {"kind": "local", "rule": None, "ids": ["p0", "p6"], "anchors": []}
+
+    def fake_editor(fragment_text, request, feedback=None):
+        seen.append(fragment_text)
+        target = "p0" if any(ln.startswith("p0 ") for ln in fragment_text.splitlines()) else "p6"
+        return {"ops": [{"op": "replace_text", "id": target, "old": "обычный", "new": "изменённый"}]}
+
+    def fake_checker(request, diff):
+        return {"ok": True, "reason": "ok"}
+
+    result, doc, idx = run_edit(
+        doc, idx, "замени 'обычный' на 'изменённый' в двух местах",
+        navigator=fake_navigator, editor=fake_editor, checker=fake_checker,
+    )
+    assert result["verdict"] == "done", result
+    assert len(seen) == 2, seen
+    assert "Уже сделано" not in seen[0], "первому кластеру приписывать нечего"
+    assert "Уже сделано в этой правке" in seen[1], seen[1]
+    assert "В p0 заменено" in seen[1], seen[1]
+    print("edit_demo: второй кластер получает список уже сделанного в этой правке")
+
+
 if __name__ == "__main__":
     test_split_real_file()
     test_fallback_search_then_honest_refusal()
@@ -1588,3 +1634,4 @@ if __name__ == "__main__":
     test_targets_computed_after_validate_not_before()
     test_numeric_literals_are_anchors()
     test_editor_already_gives_already_not_failed()
+    test_later_clusters_see_what_earlier_ones_did()
