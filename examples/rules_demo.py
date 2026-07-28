@@ -10,9 +10,11 @@ from docx import Document
 
 from docx_editor.parse import doc_map, index
 from docx_editor.patch import apply, validate
+from docx_editor import rules
 from docx_editor.rules import typography
 
 REAL_DOC = "/home/artem/Загрузки/Архитектура_ColBERT.docx"
+MATH_DOC = "/home/artem/Загрузки/Математика как основа.docx"
 _WS_BEFORE_PUNCT = re.compile(r"[^\S\n]+(?=[,.:;!?)\]}»])")
 _GLUED = re.compile(r"([A-Za-zА-Яа-яЁё])\.([A-ZА-ЯЁ])")
 _DECIMALS = ["4.2%", "0.4448", "0.4436", "8.8", "36.2%", "6.7%"]
@@ -72,7 +74,33 @@ def test_invisible_chars_synthetic():
     print("rules_demo: невидимые символы вырезаны на синтетике")
 
 
+def test_whitespace_rules_on_real_doc():
+    """ПАРТИЯ 3: двойной и висячий пробелы по ВСЕМУ документу.
+
+    Математика 1 просит убрать два названных места «и заодно проверить весь
+    текст на такое же». В замере w9 это уходило Редактору, он чинил ровно
+    процитированное и не доходил до блока 50 — вердикт «сделано» при
+    невыполненной правке. Смысл здесь не нужен, поэтому чинит код.
+    """
+    doc = Document(MATH_DOC)
+    blocks = doc_map(doc, index(doc))
+    bad = [b["id"] for b in blocks
+           if b["kind"] == "p" and ("  " in b["text"] or b["text"].endswith(" "))]
+    assert len(bad) == 3, bad  # 1 двойной + 2 висячих, замерено на файле
+
+    note = rules.typography(doc)
+    assert "схлопнуто двойных пробелов — 1" in note, note
+    assert "убрано висячих пробелов в конце абзаца — 2" in note, note
+
+    blocks = doc_map(doc, index(doc))
+    left = [b["id"] for b in blocks
+            if b["kind"] == "p" and ("  " in b["text"] or b["text"].endswith(" "))]
+    assert not left, left
+    print("rules_demo: двойные и висячие пробелы убраны по всему документу")
+
+
 if __name__ == "__main__":
     test_typography_on_real_doc()
     test_quotes_on_real_doc_and_bad_rule()
     test_invisible_chars_synthetic()
+    test_whitespace_rules_on_real_doc()

@@ -26,7 +26,8 @@ _NAV_PROMPT = """Ты — навигатор по документу .docx. Те
   одному из двух названных классов, других классов rule не бывает:
   "typography" — лишний пробел перед двоеточием/точкой с запятой/закрывающей
   скобкой, слипшиеся предложения (нет пробела после точки между ними),
-  невидимые символы; "quotes" — прямые кавычки вместо ёлочек. Во всех
+  невидимые символы, двойные пробелы внутри строки, висячий пробел в конце
+  абзаца; "quotes" — прямые кавычки вместо ёлочек. Во всех
   остальных случаях rule = null, даже если правка звучит "по всему
   документу". Например, "термин Bi-encoder пишется четырьмя разными
   способами, приведи к одному" — это НЕ rule (это не типографика, а
@@ -54,9 +55,13 @@ _EDIT_PROMPT = """Ты — редактор документа .docx. Тебе �
 часть текста для правки); канонический вариант выбирается ОДИН раз и
 действует во всех фрагментах этой правки, а не только в показанном здесь.
 Верни ТОЛЬКО JSON {"ops": [...]} — операции над блоками ИЗ ЭТОГО ФРАГМЕНТА.
-Если правку нельзя выразить перечисленными операциями — не подменяй её
-похожей и не изобретай новую: верни {"ops": [], "note": "почему нельзя"},
-это честный и ожидаемый ответ, а не провал.
+Если менять нечего — не выдумывай изменение: верни
+{"ops": [], "already": true, "note": "что именно уже так"}. Это ответ для
+случая, когда документ УЖЕ в том виде, которого просит правка.
+Если же правку нельзя выразить перечисленными операциями — не подменяй её
+похожей и не изобретай новую: верни {"ops": [], "already": false,
+"note": "почему нельзя"}. Оба ответа честные и ожидаемые, а не провал, но
+путать их нельзя: первый говорит «сделано до нас», второй — «не умею».
 
 Операции (id — только из фрагмента, other — новых не изобретать):
 {"op":"replace_text","id":"p12","old":"...","new":"..."} — заменить кусок текста в абзаце
@@ -542,7 +547,7 @@ def _redundant_in_batch(op, idx, written):
     return False
 
 
-def _apply_ops(doc, idx, ops, fragment_text, request, editor, fragment_ids=None):
+def _apply_ops(doc, idx, ops, fragment_text, request, editor, fragment_ids=None, written=None):
     """Применяет ops по очереди; на невалидной операции — один ретрай к
     Редактору с текстом ошибки (editor=None — ретрая нет, путь rule). Второй
     провал (или провал без Редактора) останавливает применение немедленно.
@@ -572,7 +577,14 @@ def _apply_ops(doc, idx, ops, fragment_text, request, editor, fragment_ids=None)
     Такая операция молча пропускается (запись в applied честно называет её
     пропущенной), ретрай не тратится, батч не падает из-за собственного же
     прогресса (ColBERT 7, Математика 14)."""
-    applied, retried, i, written = [], False, 0, {}
+    # written приходит снаружи и общий на всю правку (ПАРТИЯ 2, замер w10):
+    # ColBERT 4 — первый кластер починил три числа через replace_text, второй
+    # предложил replace_all на те же три, их в документе уже нет → жёсткая
+    # ошибка и откат всей правки. Внутри одного вызова это ловит
+    # _redundant_in_batch, но между кластерами written обнулялся.
+    applied, retried, i = [], False, 0
+    if written is None:
+        written = {}
     while i < len(ops):
         op = ops[i]
         out = _out_of_lane(op, fragment_ids) if fragment_ids is not None else None
@@ -795,6 +807,7 @@ def _run_clusters(doc, idx, blocks, ids, request, editor, checker, nav, fallthro
     inventory = _variant_inventory(blocks, nav, request)
 
     applied_all, editor_replies, tries_total, partial, replace_all_seen = [], [], 0, False, set()
+    written = {}  # общий на все кластеры правки, см. _apply_ops
     for cluster_ids in clusters:
         pre_cluster = doc_map(doc, idx)
         frag_blocks = find.fragment(pre_cluster, cluster_ids, around=1)
@@ -822,7 +835,7 @@ def _run_clusters(doc, idx, blocks, ids, request, editor, checker, nav, fallthro
         replace_all_seen |= {(o.get("old"), o.get("new")) for o in ops if o.get("op") == "replace_all"}
         if not ops:
             continue
-        applied, err, cluster_tries = _apply_ops(doc, idx, ops, fragment_text, request, editor, fragment_ids)
+        applied, err, cluster_tries = _apply_ops(doc, idx, ops, fragment_text, request, editor, fragment_ids, written)
         tries_total += cluster_tries - 1  # первый вызов кластера уже посчитан выше, тут доучитывается только ретрай
         applied_all += applied
         if err is not None:
@@ -835,6 +848,17 @@ def _run_clusters(doc, idx, blocks, ids, request, editor, checker, nav, fallthro
         doc, idx = _restore(snapshot_path)
         if fallthrough:
             reason = "нормализация ничего не нашла, и Редактор ни в одном кластере не предложил операций — оба пути согласны, что менять нечего"
+            return _already(reason, nav, editor_replies, tries_total), doc, idx
+        # ПАРТИЯ 4: Редактор умеет сказать «здесь уже всё так» (already=true),
+        # и это правильный исход, а не отказ — ColBERT 15 просит переставить
+        # уровни списка, которые в документе УЖЕ расставлены верно (проверено
+        # по файлу: p51/54/57 — ilvl 0, остальные ilvl 1). Раньше вердикт
+        # «уже так» жил только на пути rule, и верный ответ модели
+        # записывался как failed. Условие двойное: так сказал КАЖДЫЙ кластер
+        # И код подтвердил, что изменений нет (applied_all пуст) — по одному
+        # заявлению модели already не выдаётся (инвариант 5).
+        if editor_replies and all(r.get("already") is True for r in editor_replies):
+            reason = "Редактор во всех кластерах сообщил, что менять нечего — документ уже в требуемом виде"
             return _already(reason, nav, editor_replies, tries_total), doc, idx
         return _failed("редактор не предложил операций ни в одном из кластеров", nav, editor_replies, tries_total, applied_all), doc, idx
 

@@ -1499,6 +1499,49 @@ def test_numeric_literals_are_anchors():
     print("edit_demo: числа из текста правки работают якорями наравне с цитатами")
 
 
+def test_editor_already_gives_already_not_failed():
+    """ПАРТИЯ 4: «здесь уже всё так» — правильный исход, а не отказ.
+
+    ColBERT 15 просит переставить уровни списка, которые в документе УЖЕ
+    расставлены верно, и Редактор честно это сообщает. Раньше вердикт «уже
+    так» жил только на пути rule, и верный ответ модели записывался как
+    failed. Мерило проекта — совпадение вердикта с файлом, а не число
+    выполненных правок, поэтому такая метка была ложью в свою сторону.
+    """
+    doc = Document()
+    for i in range(10):
+        doc.add_paragraph(f"Абзац {i}: обычный текст.")
+    idx = index(doc)
+    before = [b["text"] for b in doc_map(doc, idx)]
+
+    def fake_navigator(outline_text, request):
+        return {"kind": "local", "rule": None, "ids": ["p0", "p7"], "anchors": []}
+
+    def fake_checker(request, diff):
+        raise AssertionError("Проверяющий не зовётся: менять нечего, diff пуст")
+
+    def editor_already(fragment_text, request, feedback=None):
+        return {"ops": [], "already": True, "note": "уже в требуемом виде"}
+
+    result, doc, idx = run_edit(
+        doc, idx, "приведи к нужному виду",
+        navigator=fake_navigator, editor=editor_already, checker=fake_checker,
+    )
+    assert result["verdict"] == "already", result
+    assert [b["text"] for b in doc_map(doc, idx)] == before
+
+    # «не умею» остаётся отказом — путать эти два ответа нельзя
+    def editor_cannot(fragment_text, request, feedback=None):
+        return {"ops": [], "already": False, "note": "нет подходящей операции"}
+
+    result, doc, idx = run_edit(
+        doc, idx, "сделай сноску",
+        navigator=fake_navigator, editor=editor_cannot, checker=fake_checker,
+    )
+    assert result["verdict"] == "failed", result
+    print("edit_demo: already на локальном пути отличается от «не умею»")
+
+
 if __name__ == "__main__":
     test_split_real_file()
     test_fallback_search_then_honest_refusal()
@@ -1544,3 +1587,4 @@ if __name__ == "__main__":
     test_cluster_with_removed_targets_skipped_not_dead_end()
     test_targets_computed_after_validate_not_before()
     test_numeric_literals_are_anchors()
+    test_editor_already_gives_already_not_failed()
