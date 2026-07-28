@@ -1139,6 +1139,92 @@ def test_partial_cluster_processing_not_done():
     print(f"edit_demo: частично обработанный набор кластеров не даёт done, verdict={result['verdict']!r}")
 
 
+def test_retry_recomputes_fragment_after_batch_mutation():
+    # Ф13-бис (ColBERT 19, живое воспроизведение): батч удаляет p2, p3, p4,
+    # затем insert_after падает на p3, которого сам же батч и удалил. Ретрай
+    # обязан увидеть ТЕКУЩЕЕ состояние документа (p2/p3/p4 уже нет), а не
+    # снимок, снятый до батча, — иначе Редактор честно видит их живыми и
+    # предлагает удалить снова, и это бьёт "блок не найден в документе".
+    doc = Document()
+    for i in range(7):
+        doc.add_paragraph(f"Абзац {i}: наполнитель.")
+    idx = index(doc)
+
+    def fake_navigator(outline_text, request):
+        return {"kind": "local", "rule": None, "ids": ["p1", "p2", "p3", "p4", "p5"], "anchors": []}
+
+    retry_fragments = []
+
+    def fake_editor(fragment_text, request, feedback=None):
+        if feedback is None:
+            return {"ops": [
+                {"op": "delete", "id": "p2"},
+                {"op": "delete", "id": "p3"},
+                {"op": "delete", "id": "p4"},
+                {"op": "insert_after", "id": "p3", "text": "Новый абзац.", "style": "Normal"},
+            ]}
+        retry_fragments.append(fragment_text)
+        # Улика бага: если бы фрагмент был снят ДО батча, p2/p3/p4 всё ещё
+        # выглядели бы живыми здесь.
+        assert "p2 [" not in fragment_text and "p3 [" not in fragment_text and "p4 [" not in fragment_text, fragment_text
+        assert "p1 [" in fragment_text and "p5 [" in fragment_text, fragment_text
+        return {"ops": [{"op": "insert_after", "id": "p5", "text": "Новый абзац.", "style": "Normal"}]}
+
+    def fake_checker(request, diff):
+        return {"ok": True, "reason": "ok"}
+
+    result, doc, idx = run_edit(
+        doc, idx, "удали три абзаца из середины и добавь новый после последнего оставшегося",
+        navigator=fake_navigator, editor=fake_editor, checker=fake_checker,
+    )
+
+    assert len(retry_fragments) == 1, "ретрай обязан случиться ровно один раз"
+    assert result["verdict"] == "done", result
+    texts = [b["text"] for b in doc_map(doc, idx)]
+    assert not any("Абзац 2" in t or "Абзац 3" in t or "Абзац 4" in t for t in texts), texts
+    assert any("Новый абзац" in t for t in texts), texts
+    print("edit_demo: ретрай после мутации батча получил ТЕКУЩЕЕ состояние документа, а не снимок до батча")
+
+
+def test_failed_records_ops_applied_before_batch_failure():
+    # Ф13-бис (ColBERT 19): даже когда правка в итоге failed (ретрай тоже не
+    # спас — Редактор игнорирует feedback и повторяет невалидный ops), три
+    # реальных delete, применённые ДО сбоя, обязаны остаться в "applied", а
+    # не пропадать бесследно — документ при этом всё равно откатывается.
+    doc = Document()
+    for i in range(7):
+        doc.add_paragraph(f"Абзац {i}: наполнитель.")
+    idx = index(doc)
+    before = [b["text"] for b in doc_map(doc, idx)]
+
+    def fake_navigator(outline_text, request):
+        return {"kind": "local", "rule": None, "ids": ["p1", "p2", "p3", "p4", "p5"], "anchors": []}
+
+    def fake_editor(fragment_text, request, feedback=None):
+        return {"ops": [
+            {"op": "delete", "id": "p2"},
+            {"op": "delete", "id": "p3"},
+            {"op": "delete", "id": "p4"},
+            # невалидна что при первой попытке, что при ретрае (feedback игнорируется нарочно)
+            {"op": "replace_text", "id": "p1", "old": "текста, которого тут нет", "new": "х"},
+        ]}
+
+    def fake_checker(request, diff):
+        raise AssertionError("Проверяющий не должен вызываться — правка обязана прерваться раньше")
+
+    result, doc, idx = run_edit(
+        doc, idx, "удали три абзаца из середины",
+        navigator=fake_navigator, editor=fake_editor, checker=fake_checker,
+    )
+
+    assert result["verdict"] == "failed", result
+    assert len(result["applied"]) == 3, result["applied"]
+    assert all("удал" in a for a in result["applied"]), result["applied"]
+    after = [b["text"] for b in doc_map(doc, idx)]
+    assert after == before, "документ обязан откатиться, несмотря на непустой applied"
+    print(f"edit_demo: failed сохранил {len(result['applied'])} операций, реально применённых до сбоя, документ откачен")
+
+
 if __name__ == "__main__":
     test_split_real_file()
     test_fallback_search_then_honest_refusal()
@@ -1174,3 +1260,5 @@ if __name__ == "__main__":
     test_variant_inventory_absent_for_single_target()
     test_collision_feedback_lets_retry_succeed()
     test_partial_cluster_processing_not_done()
+    test_retry_recomputes_fragment_after_batch_mutation()
+    test_failed_records_ops_applied_before_batch_failure()

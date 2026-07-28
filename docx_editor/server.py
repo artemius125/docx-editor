@@ -122,8 +122,9 @@ async def edit(prompt: str = Form(...), session: str = Form(...)):
 
 
 @app.get("/logs")
-def logs(session: str | None = None, n: int = 50):
-    """Хвост журнала правок (docx_editor/log.py), опционально по сессии."""
+def logs(session: str, n: int = 50):
+    """Хвост журнала правок (docx_editor/log.py) — только заданной сессии.
+    session обязателен: без него ручка отдавала бы журнал всех сессий (Ф10)."""
     return log.tail(session, n)
 
 

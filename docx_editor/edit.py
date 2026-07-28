@@ -510,6 +510,12 @@ def _apply_ops(doc, idx, ops, fragment_text, request, editor, fragment_ids=None)
         if retried or editor is None:
             return applied, err, 2 if retried else 1
         retried = True
+        if fragment_ids is not None:
+            # Находка Ф13-бис (ColBERT 19): предыдущие операции ЭТОГО ЖЕ батча уже
+            # могли удалить/переместить блоки — ретрай обязан увидеть ТЕКУЩЕЕ
+            # состояние документа, а не снимок, снятый до начала батча, иначе
+            # Редактор предлагает удалить уже удалённое и валидатор бьёт "блок не найден".
+            fragment_text = render(find.fragment(doc_map(doc, idx), fragment_ids, around=1))
         feedback = f'Операция {op} не прошла проверку: {err}. Пришли исправленный {{"ops": [...]}}.'
         reply = editor(fragment_text, request, feedback=feedback) or {}
         ops = _clean_ops(reply.get("ops"))
@@ -519,11 +525,16 @@ def _apply_ops(doc, idx, ops, fragment_text, request, editor, fragment_ids=None)
     return applied, None, 2 if retried else 1
 
 
-def _failed(reason, nav=None, editor_reply=None, tries=1):
+def _failed(reason, nav=None, editor_reply=None, tries=1, applied=None):
     """reply/iter обязаны быть в каждой записи, включая честные отказы —
-    именно они интереснее всего в журнале для разбора «куда целился Навигатор»."""
+    именно они интереснее всего в журнале для разбора «куда целился Навигатор».
+
+    applied (Ф13-бис): операции, реально применённые к документу ДО сбоя,
+    даже если документ откатан снимком, — раньше поле жёстко писалось [],
+    и след (например три реальных delete перед упавшим insert_after) исчезал
+    из журнала, хотя откат документа при этом был верным."""
     return {
-        "verdict": "failed", "reason": reason, "applied": [], "ids": [],
+        "verdict": "failed", "reason": reason, "applied": applied or [], "ids": [],
         "iter": tries, "reply": {"nav": nav, "editor": editor_reply},
     }
 
@@ -613,7 +624,7 @@ def _apply_and_check(doc, idx, ops, fragment_text, request, use_editor, nav, edi
 
     if not applied:
         doc, idx = _restore(snapshot_path)
-        return _failed(err or "ни одна операция не применилась", nav, editor_reply, tries), doc, idx, tries
+        return _failed(err or "ни одна операция не применилась", nav, editor_reply, tries, applied), doc, idx, tries
 
     return _finish(doc, idx, snapshot_path, blocks_before, applied, request, checker, nav, editor_reply, tries)
 
@@ -702,7 +713,7 @@ def _run_clusters(doc, idx, blocks, ids, request, editor, checker, nav, fallthro
         applied_all += applied
         if err is not None:
             doc, idx = _restore(snapshot_path)
-            return _failed(err, nav, editor_replies, tries_total), doc, idx
+            return _failed(err, nav, editor_replies, tries_total, applied_all), doc, idx
         if not _diff(pre_cluster, doc_map(doc, idx)):
             partial = True  # ops применились без ошибки, но эта цель по факту не обработана
 
@@ -711,7 +722,7 @@ def _run_clusters(doc, idx, blocks, ids, request, editor, checker, nav, fallthro
         if fallthrough:
             reason = "нормализация ничего не нашла, и Редактор ни в одном кластере не предложил операций — оба пути согласны, что менять нечего"
             return _already(reason, nav, editor_replies, tries_total), doc, idx
-        return _failed("редактор не предложил операций ни в одном из кластеров", nav, editor_replies, tries_total), doc, idx
+        return _failed("редактор не предложил операций ни в одном из кластеров", nav, editor_replies, tries_total, applied_all), doc, idx
 
     diff_all = _diff(blocks_before, doc_map(doc, idx))
     if partial and diff_all:

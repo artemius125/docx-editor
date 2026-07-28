@@ -226,6 +226,12 @@ def test_crash_does_not_lose_saved_progress(main_session=None):
         assert all(r["session"] == main_session for r in main_logs), main_logs
         assert not any(CRASH_MARKER in r["task_text"] for r in main_logs), main_logs
 
+        # Ф10-находка: GET /logs без session отдавал журнал ВСЕХ сессий —
+        # session теперь обязателен, ручка обязана отказать (422), а не
+        # молча слить обе сессии разом.
+        no_session = client.get("/logs")
+        assert no_session.status_code == 422, no_session.text
+
     print("server_demo: падение внутри /edit долетает наружу, правка 1 уже на диске, журнал фильтрует по сессии")
 
 

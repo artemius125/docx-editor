@@ -1,8 +1,12 @@
 """Приёмка patch.py: девять операций на маленьком документе + валидатор невалидных патчей."""
 
+import io
+
 from docx import Document
+from docx.opc.constants import RELATIONSHIP_TYPE as RT
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
+from docx.oxml.parser import parse_xml
 
 from docx_editor.parse import doc_map, index
 from docx_editor.patch import _HANDLERS, _OPS, apply, validate
@@ -377,6 +381,114 @@ def test_set_list_level():
     print("patch_demo: set_list_level меняет ilvl и сохраняет numId, отказан на абзаце вне списка")
 
 
+def test_delete_rejects_long_paragraph():
+    # di-base (Математика 16, 18): задача «сжать текст» обернулась стиранием
+    # абзацев 279-508 знаков через delete — validate обязан отбивать это ДО
+    # применения, короткие абзацы (заголовки, подписи) остаются разрешены.
+    doc = Document(REAL_DOC)
+    idx = index(doc)
+    blocks = doc_map(doc, idx)
+
+    long_block = next(b for b in blocks if b["kind"] == "p" and len(b["text"]) > 150)
+    err = validate(blocks, {"op": "delete", "id": long_block["id"]}, doc)
+    assert isinstance(err, str) and long_block["id"] in err, err
+
+    short_block = next(b for b in blocks if b["kind"] == "p" and 0 < len(b["text"]) <= 150)
+    assert validate(blocks, {"op": "delete", "id": short_block["id"]}, doc) is None
+
+    print("patch_demo: delete длинного абзаца отбит валидатором, короткий пропущен")
+
+
+def test_footnote_new_and_existing_part():
+    # Математика 19: несколько сносок подряд в документе, где footnotes.xml
+    # изначально нет вовсе. Первая сноска создаёт часть, вторая — дописывает
+    # в неё же (не пересоздаёт), id не коллизят с зарезервированными -1/0.
+    # Проверка идёт через реальный save()/Document() — только чтение живых
+    # lxml-элементов в памяти не поймало бы поломанную связь в .rels или
+    # отсутствующую запись в [Content_Types].xml.
+    doc = Document(REAL_DOC)
+    idx = index(doc)
+    blocks = doc_map(doc, idx)
+
+    paras = [b for b in blocks if b["kind"] == "p" and len(b["text"]) > 30]
+    p1, p2 = paras[0], paras[1]
+    anchor1 = " ".join(p1["text"].split()[:3])
+    anchor2 = " ".join(p2["text"].split()[:3])
+
+    op1 = {"op": "footnote", "id": p1["id"], "old": anchor1, "text": "Первая сноска: [уточнить]."}
+    assert validate(blocks, op1, doc) is None
+    apply(doc, idx, op1)
+
+    rels = [r for r in doc.part.rels.values() if r.reltype == RT.FOOTNOTES]
+    assert len(rels) == 1, "footnotes.xml должен создаться ровно один раз"
+
+    blocks = doc_map(doc, idx)
+    op2 = {"op": "footnote", "id": p2["id"], "old": anchor2, "text": "Вторая сноска, другая."}
+    assert validate(blocks, op2, doc) is None
+    apply(doc, idx, op2)
+
+    rels_after = [r for r in doc.part.rels.values() if r.reltype == RT.FOOTNOTES]
+    assert len(rels_after) == 1, "вторая сноска не должна была пересоздать часть footnotes.xml"
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+    doc2 = Document(buf)
+    idx2 = index(doc2)
+    blocks2 = doc_map(doc2, idx2)
+
+    def _real_ids(fpart_element):
+        return sorted(int(fn.get(qn("w:id"))) for fn in fpart_element.findall(qn("w:footnote"))
+                      if int(fn.get(qn("w:id"))) >= 1)
+
+    def _footnote_text(fpart_element, fid):
+        fn = next(fn for fn in fpart_element.findall(qn("w:footnote")) if fn.get(qn("w:id")) == str(fid))
+        return "".join(t.text or "" for t in fn.iter(qn("w:t")))
+
+    # doc2.part_related_by(RT.FOOTNOTES) на СВЕЖЕОТКРЫТОМ документе — это
+    # обобщённый Part с сырыми байтами (см. _footnotes_part), не XmlPart;
+    # разбираем через parse_xml, как это делает сам _footnotes_part.
+    fpart2_raw = doc2.part.part_related_by(RT.FOOTNOTES)
+    fpart2_el = parse_xml(fpart2_raw.blob)
+    assert _real_ids(fpart2_el) == [1, 2], f"ожидали новые id 1 и 2 без коллизий с зарезервированными -1/0: {_real_ids(fpart2_el)}"
+    assert "Первая сноска" in _footnote_text(fpart2_el, 1), _footnote_text(fpart2_el, 1)
+    assert "Вторая сноска" in _footnote_text(fpart2_el, 2), _footnote_text(fpart2_el, 2)
+
+    refs1 = idx2[p1["id"]].findall(".//" + qn("w:footnoteReference"))
+    assert len(refs1) == 1 and refs1[0].get(qn("w:id")) == "1", refs1
+    refs2 = idx2[p2["id"]].findall(".//" + qn("w:footnoteReference"))
+    assert len(refs2) == 1 and refs2[0].get(qn("w:id")) == "2", refs2
+
+    # третья сноска — уже на документе, у которого footnotes.xml пришёл при
+    # открытии как обобщённый Part (случай "часть уже есть"): _footnotes_part
+    # обязан обернуть его в XmlPart, дописать, не завести вторую связь.
+    p3 = next(b for b in blocks2 if b["kind"] == "p" and b["id"] not in (p1["id"], p2["id"]) and len(b["text"]) > 30)
+    anchor3 = " ".join(p3["text"].split()[:3])
+    op3 = {"op": "footnote", "id": p3["id"], "old": anchor3, "text": "Третья сноска, после перезагрузки."}
+    assert validate(blocks2, op3, doc2) is None
+    apply(doc2, idx2, op3)
+
+    rels3 = [r for r in doc2.part.rels.values() if r.reltype == RT.FOOTNOTES]
+    assert len(rels3) == 1, "дозапись в существующую footnotes.xml не должна была завести вторую связь"
+
+    buf3 = io.BytesIO()
+    doc2.save(buf3)
+    buf3.seek(0)
+    doc3 = Document(buf3)
+    idx3 = index(doc3)
+    fpart3_el = parse_xml(doc3.part.part_related_by(RT.FOOTNOTES).blob)
+    assert _real_ids(fpart3_el) == [1, 2, 3], _real_ids(fpart3_el)
+    assert "Первая сноска" in _footnote_text(fpart3_el, 1)
+    assert "Третья сноска" in _footnote_text(fpart3_el, 3)
+    refs3 = idx3[p3["id"]].findall(".//" + qn("w:footnoteReference"))
+    assert len(refs3) == 1 and refs3[0].get(qn("w:id")) == "3", refs3
+
+    print(
+        "patch_demo: footnote создаёт footnotes.xml, дозаписывает в неё же (и в свежеоткрытую тоже) "
+        "без коллизий id, все тексты и ссылки видны после save/reopen"
+    )
+
+
 def test_all_ops_have_handlers():
     # Находка BUILD_PLAN: коммит однажды завёл set_format в _OPS без записи
     # в _HANDLERS — apply() падал бы KeyError на первом же применении.
@@ -399,3 +511,5 @@ if __name__ == "__main__":
     test_set_format_splits_run_boundary()
     test_set_format_rejects_no_flags()
     test_set_list_level()
+    test_delete_rejects_long_paragraph()
+    test_footnote_new_and_existing_part()

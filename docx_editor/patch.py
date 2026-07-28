@@ -2,15 +2,20 @@
 
 Патч — список операций из контракта BUILD_PLAN.md: replace_text, set_text,
 insert_after, delete, move_after, set_style, create_table, set_cell, normalize,
-replace_all, плюс два из Ф15 — set_format (начертание рана) и set_list_level
-(уровень вложенности уже существующего списка).
+replace_all, плюс из Ф15 — set_format (начертание рана), set_list_level
+(уровень вложенности уже существующего списка) и footnote (настоящая сноска
+Word: footnotes.xml + связь в .rels + w:footnoteReference в теле).
 """
 
 from copy import deepcopy
 
 from docx.enum.style import WD_STYLE_TYPE
+from docx.opc.constants import CONTENT_TYPE as CT, RELATIONSHIP_TYPE as RT
+from docx.opc.packuri import PackURI
+from docx.opc.part import XmlPart
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
+from docx.oxml.parser import parse_xml
 from docx.table import Table
 from docx.text.font import Font
 from docx.text.paragraph import Paragraph
@@ -20,9 +25,9 @@ from docx_editor.find import _flex_span
 _OPS = {
     "replace_text", "set_text", "insert_after", "delete", "move_after",
     "set_style", "create_table", "set_cell", "normalize", "replace_all",
-    "set_format", "set_list_level",
+    "set_format", "set_list_level", "footnote",
 }
-_PARAGRAPH_ONLY = {"replace_text", "set_text", "set_style", "set_format", "set_list_level"}
+_PARAGRAPH_ONLY = {"replace_text", "set_text", "set_style", "set_format", "set_list_level", "footnote"}
 _NORMALIZE_RULES = {"typography", "quotes"}
 
 
@@ -100,6 +105,27 @@ def _mid_word_error(block_id, old):
     )
 
 
+_DELETE_LENGTH_LIMIT = 150
+# Математика 16 и 18 (di-base): задача «сжать текст» — Редактор переписал
+# пару соседних абзацев, а остальные СТЁР целиком через delete (279-508
+# знаков каждый, один — определение простого числа). _op_delete отработал
+# как задуман, обрезание тут ни при чём — просто ничто в validate не
+# смотрело на объём удаляемого. Порог взят с реальных документов: короткие
+# структурные абзацы (заголовки, подписи, элементы формул) в
+# Архитектура_ColBERT.docx и Математика_как_основа.docx укладываются в
+# 120 знаков (37/115 и 6/51 абзацев соответственно), а стёртые в di-base —
+# от 279. 150 — с запасом выше первых и с запасом ниже вторых.
+
+
+def _delete_volume_error(block_id, length):
+    return (
+        f"{block_id}: удаление абзаца длиной {length} знаков ({_DELETE_LENGTH_LIMIT}+ — порог) "
+        f"отклонено — это стирание содержания, а не сокращение. Если часть текста должна "
+        f"остаться, перенеси её через replace_text/set_text в другой абзац ДО удаления этого, "
+        f"а не удаляй блок целиком."
+    )
+
+
 def validate(blocks, op, doc):
     """None — патч валиден; иначе русский текст ошибки для повторной попытки модели.
 
@@ -121,6 +147,11 @@ def validate(blocks, op, doc):
             return f"блок {block_id!r} не найден в документе"
         if name in _PARAGRAPH_ONLY and by_id[block_id]["kind"] != "p":
             return f"{block_id} — это таблица, {name} работает только с абзацами"
+
+    if name == "delete" and by_id[block_id]["kind"] == "p":
+        length = len(by_id[block_id]["text"])
+        if length > _DELETE_LENGTH_LIMIT:
+            return _delete_volume_error(block_id, length)
 
     if name == "set_text" and _ellipsis_truncation(by_id[block_id]["text"], op.get("text")):
         return _ellipsis_error(block_id)
@@ -188,6 +219,17 @@ def validate(blocks, op, doc):
     if name == "set_format":
         if op.get("b") is None and op.get("i") is None and op.get("u") is None:
             return f"{op['id']}: не указано ни одного из b/i/u — операция ничего не меняет"
+        old = op.get("old")
+        text = by_id[op["id"]]["text"]
+        span = _flex_span(text, old)
+        if span is None:
+            return f"в {op['id']} нет текста «{old}»"
+        if _mid_word_cut(text, span):
+            return _mid_word_error(op["id"], old)
+
+    if name == "footnote":
+        if not op.get("text"):
+            return f"{op['id']}: не указан текст сноски"
         old = op.get("old")
         text = by_id[op["id"]]["text"]
         span = _flex_span(text, old)
@@ -399,6 +441,101 @@ def _op_set_list_level(doc, idx, op):
     return f"Уровень списка {op['id']} изменён на {op['ilvl']}"
 
 
+_FOOTNOTES_PARTNAME = PackURI("/word/footnotes.xml")
+# id -1 и 0 — зарезервированы OOXML под разделитель/разделитель-продолжение
+# (17.3.1.11); настоящие сноски нумеруются с 1, чтобы никогда с ними не
+# столкнуться. Word сам создаёт такую же пару при первой сноске в документе.
+_FOOTNOTES_XML = (
+    b'<w:footnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+    b'<w:footnote w:type="separator" w:id="-1"><w:p><w:r><w:separator/></w:r></w:p></w:footnote>'
+    b'<w:footnote w:type="continuationSeparator" w:id="0">'
+    b'<w:p><w:r><w:continuationSeparator/></w:r></w:p></w:footnote>'
+    b'</w:footnotes>'
+)
+
+
+def _footnotes_part(doc):
+    """Часть footnotes.xml документа: существующая или только что созданная.
+
+    [Content_Types].xml python-docx строит сам при save() из part.content_type
+    каждой части (см. docx.opc.pkgwriter._ContentTypesItem) — отдельно его
+    редактировать не нужно. Связь в document.xml.rels создаёт relate_to.
+
+    Если документ УЖЕ содержал footnotes.xml (открыт заново после чужой правки
+    или пришёл с сносками из Word), PartFactory не регистрирует под
+    WML_FOOTNOTES собственный класс — в python-docx нет API сносок, — и часть
+    приходит как обобщённый Part с сырыми байтами, без живого lxml-дерева.
+    Оборачиваем её в XmlPart и подменяем цель УЖЕ существующей связи (тот же
+    rId, add_relationship с тем же rId просто переписывает запись), чтобы не
+    завести вторую связь на ту же часть.
+    """
+    try:
+        part = doc.part.part_related_by(RT.FOOTNOTES)
+    except KeyError:
+        part = XmlPart(_FOOTNOTES_PARTNAME, CT.WML_FOOTNOTES, parse_xml(_FOOTNOTES_XML), doc.part.package)
+        doc.part.relate_to(part, RT.FOOTNOTES)
+        return part
+    if isinstance(part, XmlPart):
+        return part
+    xml_part = XmlPart(part.partname, part.content_type, parse_xml(part.blob), doc.part.package)
+    rId = next(rid for rid, rel in doc.part.rels.items() if rel.reltype == RT.FOOTNOTES)
+    doc.part.rels.add_relationship(RT.FOOTNOTES, xml_part, rId)
+    return xml_part
+
+
+def _add_footnote(doc, text):
+    """Добавляет новую w:footnote в footnotes.xml (создав часть при первой
+    сноске), возвращает её id. Существующие сноски не трогает — только append."""
+    part = _footnotes_part(doc)
+    used_ids = [int(fn.get(qn("w:id"))) for fn in part.element.findall(qn("w:footnote"))]
+    fid = max(used_ids, default=0) + 1
+
+    fn = OxmlElement("w:footnote")
+    fn.set(qn("w:id"), str(fid))
+    p = OxmlElement("w:p")
+    ref_run = OxmlElement("w:r")
+    ref_rPr = OxmlElement("w:rPr")
+    vert = OxmlElement("w:vertAlign")
+    vert.set(qn("w:val"), "superscript")
+    ref_rPr.append(vert)
+    ref_run.append(ref_rPr)
+    ref_run.append(OxmlElement("w:footnoteRef"))
+    p.append(ref_run)
+    text_run = OxmlElement("w:r")
+    t = OxmlElement("w:t")
+    body = f" {text}"
+    if len(body.strip()) < len(body):
+        t.set(qn("xml:space"), "preserve")
+    t.text = body
+    text_run.append(t)
+    p.append(text_run)
+    fn.append(p)
+    part.element.append(fn)
+    return fid
+
+
+def _op_footnote(doc, idx, op):
+    el = idx[op["id"]]
+    span = _flex_span(_ptext(el), op["old"])
+    if span is None:
+        # validate должен был отсечь это раньше (см. _op_replace_text) — громко падаем.
+        raise ValueError(f"текст {op['old']!r} не найден в {op['id']} на момент применения")
+    anchor = _split_span_runs(el, *span)[-1]
+
+    fid = _add_footnote(doc, op["text"])
+    ref = OxmlElement("w:r")
+    rPr = OxmlElement("w:rPr")
+    vert = OxmlElement("w:vertAlign")
+    vert.set(qn("w:val"), "superscript")
+    rPr.append(vert)
+    ref.append(rPr)
+    fref = OxmlElement("w:footnoteReference")
+    fref.set(qn("w:id"), str(fid))
+    ref.append(fref)
+    anchor.addnext(ref)
+    return f"В {op['id']} после «{op['old']}» добавлена сноска {fid}: «{op['text']}»"
+
+
 def _add_borders(tbl):
     """Одиночные границы прямо в tblPr. В контракте create_table нет поля
     style, а из именованных табличных стилей в документе часто есть только
@@ -481,6 +618,7 @@ _HANDLERS = {
     "replace_all": _op_replace_all,
     "set_format": _op_set_format,
     "set_list_level": _op_set_list_level,
+    "footnote": _op_footnote,
 }
 
 
