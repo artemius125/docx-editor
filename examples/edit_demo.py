@@ -1325,6 +1325,19 @@ def test_id_fields_covers_all_ops_except_document_wide():
     print("edit_demo: _ID_FIELDS покрывает все id-несущие операции patch._OPS")
 
 
+def test_edit_prompt_mentions_every_op():
+    # Ф17: тот же класс дефекта, что и test_id_fields_covers_all_ops_except_
+    # document_wide, но для другого потребителя контракта — _EDIT_PROMPT.
+    # normalize идёт путём rule и Редактору вообще не показывается (см.
+    # run_edit), поэтому единственное законное исключение. Операция, которую
+    # добавили в patch._OPS, но забыли упомянуть в _EDIT_PROMPT, реализована,
+    # но Редактор о ней никогда не узнает и не сможет её предложить — именно
+    # это уже случилось с "footnote".
+    missing = [op for op in patch._OPS - {"normalize"} if op not in edit_mod._EDIT_PROMPT]
+    assert not missing, f"_EDIT_PROMPT не упоминает операции {missing} — Редактор их никогда не увидит"
+    print("edit_demo: _EDIT_PROMPT упоминает каждую операцию patch._OPS (кроме normalize)")
+
+
 def test_replace_all_deduped_across_clusters():
     # Item 1 (di-base math#1, живой прогон: verdict rolled_back, iter=3,
     # applied нёс одну и ту же пару дважды). Каждый кластер получает ПОЛНЫЙ
@@ -1628,6 +1641,7 @@ if __name__ == "__main__":
     test_retry_recomputes_fragment_after_batch_mutation()
     test_failed_records_ops_applied_before_batch_failure()
     test_id_fields_covers_all_ops_except_document_wide()
+    test_edit_prompt_mentions_every_op()
     test_replace_all_deduped_across_clusters()
     test_retry_widens_lane_to_match_rerendered_fragment()
     test_cluster_with_removed_targets_skipped_not_dead_end()

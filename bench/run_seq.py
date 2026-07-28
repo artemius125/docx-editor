@@ -49,37 +49,43 @@ def main():
             chars_before = sum(len(t) for t in texts_before)
 
             t0 = time.perf_counter()
-            try:
-                result, doc, idx = run_edit(doc, idx, task)
-            except httpx.TransportError as e:
-                # обрыв транспорта — не повод терять оставшиеся правки (как в run.py/
-                # colbert_run.py); doc/idx либо не тронуты, либо run_edit сам откатил
-                # их на месте — в любом случае это ТЕ ЖЕ doc/idx, что и до вызова
-                elapsed = time.perf_counter() - t0
-                blocks_after = doc_map(doc, idx)
-                texts_after = [_btext(b) for b in blocks_after]
-                styles_after = _styles(blocks_after)
-                record = {
-                    "n": n, "task": task, "verdict": "crashed", "reason": f"{type(e).__name__}: {e}",
-                    "applied": [], "ids": [], "iter": None,
-                    "blocks_before": texts_before, "blocks_after": texts_after,
-                    "styles_before": styles_before, "styles_after": styles_after,
-                    "chars_before": chars_before, "chars_after": sum(len(t) for t in texts_after),
-                    "seconds": elapsed,
-                }
-            else:
-                elapsed = time.perf_counter() - t0
-                blocks_after = doc_map(doc, idx)
-                texts_after = [_btext(b) for b in blocks_after]
-                styles_after = _styles(blocks_after)
-                record = {
-                    "n": n, "task": task, "verdict": result["verdict"], "reason": result["reason"],
-                    "applied": result["applied"], "ids": result["ids"], "iter": result["iter"],
-                    "blocks_before": texts_before, "blocks_after": texts_after,
-                    "styles_before": styles_before, "styles_after": styles_after,
-                    "chars_before": chars_before, "chars_after": sum(len(t) for t in texts_after),
-                    "seconds": elapsed,
-                }
+            for attempt in range(3):
+                try:
+                    result, doc, idx = run_edit(doc, idx, task)
+                except httpx.TransportError as e:
+                    # обрыв транспорта — ретрай ТОЙ ЖЕ правки на месте (до 3 попыток),
+                    # не второй проход в конце: в кумулятивной цепочке повтор правки N
+                    # после N+1..20 поменял бы смысл. doc/idx либо не тронуты, либо
+                    # run_edit сам откатил их на месте — в любом случае это ТЕ ЖЕ doc/idx.
+                    if attempt < 2:
+                        time.sleep(5)
+                        continue
+                    elapsed = time.perf_counter() - t0
+                    blocks_after = doc_map(doc, idx)
+                    texts_after = [_btext(b) for b in blocks_after]
+                    styles_after = _styles(blocks_after)
+                    record = {
+                        "n": n, "task": task, "verdict": "crashed", "reason": f"{type(e).__name__}: {e}",
+                        "applied": [], "ids": [], "iter": None,
+                        "blocks_before": texts_before, "blocks_after": texts_after,
+                        "styles_before": styles_before, "styles_after": styles_after,
+                        "chars_before": chars_before, "chars_after": sum(len(t) for t in texts_after),
+                        "seconds": elapsed,
+                    }
+                else:
+                    elapsed = time.perf_counter() - t0
+                    blocks_after = doc_map(doc, idx)
+                    texts_after = [_btext(b) for b in blocks_after]
+                    styles_after = _styles(blocks_after)
+                    record = {
+                        "n": n, "task": task, "verdict": result["verdict"], "reason": result["reason"],
+                        "applied": result["applied"], "ids": result["ids"], "iter": result["iter"],
+                        "blocks_before": texts_before, "blocks_after": texts_after,
+                        "styles_before": styles_before, "styles_after": styles_after,
+                        "chars_before": chars_before, "chars_after": sum(len(t) for t in texts_after),
+                        "seconds": elapsed,
+                    }
+                break
 
             doc.save(docx_path)  # после КАЖДОЙ правки — крах на следующей не уничтожит уже сделанное
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
