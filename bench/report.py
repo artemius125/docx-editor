@@ -36,9 +36,17 @@ def efficiency(label, seq):
 
 def labels():
     """Прогоны в хронологическом порядке — по времени ПЕРВОЙ записи в каталоге
-    (по последней нельзя: перенос каталогов переставил им mtime скопом)."""
+    (по последней нельзя: перенос каталогов переставил им mtime скопом).
+
+    Каталоги с одним корпусом в график не идут: это повторные прогоны для
+    проверки разброса (w9b — ColBERT трижды подряд), и рядом с полными
+    точками они читались бы как провал, хотя меряли другое."""
     dirs = [p for p in (HERE / "runs").iterdir() if p.is_dir()]
-    return [p.name for p in sorted(dirs, key=lambda p: min(f.stat().st_mtime for f in p.iterdir()))]
+    full, partial = [], []
+    for d in sorted(dirs, key=lambda p: min(f.stat().st_mtime for f in p.iterdir())):
+        names = {f.name for f in d.iterdir()}
+        (full if {"colbert.jsonl", "math.jsonl"} <= names else partial).append(d.name)
+    return full, partial
 
 
 def chart(title, points):
@@ -59,7 +67,7 @@ def chart(title, points):
 
 
 def main():
-    names = labels()
+    names, partial = labels()
     text = [
         "# Эффективность", "",
         "Одна метрика: **Э = (подтверждено оценщиком − ложных вердиктов) /",
@@ -77,6 +85,8 @@ def main():
                   [(n, efficiency(n, seq=False)) for n in names])
     text += chart("Весь список подряд по одному документу — правда о продукте",
                   [(n, efficiency(n, seq=True)) for n in names])
+    if partial:
+        text += [f"Не в графике (прогон по одному корпусу, проверка разброса): {', '.join(partial)}.", ""]
     OUT.write_text("\n".join(text), encoding="utf-8")
     print(OUT)
 
