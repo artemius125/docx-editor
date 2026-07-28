@@ -988,6 +988,81 @@ def test_defect2_batch_collision_replace_all():
     print(f"edit_demo: replace_all не тронул Bi-encoders, вписанный op1 этого же батча, verdict={result['verdict']!r}")
 
 
+def test_batch_identity_op_skipped_not_retried():
+    # ПАРТИЯ 1 (BUILD_PLAN): воспроизводит форму ColBERT 7 (bench/runs/w8,
+    # n=7) — два реальных replace_all и третий, тождественный (old==new),
+    # который Редактор добавляет, "унифицируя" правку к варианту, уже
+    # стоящему в документе. До фикса: op3 бьёт "old и new совпадают",
+    # единственный ретрай тратится впустую, батч проваливается — ОБЕ верные
+    # замены откатываются вместе с ним. После фикса: op3 молча пропускается,
+    # обе замены остаются в силе.
+    doc = Document()
+    doc.add_paragraph("Используется Single-Vector Bi-encoders. Также известен как Bi-Encoders для сравнения.")
+    idx = index(doc)
+
+    def fake_navigator(outline_text, request):
+        return {"kind": "local", "rule": None, "ids": ["p0"], "anchors": []}
+
+    def fake_editor(fragment_text, request, feedback=None):
+        return {"ops": [
+            {"op": "replace_all", "old": "Single-Vector Bi-encoders", "new": "Single-Vector Bi-encoder"},
+            {"op": "replace_all", "old": "Bi-Encoders", "new": "Bi-encoder"},
+            {"op": "replace_all", "old": "Bi-encoder", "new": "Bi-encoder"},
+        ]}
+
+    def fake_checker(request, diff):
+        return {"ok": True, "reason": "ok"}
+
+    result, doc, idx = run_edit(
+        doc, idx, "Bi-encoder пишется по-разному, выбери один вариант и поставь везде",
+        navigator=fake_navigator, editor=fake_editor, checker=fake_checker,
+    )
+
+    assert result["verdict"] == "done", result
+    text = doc_map(doc, idx)[0]["text"]
+    assert "Single-Vector Bi-encoder." in text, text
+    assert "Bi-encoder для сравнения" in text, text
+    assert "Bi-Encoders" not in text and "Single-Vector Bi-encoders" not in text, text
+    print(f"edit_demo: тождественная операция (old==new) в батче пропущена без ретрая, verdict={result['verdict']!r}")
+
+
+def test_batch_consumed_old_skipped_not_retried():
+    # ПАРТИЯ 1 (BUILD_PLAN): воспроизводит Математика 14 (bench/runs/w8,
+    # n=14) — op1 (replace_all «читатель»→«вы») съедает подстроку, которую
+    # op2 того же батча искал целой фразой. До фикса: op2 бьёт "не найден",
+    # единственный ретрай не спасает, батч (и уже верная работа op1)
+    # откатывается. После фикса: op2 распознаётся как объяснимый собственной
+    # перепиской батча ("не найден", потому что уже переписан, а не потому
+    # что документ не такой) и пропускается, работа op1 остаётся в силе.
+    doc = Document()
+    doc.add_paragraph("Я хочу, чтобы читатель знал важные детали.")
+    idx = index(doc)
+
+    def fake_navigator(outline_text, request):
+        return {"kind": "local", "rule": None, "ids": ["p0"], "anchors": []}
+
+    def fake_editor(fragment_text, request, feedback=None):
+        return {"ops": [
+            {"op": "replace_all", "old": "читатель", "new": "вы"},
+            {"op": "replace_all", "old": "Я хочу, чтобы читатель знал", "new": "Я хочу, чтобы вы знали"},
+        ]}
+
+    def fake_checker(request, diff):
+        return {"ok": True, "reason": "ok"}
+
+    result, doc, idx = run_edit(
+        doc, idx, "приведи обращение к читателю к одному лицу по всей главе",
+        navigator=fake_navigator, editor=fake_editor, checker=fake_checker,
+    )
+
+    assert result["verdict"] == "done", result
+    text = doc_map(doc, idx)[0]["text"]
+    assert "вы знал" in text, text
+    assert "читатель" not in text, text
+    assert any("пропущ" in a for a in result["applied"]), result["applied"]
+    print(f"edit_demo: операция, чей old съеден более ранней записью батча, честно помечена пропущенной, verdict={result['verdict']!r}")
+
+
 def test_new_containing_old_still_applies():
     # "new", включающий "old" целиком (добавили пояснение в скобках), — сам
     # по себе легитимная правка: под подозрение попадает только ПОЗДНЕЙШАЯ
@@ -1432,6 +1507,8 @@ if __name__ == "__main__":
     test_defect1_mid_word_cut_rejected()
     test_defect2_batch_collision_colbert11()
     test_defect2_batch_collision_replace_all()
+    test_batch_identity_op_skipped_not_retried()
+    test_batch_consumed_old_skipped_not_retried()
     test_new_containing_old_still_applies()
     test_variant_inventory_appears_for_multiple_targets()
     test_variant_inventory_absent_for_single_target()

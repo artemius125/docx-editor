@@ -463,6 +463,69 @@ def _own_output_error(op, source_op):
     )
 
 
+def _revert_written(text, ranges):
+    """Текст элемента с диапазонами written, откатанными к old той операции,
+    которая их записала — только чтобы ПРОВЕРИТЬ, стоял ли искомый текст на
+    этом месте ДО более ранней записи этого же батча. Диапазон без old
+    (source_op — set_text, там нет old) откатить нечем — оставляется как
+    есть, реконструкция для него просто не сработает (вернёт False дальше)."""
+    out, pos = [], 0
+    for s, e, wop in sorted(ranges, key=lambda r: r[0]):
+        old = wop.get("old")
+        if old is None:
+            continue
+        out.append(text[pos:s])
+        out.append(old)
+        pos = e
+    out.append(text[pos:])
+    return "".join(out)
+
+
+def _redundant_in_batch(op, idx, written):
+    """ПАРТИЯ 1: True — операция избыточна ОТНОСИТЕЛЬНО этого же батча, её
+    можно пропустить, не тратя ретрай. Два узких случая:
+
+    (a) old == new — no-op по построению (validate это и так отклонит, но
+        платить за это ретраем незачем).
+    (b) old этой операции стоял в документе ДО того, как более ранняя
+        операция этого же батча его переписала — written хранит, кто что
+        записал (Change 2), reused здесь, а не заново. Проверяется
+        реконструкцией: откатываем записи written в затронутом элементе к
+        их old (_revert_written) и ищем old текущей операции ТАМ — нашёлся
+        → цель уже достигнута раньше в этом же батче, «не найден» объясняется
+        собственной перепиской, а не пробелом в документе.
+
+    Не путать с _own_output_error/_collision_source: там old НАЙДЕН в
+    текущем (не откатанном) тексте — он существует только благодаря свежей
+    записи более ранней операции, откат его уберёт. Такая операция здесь
+    вернёт False и останется жёсткой ошибкой — это и есть защищаемая
+    граница (искажение вывода вместо избыточности)."""
+    old, new = op.get("old"), op.get("new")
+    if old is not None and "new" in op and old == new:
+        return True
+    if not old:
+        return False
+    name = op.get("op")
+    if name == "replace_text":
+        items = [(idx.get(op.get("id")), written.get(idx.get(op.get("id")), []))]
+    elif name == "replace_all":
+        items = list(written.items())
+    else:
+        return False
+    for el, ranges in items:
+        if el is None or not ranges:
+            continue
+        cur = patch._ptext(el)
+        # old ЕСТЬ в текущем тексте — операция не избыточна, она применилась бы
+        # сюда; отказ у неё по другой причине (например разрез посреди слова),
+        # и её нельзя молча ронять — пусть идёт обычным путём с ретраем.
+        if find._flex_span(cur, old) is not None:
+            continue
+        if find._flex_span(_revert_written(cur, ranges), old) is not None:
+            return True
+    return False
+
+
 def _apply_ops(doc, idx, ops, fragment_text, request, editor, fragment_ids=None):
     """Применяет ops по очереди; на невалидной операции — один ретрай к
     Редактору с текстом ошибки (editor=None — ретрая нет, путь rule). Второй
@@ -485,7 +548,14 @@ def _apply_ops(doc, idx, ops, fragment_text, request, editor, fragment_ids=None)
     written (Ф12, дефект 2) — диапазоны текста, которые внутри ЭТОГО вызова
     уже записала более ранняя операция батча; replace_text/replace_all,
     чей матч пересёкся с ними, отклоняются тем же путём, что и любая другая
-    невалидная операция, — до того, как patch.apply вообще увидит op."""
+    невалидная операция, — до того, как patch.apply вообще увидит op.
+
+    ПАРТИЯ 1: невалидная операция, прежде чем стать ошибкой-с-ретраем,
+    проверяется на избыточность ОТНОСИТЕЛЬНО этого же батча (_redundant_in_batch)
+    — old==new или цель уже переписана более ранней операцией этого вызова.
+    Такая операция молча пропускается (запись в applied честно называет её
+    пропущенной), ретрай не тратится, батч не падает из-за собственного же
+    прогресса (ColBERT 7, Математика 14)."""
     applied, retried, i, written = [], False, 0, {}
     while i < len(ops):
         op = ops[i]
@@ -509,6 +579,10 @@ def _apply_ops(doc, idx, ops, fragment_text, request, editor, fragment_ids=None)
                 fragment_ids |= set(idx) - before_ids
             if targets:
                 _record_batch_write(op, targets, written)
+            i += 1
+            continue
+        if _redundant_in_batch(op, idx, written):
+            applied.append(f'пропущена операция {op.get("op")} (old={op.get("old")!r}) — избыточна относительно более ранней операции этого же батча: {err}')
             i += 1
             continue
         if retried or editor is None:
