@@ -984,14 +984,16 @@ def _run_unify(doc, idx, blocks, nav, request, editor, checker, unifier):
     if not pairs:
         return _failed(reply.get("note") or "модель не предложила ни одной пары для унификации", nav, reply), doc, idx
 
+    # Замер w14: маршрут не должен ПЕРЕХВАТЫВАТЬ правку, которую он не тянет.
+    # Пары не совпали с инвентарём (Математика 5) или разошлись по нескольким
+    # канонам (ColBERT 4 — шесть разных чисел, ColBERT 12 — две формулировки):
+    # это не унификация одного написания, а обычная локальная правка, и в w12
+    # локальный путь её делал. Отказ здесь был чистой потерей: −4 правки.
     variant_set = {v for v, n in counts}
     pairs = [(old, new) for old, new in pairs if old != new and old in variant_set]
-    if not pairs:
-        return _failed("ни одна пара модели не совпала с реально найденными вариантами написания", nav, reply), doc, idx
     canonicals = {new for old, new in pairs}
-    if len(canonicals) > 1:
-        reason = "модель не выбрала единый канонический вариант: " + ", ".join(f"«{c}»" for c in canonicals)
-        return _failed(reason, nav, reply), doc, idx
+    if len(canonicals) != 1:
+        return _run_local(doc, idx, blocks, nav, request, editor, checker)
     canonical = canonicals.pop()
 
     # УБЫВАНИЕ длины old — иначе «Bi-encoder» переписал бы внутренность
@@ -1082,18 +1084,20 @@ def run_edit(doc, idx, request, navigator=_navigate, editor=_edit_llm, checker=_
 
     Ф18: kind="unify" (навигатор) уходит в _run_unify — там "editor" в reply
     не список ответов по кластерам, а ОДИН ответ unifier (пары "старое"→
-    "новое"), Проверяющий-LLM не зовётся вовсе, вердикт считает код. unify
-    побеждает rule, даже если Навигатор проставил оба (Defect w13, _NAV_PROMPT
-    объявляет их взаимоисключающими, но модель иногда путает): unify
-    безопасно деградирует до local при тонком инвентаре, а rule на неверно
-    определённой правке портит документ и валит её в rolled_back."""
+    "новое"), Проверяющий-LLM не зовётся вовсе, вердикт считает код.
+
+    Замер w14 отменил обратный порядок: rule ВЫШЕ unify, как и было до Ф18.
+    Когда Навигатор проставлял оба, а выигрывал unify, ломались ColBERT 6
+    (кавычки) и Математика 1 (пробелы) — обе делались нормализацией и обе
+    упали. Защита от неверного rule — не приоритет unify, а fallthrough
+    ниже: откат Проверяющего продолжается локальным путём."""
     blocks = doc_map(doc, idx)
     nav = navigator(find.outline(blocks), request) or {}
     rule = nav.get("rule")
 
-    if nav.get("kind") == "unify":
-        return _run_unify(doc, idx, blocks, nav, request, editor, checker, unifier)
     if not rule:
+        if nav.get("kind") == "unify":
+            return _run_unify(doc, idx, blocks, nav, request, editor, checker, unifier)
         return _run_local(doc, idx, blocks, nav, request, editor, checker)
 
     # Правки типа rule идут мимо Редактора — код нормализует сам, LLM не зовём.

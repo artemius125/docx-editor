@@ -1816,6 +1816,41 @@ def test_unify_verdict_checks_own_inventory_not_model_reply():
     print("edit_demo: unify сверяет done со своим инвентарём, а не со списком пар модели")
 
 
+def test_unify_without_single_canonical_falls_through_to_local():
+    # Замер w14: пары модели разошлись по нескольким канонам (ColBERT 4 —
+    # шесть разных чисел, ColBERT 12 — две формулировки) — это не унификация
+    # одного написания. Отказ здесь был чистой потерей: в w12 те же правки
+    # делал локальный путь. Маршрут обязан уступить, а не перехватить.
+    doc = Document()
+    doc.add_paragraph("Доля 4.2% и метрика 0.4448 записаны через точку.")
+    doc.add_paragraph("Ещё раз 4.2% в другом абзаце.")
+    idx = index(doc)
+
+    def fake_navigator(outline_text, request):
+        return {"kind": "unify", "rule": None, "ids": [], "anchors": []}
+
+    def fake_unifier(inventory_text, request):
+        return {"pairs": [["4.2%", "4,2%"], ["0.4448", "0,4448"]], "note": ""}
+
+    called = []
+
+    def fake_editor(fragment_text, request):
+        called.append(fragment_text)
+        return {"ops": [{"op": "replace_all", "old": "4.2%", "new": "4,2%"}]}
+
+    def ok_checker(request, diff):
+        return {"ok": True, "reason": "числа приведены к запятой"}
+
+    request = 'Числа «4.2%» и «0.4448» записаны через точку — приведи к запятой.'
+    result, doc, idx = run_edit(
+        doc, idx, request,
+        navigator=fake_navigator, editor=fake_editor, checker=ok_checker, unifier=fake_unifier,
+    )
+    assert called, "правка обязана уйти на локальный путь, а не отказаться на unify"
+    assert result["verdict"] == "done", result
+    print("edit_demo: unify без единого канона уступает локальному пути, а не отказывает")
+
+
 def test_unify_old_outside_inventory_never_applied():
     # Defect w13 (ColBERT 7, "Single-vector"→"Bi-encoder"): модель предложила
     # переписать прилагательное "Single-vector" в термин "Bi-Encoder" — этого
@@ -1886,36 +1921,37 @@ def test_unify_canonical_containing_old_is_done_not_leftover():
     print("edit_demo: канон, содержащий старый вариант как подстроку, не считается ложным остатком")
 
 
-def test_unify_wins_when_rule_also_set():
-    # Defect w13 (Математика 2/6): после того как в _NAV_PROMPT появился
-    # unify, Навигатор иногда стал ставить rule И kind=unify одновременно.
-    # Путь rule на неверно определённой правке портит документ и валит её в
-    # rolled_back — unify обязан победить, даже если Навигатор проставил оба.
+def test_rule_wins_when_unify_also_set():
+    # Замер w14: обратный порядок (unify выше rule) сломал ColBERT 6 (кавычки)
+    # и Математику 1 (пробелы) — обе делались нормализацией, обе перехватывал
+    # unify и валил. Навигатор иногда ставит оба поля; выигрывает rule, а от
+    # НЕВЕРНОГО rule защищает не приоритет, а fallthrough после отката
+    # Проверяющего (см. test_rule_rolled_back_falls_through_to_local_done).
     doc = Document()
-    doc.add_paragraph("Модель COLBERT показывает высокое качество.")
-    doc.add_paragraph("ColBERT — базовая архитектура.")
+    doc.add_paragraph('Здесь стоят "прямые кавычки" в тексте.')
     idx = index(doc)
 
     def fake_navigator(outline_text, request):
-        return {"kind": "unify", "rule": "typography", "ids": [], "anchors": []}
+        return {"kind": "unify", "rule": "quotes", "ids": [], "anchors": []}
 
-    def fake_unifier(inventory_text, request):
-        return {"pairs": [["COLBERT", "ColBERT"]], "note": ""}
+    def no_unifier(*a, **kw):
+        raise AssertionError("unifier не должен звониться, когда Навигатор назвал rule")
 
     def no_editor(*a, **kw):
-        raise AssertionError("Редактор не должен звонить на пути unify")
+        raise AssertionError("Редактор не должен звониться на пути rule")
 
-    def no_checker(*a, **kw):
-        raise AssertionError("Проверяющий-LLM не должен звонить — rule-путь не имеет права запускаться, когда kind=unify")
+    def ok_checker(request, diff):
+        return {"ok": True, "reason": "кавычки заменены"}
 
-    request = 'Термин записан как «COLBERT», «ColBERT» — приведи к одному варианту по всему документу.'
+    request = 'Прямые кавычки замени на ёлочки по всему документу.'
     result, doc, idx = run_edit(
         doc, idx, request,
-        navigator=fake_navigator, editor=no_editor, checker=no_checker, unifier=fake_unifier,
+        navigator=fake_navigator, editor=no_editor, checker=ok_checker, unifier=no_unifier,
     )
     assert result["verdict"] == "done", result
-    assert result["reason"].startswith("заменено"), "формулировка вердикта обязана быть с пути unify, не rule"
-    print("edit_demo: unify побеждает, даже если Навигатор проставил rule вместе с ним")
+    text = doc_map(doc, idx)[0]["text"]
+    assert '"' not in text and "«прямые кавычки»" in text, text
+    print("edit_demo: rule побеждает, когда Навигатор проставил unify вместе с ним")
 
 
 def test_rule_rolled_back_falls_through_to_local_done():
@@ -2006,7 +2042,8 @@ if __name__ == "__main__":
     test_unify_empty_pairs_is_honest_failed()
     test_unify_falls_through_to_local_when_inventory_thin()
     test_unify_verdict_checks_own_inventory_not_model_reply()
+    test_unify_without_single_canonical_falls_through_to_local()
     test_unify_old_outside_inventory_never_applied()
     test_unify_canonical_containing_old_is_done_not_leftover()
-    test_unify_wins_when_rule_also_set()
+    test_rule_wins_when_unify_also_set()
     test_rule_rolled_back_falls_through_to_local_done()
