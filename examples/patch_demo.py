@@ -5,7 +5,7 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 
 from docx_editor.parse import doc_map, index
-from docx_editor.patch import apply, validate
+from docx_editor.patch import _HANDLERS, _OPS, apply, validate
 
 REAL_DOC = "/home/artem/Загрузки/Архитектура_ColBERT.docx"
 
@@ -377,7 +377,16 @@ def test_set_list_level():
     print("patch_demo: set_list_level меняет ilvl и сохраняет numId, отказан на абзаце вне списка")
 
 
+def test_all_ops_have_handlers():
+    # Находка BUILD_PLAN: коммит однажды завёл set_format в _OPS без записи
+    # в _HANDLERS — apply() падал бы KeyError на первом же применении.
+    missing = _OPS - set(_HANDLERS)
+    assert not missing, f"операции без обработчика в _HANDLERS: {missing}"
+    print("patch_demo: у каждой операции из _OPS есть обработчик в _HANDLERS")
+
+
 if __name__ == "__main__":
+    test_all_ops_have_handlers()
     test_ops()
     test_invalid()
     test_hyperlink()

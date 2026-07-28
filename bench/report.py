@@ -12,7 +12,6 @@
 Запуск: python3 report.py  → перезаписывает ЭФФЕКТИВНОСТЬ.md
 """
 
-import re
 from pathlib import Path
 
 from oracle import CHECKS
@@ -36,10 +35,10 @@ def efficiency(label, seq):
 
 
 def labels():
-    """Прогоны в хронологическом порядке: baseline, потом w4, w5, … w10."""
-    names = [p.name for p in (HERE / "runs").iterdir() if p.is_dir()]
-    key = lambda n: (n != "baseline", int(m.group()) if (m := re.search(r"\d+", n)) else 0, n)
-    return sorted(names, key=key)
+    """Прогоны в хронологическом порядке — по времени ПЕРВОЙ записи в каталоге
+    (по последней нельзя: перенос каталогов переставил им mtime скопом)."""
+    dirs = [p for p in (HERE / "runs").iterdir() if p.is_dir()]
+    return [p.name for p in sorted(dirs, key=lambda p: min(f.stat().st_mtime for f in p.iterdir()))]
 
 
 def chart(title, points):
