@@ -364,7 +364,7 @@ _ID_FIELDS = {
     "replace_text": ("id",), "set_text": ("id",), "insert_after": ("id",),
     "delete": ("id",), "move_after": ("id", "after"), "set_style": ("id",),
     "create_table": ("after",), "set_cell": ("id",),
-    "set_format": ("id",), "set_list_level": ("id",),
+    "set_format": ("id",), "set_list_level": ("id",), "footnote": ("id",),
 }
 
 
@@ -490,14 +490,18 @@ def _apply_ops(doc, idx, ops, fragment_text, request, editor, fragment_ids=None)
     while i < len(ops):
         op = ops[i]
         out = _out_of_lane(op, fragment_ids) if fragment_ids is not None else None
-        targets = _op_targets(doc, idx, op) if out is None else []
-        collision = _collision_source(targets, written) if out is None else None
-        err = (
-            f"блок {out!r} вне фрагмента, показанного в этом вызове — правь только то, что было показано"
-            if out is not None
-            else _own_output_error(op, collision) if collision is not None
-            else patch.validate(doc_map(doc, idx), op, doc)
-        )
+        if out is not None:
+            targets, collision, err = [], None, f"блок {out!r} вне фрагмента, показанного в этом вызове — правь только то, что было показано"
+        else:
+            # Change (Ф16, item 4): targets/collision требуют полей вроде "old",
+            # которые validate и создан проверять — считаем их только когда op
+            # уже прошла validate, иначе _op_targets падает TypeError на op,
+            # которую validate всё равно отклонил бы (например old=None).
+            err = patch.validate(doc_map(doc, idx), op, doc)
+            targets = _op_targets(doc, idx, op) if err is None else []
+            collision = _collision_source(targets, written) if err is None else None
+            if collision is not None:
+                err = _own_output_error(op, collision)
         if err is None:
             before_ids = set(idx)
             applied.append(patch.apply(doc, idx, op))
@@ -515,7 +519,13 @@ def _apply_ops(doc, idx, ops, fragment_text, request, editor, fragment_ids=None)
             # могли удалить/переместить блоки — ретрай обязан увидеть ТЕКУЩЕЕ
             # состояние документа, а не снимок, снятый до начала батча, иначе
             # Редактор предлагает удалить уже удалённое и валидатор бьёт "блок не найден".
-            fragment_text = render(find.fragment(doc_map(doc, idx), fragment_ids, around=1))
+            frag = find.fragment(doc_map(doc, idx), fragment_ids, around=1)
+            fragment_text = render(frag)
+            # Ф16, item 2: around=1 расширяет перерисованный фрагмент за пределы
+            # fragment_ids (уже содержащего исходных соседей) — без этого блок,
+            # реально показанный на ретрае, отклоняется гвардом как "вне
+            # фрагмента", хотя он только что был на экране у Редактора.
+            fragment_ids |= {b["id"] for b in frag}
         feedback = f'Операция {op} не прошла проверку: {err}. Пришли исправленный {{"ops": [...]}}.'
         reply = editor(fragment_text, request, feedback=feedback) or {}
         ops = _clean_ops(reply.get("ops"))
@@ -694,10 +704,16 @@ def _run_clusters(doc, idx, blocks, ids, request, editor, checker, nav, fallthro
     clusters = _cluster(blocks, ids, around=1)
     inventory = _variant_inventory(blocks, nav, request)
 
-    applied_all, editor_replies, tries_total, partial = [], [], 0, False
+    applied_all, editor_replies, tries_total, partial, replace_all_seen = [], [], 0, False, set()
     for cluster_ids in clusters:
         pre_cluster = doc_map(doc, idx)
         frag_blocks = find.fragment(pre_cluster, cluster_ids, around=1)
+        if not frag_blocks:
+            # Ф16, item 3: цели этого кластера уже пропали (удалены/слиты более
+            # ранним кластером) — пустой фрагмент даёт ПУСТОЕ множество
+            # fragment_ids, гвард полосы активен и отклонит любой ответ
+            # Редактора; тупик, ретрай не спасает. Пропускаем кластер честно.
+            continue
         fragment_text = render(frag_blocks)
         if inventory:
             fragment_text = f"{inventory}\n\n{fragment_text}"
@@ -706,6 +722,14 @@ def _run_clusters(doc, idx, blocks, ids, request, editor, checker, nav, fallthro
         editor_replies.append(reply)
         tries_total += 1
         ops = _clean_ops(reply.get("ops"))
+        # Ф16, item 1: replace_all документ-широкая, и каждый кластер видит
+        # ПОЛНЫЙ текст правки — один и тот же replace_all может прийти от
+        # нескольких кластеров подряд (written внутри _apply_ops этого не
+        # ловит, он заводится заново на каждый вызов). Повтор молча не меняет
+        # текст, diff кластера пуст → partial → откатывает уже верную работу
+        # более раннего кластера. Дедуплицируем по (old, new) между кластерами.
+        ops = [o for o in ops if o.get("op") != "replace_all" or (o.get("old"), o.get("new")) not in replace_all_seen]
+        replace_all_seen |= {(o.get("old"), o.get("new")) for o in ops if o.get("op") == "replace_all"}
         if not ops:
             continue
         applied, err, cluster_tries = _apply_ops(doc, idx, ops, fragment_text, request, editor, fragment_ids)

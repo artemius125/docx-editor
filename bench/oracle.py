@@ -100,8 +100,15 @@ def m6(before, after, sb, sa):
 
 
 def m9(before, after, sb, sa):
-    target = "Сначала о первом"
-    return before.count(target) == 1 and after.count(target) == 0
+    # Абзац из одной фразы должен перестать быть отдельным блоком и уцелеть
+    # внутри соседнего. Проверка была сломана: before.count() — это count по
+    # СПИСКУ блоков, то есть точное равенство элементу, а блок в документе —
+    # «Сначала — о первом.» с тире и точкой. Возвращала False всегда, из-за
+    # чего верная правка считалась провалом и вдобавок ложным вердиктом.
+    frag = "Сначала — о первом."
+    alone = lambda blocks: any(t.strip() == frag for t in blocks)
+    merged = any(frag in t and len(t) > len(frag) for t in after)
+    return alone(before) and not alone(after) and merged
 
 
 def m10(before, after, sb, sa):

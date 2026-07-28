@@ -381,22 +381,36 @@ def test_set_list_level():
     print("patch_demo: set_list_level меняет ilvl и сохраняет numId, отказан на абзаце вне списка")
 
 
-def test_delete_rejects_long_paragraph():
-    # di-base (Математика 16, 18): задача «сжать текст» обернулась стиранием
-    # абзацев 279-508 знаков через delete — validate обязан отбивать это ДО
-    # применения, короткие абзацы (заголовки, подписи) остаются разрешены.
-    doc = Document(REAL_DOC)
+def test_replace_all_reports_only_real_changes():
+    # replace_all отчитывался по числу СОВПАДЕНИЙ, а не изменений: _flex_span
+    # нормализует пробельные разрывы при поиске, и повторное применение той
+    # же замены снова "находит" совпадение (обычный пробел ~ U+00A0), хотя
+    # подстановка пишет то же самое, что уже стоит в абзаце. Отчёт из этого
+    # уходит пользователю как есть (server.py рендерит applied дословно) —
+    # значит, не должен приписывать правке изменение, которого не было
+    # (инвариант 5, «отчёт не врёт»).
+    doc = Document()
+    doc.add_paragraph("слово слово синее небо.")
     idx = index(doc)
     blocks = doc_map(doc, idx)
 
-    long_block = next(b for b in blocks if b["kind"] == "p" and len(b["text"]) > 150)
-    err = validate(blocks, {"op": "delete", "id": long_block["id"]}, doc)
-    assert isinstance(err, str) and long_block["id"] in err, err
+    op = {"op": "replace_all", "old": "слово слово", "new": "слово\xa0слово"}
+    assert validate(blocks, op, doc) is None
+    report1 = apply(doc, idx, op)
+    blocks = doc_map(doc, idx)
+    assert blocks[0]["text"] == "слово\xa0слово синее небо.", blocks[0]["text"]
+    assert "Заменено 1 вхождений" in report1 and "в 1 блоках" in report1, report1
 
-    short_block = next(b for b in blocks if b["kind"] == "p" and 0 < len(b["text"]) <= 150)
-    assert validate(blocks, {"op": "delete", "id": short_block["id"]}, doc) is None
+    # повторное применение ТОГО ЖЕ op: _flex_span снова находит совпадение
+    # (пробел ~ U+00A0), но подстановка ничего не меняет — блок не изменился
+    # и не должен быть засчитан
+    assert validate(blocks, op, doc) is None
+    report2 = apply(doc, idx, op)
+    blocks = doc_map(doc, idx)
+    assert blocks[0]["text"] == "слово\xa0слово синее небо.", "текст не должен был измениться повторно"
+    assert "Заменено 0 вхождений" in report2 and "в 0 блоках" in report2, report2
 
-    print("patch_demo: delete длинного абзаца отбит валидатором, короткий пропущен")
+    print("patch_demo: replace_all считает и отчитывается только по реально изменённым блокам")
 
 
 def test_footnote_new_and_existing_part():
@@ -497,8 +511,25 @@ def test_all_ops_have_handlers():
     print("patch_demo: у каждой операции из _OPS есть обработчик в _HANDLERS")
 
 
+def test_missing_required_field_is_rejected_not_crash():
+    # Одна операция без old роняла ВЕСЬ прогон: _flex_span(text, None) —
+    # TypeError, а не отказ. validate обязан отвечать текстом, а не падать.
+    doc = Document(REAL_DOC)
+    idx = index(doc)
+    blocks = doc_map(doc, idx)
+    for op in (
+        {"op": "replace_text", "id": "p10", "new": "x"},
+        {"op": "replace_all", "new": "x"},
+        {"op": "set_text", "id": "p10"},
+    ):
+        err = validate(blocks, op, doc)
+        assert err and "нет поля" in err, (op, err)
+    print("patch_demo: операция без обязательного поля отбита текстом, а не падением")
+
+
 if __name__ == "__main__":
     test_all_ops_have_handlers()
+    test_missing_required_field_is_rejected_not_crash()
     test_ops()
     test_invalid()
     test_hyperlink()
@@ -511,5 +542,5 @@ if __name__ == "__main__":
     test_set_format_splits_run_boundary()
     test_set_format_rejects_no_flags()
     test_set_list_level()
-    test_delete_rejects_long_paragraph()
+    test_replace_all_reports_only_real_changes()
     test_footnote_new_and_existing_part()

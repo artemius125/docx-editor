@@ -73,6 +73,9 @@ def _run_one(n, task, src):
     record = {
         "n": n, "task": task, "verdict": result["verdict"], "reason": result["reason"],
         "applied": result["applied"], "ids": result["ids"], "iter": result["iter"],
+        # что реально предложили Навигатор и Редактор: без этого у failed-строк
+        # нет следа вообще и причину отказа не приписать к операции
+        "reply": result["reply"],
         "blocks_before": texts_before, "blocks_after": texts_after,
         "styles_before": styles_before, "styles_after": styles_after,
         "chars_before": chars_before, "chars_after": sum(len(t) for t in texts_after),

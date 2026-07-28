@@ -105,25 +105,15 @@ def _mid_word_error(block_id, old):
     )
 
 
-_DELETE_LENGTH_LIMIT = 150
-# Математика 16 и 18 (di-base): задача «сжать текст» — Редактор переписал
-# пару соседних абзацев, а остальные СТЁР целиком через delete (279-508
-# знаков каждый, один — определение простого числа). _op_delete отработал
-# как задуман, обрезание тут ни при чём — просто ничто в validate не
-# смотрело на объём удаляемого. Порог взят с реальных документов: короткие
-# структурные абзацы (заголовки, подписи, элементы формул) в
-# Архитектура_ColBERT.docx и Математика_как_основа.docx укладываются в
-# 120 знаков (37/115 и 6/51 абзацев соответственно), а стёртые в di-base —
-# от 279. 150 — с запасом выше первых и с запасом ниже вторых.
-
-
-def _delete_volume_error(block_id, length):
-    return (
-        f"{block_id}: удаление абзаца длиной {length} знаков ({_DELETE_LENGTH_LIMIT}+ — порог) "
-        f"отклонено — это стирание содержания, а не сокращение. Если часть текста должна "
-        f"остаться, перенеси её через replace_text/set_text в другой абзац ДО удаления этого, "
-        f"а не удаляй блок целиком."
-    )
+_REQUIRED_TEXT = {
+    # Поля-строки, без которых операция не просто бессмысленна, а роняет код:
+    # _flex_span(text, None) и _replace_span(..., None) дают TypeError. Модель
+    # присылает такое редко, но одна операция без old убивала ВЕСЬ прогон из
+    # 20 правок — bench/run.py ловит только обрыв транспорта.
+    "replace_text": ("old", "new"), "replace_all": ("old", "new"),
+    "set_format": ("old",), "footnote": ("old", "text"),
+    "set_text": ("text",), "insert_after": ("text",),
+}
 
 
 def validate(blocks, op, doc):
@@ -147,11 +137,6 @@ def validate(blocks, op, doc):
             return f"блок {block_id!r} не найден в документе"
         if name in _PARAGRAPH_ONLY and by_id[block_id]["kind"] != "p":
             return f"{block_id} — это таблица, {name} работает только с абзацами"
-
-    if name == "delete" and by_id[block_id]["kind"] == "p":
-        length = len(by_id[block_id]["text"])
-        if length > _DELETE_LENGTH_LIMIT:
-            return _delete_volume_error(block_id, length)
 
     if name == "set_text" and _ellipsis_truncation(by_id[block_id]["text"], op.get("text")):
         return _ellipsis_error(block_id)
@@ -189,6 +174,10 @@ def validate(blocks, op, doc):
         row, col = op.get("row"), op.get("col")
         if not (isinstance(row, int) and 0 <= row < nrows) or not (isinstance(col, int) and 0 <= col < ncols):
             return f"ячейка ({row},{col}) вне таблицы {block_id}: размер {nrows}x{ncols}"
+
+    for field in _REQUIRED_TEXT.get(name, ()):
+        if not isinstance(op.get(field), str):
+            return f"в операции {name} нет поля «{field}» со строкой"
 
     if name in ("replace_text", "replace_all"):
         old, new = op.get("old"), op.get("new")
@@ -592,6 +581,12 @@ def _op_replace_all(doc, idx, op):
             continue
         for m_start, m_end in reversed(matches):
             _replace_span(p_el, m_start, m_end, new)
+        if _ptext(p_el) == full:
+            # найдено, но применение не изменило текст (например, old/new
+            # расходятся только в пробелах, которые _flex_span сам нормализует
+            # при поиске) — отчёт не должен приписывать себе правку, которой
+            # не произошло (инвариант 5, «отчёт не врёт»)
+            continue
         total += len(matches)
         blocks_touched += 1
     return f"Заменено {total} вхождений «{old}» на «{new}» в {blocks_touched} блоках (включая ячейки таблиц)"

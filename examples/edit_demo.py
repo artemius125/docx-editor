@@ -966,7 +966,13 @@ def test_defect2_batch_collision_replace_all():
                  "new": "Второй абзац, известный как Bi-encoders"},
                 {"op": "replace_all", "old": "Bi-encoder", "new": "Bi-encoders"},
             ]}
-        assert "батча" in feedback, feedback
+        # Ф16, item 4: validate теперь считается ДО коллизии батча (targets/
+        # collision требуют полей, которые validate и проверяет) — здесь
+        # replace_all матчит «Bi-encoder» как префикс уже вписанного op1
+        # «Bi-encoders», и это одновременно и самоколлизия батча, и обрыв
+        # посреди слова; validate.py ловит обрыв первым, тем же исходом
+        # (батч проваливается, документ не портится).
+        assert "посреди слова" in feedback, feedback
         return {"ops": [], "note": "replace_all бьёт по только что вписанному Bi-encoders"}
 
     def fake_checker(request, diff):
@@ -1225,6 +1231,177 @@ def test_failed_records_ops_applied_before_batch_failure():
     print(f"edit_demo: failed сохранил {len(result['applied'])} операций, реально применённых до сбоя, документ откачен")
 
 
+def test_id_fields_covers_all_ops_except_document_wide():
+    # Ф16: _ID_FIELDS — контракт, на который опирается гвард полосы фрагмента
+    # (_out_of_lane). Операция, забытая в этом словаре, проходит гвард молча
+    # и может задеть любой блок документа, а не только показанный Редактору —
+    # так и было с "footnote" (добавлена в patch.py, забыта здесь). Полнота
+    # проверялась только против _HANDLERS (patch_demo.py), не против гварда.
+    missing = patch._OPS - {"normalize", "replace_all"} - set(edit_mod._ID_FIELDS)
+    assert not missing, f"_ID_FIELDS не покрывает операции {missing} — гвард полосы их не проверяет"
+    print("edit_demo: _ID_FIELDS покрывает все id-несущие операции patch._OPS")
+
+
+def test_replace_all_deduped_across_clusters():
+    # Item 1 (di-base math#1, живой прогон: verdict rolled_back, iter=3,
+    # applied нёс одну и ту же пару дважды). Каждый кластер получает ПОЛНЫЙ
+    # текст правки — один и тот же replace_all может прийти от нескольких
+    # кластеров подряд, а written внутри _apply_ops заводится заново на
+    # каждый вызов и не видит соседний кластер. Повтор не меняет текст
+    # (уже применён первым кластером), diff второго кластера пуст →
+    # partial=True → откатывается ВЕСЬ верный результат первого кластера.
+    doc = Document()
+    doc.add_paragraph("Термин обладает свойством адекватности. Точка.")
+    for i in range(1, 9):
+        doc.add_paragraph(f"Абзац {i}: наполнитель.")
+    doc.add_paragraph("Последний абзац без термина.")
+    idx = index(doc)
+
+    def fake_navigator(outline_text, request):
+        return {"kind": "local", "rule": None, "ids": ["p0", "p9"], "anchors": []}
+
+    def fake_editor(fragment_text, request, feedback=None):
+        # Оба кластера (p0 и p9 — непересекающиеся окна) честно видят один и
+        # тот же полный текст правки и оба предлагают одну и ту же замену.
+        return {"ops": [{"op": "replace_all", "old": "адекватности. ", "new": "адекватности."}]}
+
+    def fake_checker(request, diff):
+        return {"ok": True, "reason": "ok"}
+
+    result, doc, idx = run_edit(
+        doc, idx, "убери лишний пробел после «адекватности.»",
+        navigator=fake_navigator, editor=fake_editor, checker=fake_checker,
+    )
+
+    assert result["verdict"] == "done", result
+    p0_text = next(b["text"] for b in doc_map(doc, idx) if b["id"] == "p0")
+    assert p0_text == "Термин обладает свойством адекватности.Точка.", p0_text
+    print(f"edit_demo: повторный replace_all от второго кластера дедуплицирован, verdict={result['verdict']!r}")
+
+
+def test_retry_widens_lane_to_match_rerendered_fragment():
+    # Item 2 (дефект в сегодняшнем ретрай-фиксе, edit.py): фрагмент на ретрае
+    # перерисовывается С ОКРУЖЕНИЕМ (around=1) от УЖЕ показанных id, поэтому
+    # реально видимый фрагмент шире fragment_ids. Живой случай: показаны
+    # p52,p53,p54, ретрай перерисовал p51..p55, а правка на p51 отбита как
+    # "вне фрагмента, показанного в этом вызове" — хотя p51 только что был
+    # на экране у Редактора. Здесь: единственная цель p3, окно {p2,p3,p4},
+    # первая попытка невалидна (текста нет) → ретрай перерисовывает с
+    # around=1 и заодно показывает p1 — Редактор отвечает на p1, и это не
+    # должно быть отбито гвардом.
+    doc = Document()
+    for i in range(10):
+        doc.add_paragraph(f"Абзац {i}: обычный текст.")
+    idx = index(doc)
+
+    def fake_navigator(outline_text, request):
+        return {"kind": "local", "rule": None, "ids": ["p3"], "anchors": []}
+
+    def fake_editor(fragment_text, request, feedback=None):
+        if feedback is None:
+            return {"ops": [{"op": "replace_text", "id": "p3", "old": "текста, которого тут нет", "new": "х"}]}
+        assert "p1 [" in fragment_text, fragment_text
+        return {"ops": [{"op": "replace_text", "id": "p1", "old": "обычный", "new": "другой"}]}
+
+    def fake_checker(request, diff):
+        return {"ok": True, "reason": "ok"}
+
+    result, doc, idx = run_edit(
+        doc, idx, "правка",
+        navigator=fake_navigator, editor=fake_editor, checker=fake_checker,
+    )
+
+    assert result["verdict"] == "done", result
+    p1_text = next(b["text"] for b in doc_map(doc, idx) if b["id"] == "p1")
+    assert "другой" in p1_text, p1_text
+    print("edit_demo: ретрай на блок, появившийся только в перерисованном (around=1) фрагменте, не отбит гвардом")
+
+
+def test_cluster_with_removed_targets_skipped_not_dead_end():
+    # Item 3 (находка контрольного анализа потока, без живого воспроизведения):
+    # clusters вычисляются один раз до всех мутаций. Если к моменту обработки
+    # кластера его цели уже пропали из документа, find.fragment() вернёт [] —
+    # пустой фрагмент даёт ПУСТОЕ множество fragment_ids (не None!), гвард
+    # полосы активен и отклонит ЛЮБОЙ ответ Редактора; ретрай перерисует тот
+    # же пустой фрагмент, вторая неудача фатальна и откатывает ВСЮ правку,
+    # включая уже верную работу более раннего кластера. Здесь find.fragment
+    # подменена, чтобы для p6 детерминированно вернуть [] (имитация "цель
+    # уже пропала"), не полагаясь на конкретный способ, которым это могло
+    # случиться в реальном документе.
+    doc = Document()
+    for i in range(8):
+        doc.add_paragraph(f"Абзац {i}: обычный текст.")
+    idx = index(doc)
+    before_p6 = doc_map(doc, idx)[6]["text"]
+
+    def fake_navigator(outline_text, request):
+        return {"kind": "local", "rule": None, "ids": ["p0", "p6"], "anchors": []}
+
+    real_fragment = find.fragment
+
+    def fake_fragment(blocks, ids, around=1):
+        if set(ids) == {"p6"}:
+            return []
+        return real_fragment(blocks, ids, around=around)
+
+    calls = []
+
+    def fake_editor(fragment_text, request, feedback=None):
+        calls.append(fragment_text)
+        return {"ops": [{"op": "replace_text", "id": "p0", "old": "обычный", "new": "другой"}]}
+
+    def fake_checker(request, diff):
+        return {"ok": True, "reason": "ok"}
+
+    find.fragment = fake_fragment
+    try:
+        result, doc, idx = run_edit(
+            doc, idx, "правка",
+            navigator=fake_navigator, editor=fake_editor, checker=fake_checker,
+        )
+    finally:
+        find.fragment = real_fragment
+
+    assert len(calls) == 1, f"кластер с пропавшими целями обязан быть пропущен без вызова редактора, вызовов: {len(calls)}"
+    assert result["verdict"] == "done", result
+    p0_text = next(b["text"] for b in doc_map(doc, idx) if b["id"] == "p0")
+    assert "другой" in p0_text, p0_text
+    p6_text = next(b["text"] for b in doc_map(doc, idx) if b["id"] == "p6")
+    assert p6_text == before_p6, p6_text
+    print("edit_demo: кластер с find.fragment()==[] пропущен, остальная правка дошла до done")
+
+
+def test_targets_computed_after_validate_not_before():
+    # Item 4: _op_targets вычислялся ДО patch.validate и падал TypeError на
+    # операциях, которые validate и создан отклонять (например old=None у
+    # replace_text/replace_all — воспроизведено на {'op':'replace_all',
+    # 'new':'x'} и {'op':'replace_text','id':'p10','new':'x'}). Одна такая
+    # операция от модели убивала весь батч необработанным исключением.
+    # patch.validate подменён (детерминированный отказ), чтобы проверка не
+    # зависела от того, есть ли уже в patch.py (чужой файл в этой сессии)
+    # собственный гвард на old=None — здесь проверяется порядок вызовов
+    # внутри edit.py: реальный _op_targets НЕ должен вызываться раньше
+    # validate, иначе он упадёт тем же TypeError на этом же old=None.
+    doc = Document()
+    doc.add_paragraph("Абзац с текстом.")
+    idx = index(doc)
+
+    real_validate = patch.validate
+
+    def fake_validate(blocks, op, d):
+        return "симулированный отказ валидатора"
+
+    patch.validate = fake_validate
+    try:
+        malformed = {"op": "replace_text", "id": "p0", "new": "x"}  # без "old"
+        applied, err, tries = edit_mod._apply_ops(doc, idx, [malformed], "", "правка", None)
+    finally:
+        patch.validate = real_validate
+
+    assert applied == [] and err == "симулированный отказ валидатора", (applied, err)
+    print("edit_demo: _op_targets не вызывается раньше patch.validate — malformed op не роняет TypeError")
+
+
 if __name__ == "__main__":
     test_split_real_file()
     test_fallback_search_then_honest_refusal()
@@ -1262,3 +1439,8 @@ if __name__ == "__main__":
     test_partial_cluster_processing_not_done()
     test_retry_recomputes_fragment_after_batch_mutation()
     test_failed_records_ops_applied_before_batch_failure()
+    test_id_fields_covers_all_ops_except_document_wide()
+    test_replace_all_deduped_across_clusters()
+    test_retry_widens_lane_to_match_rerendered_fragment()
+    test_cluster_with_removed_targets_skipped_not_dead_end()
+    test_targets_computed_after_validate_not_before()
