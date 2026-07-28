@@ -1601,6 +1601,183 @@ def test_later_clusters_see_what_earlier_ones_did():
     print("edit_demo: второй кластер получает список уже сделанного в этой правке")
 
 
+def test_unify_replaces_every_variant_and_reports_done():
+    # Ф18: Навигатор маршрутизирует правку "приведи к одному" в unify —
+    # модель только выбирает пары ("старое"→канон.), код заменяет ПО ВСЕМУ
+    # документу и сам считает вердикт (нулевой остаток → done). Раньше это
+    # шло кластерами и на 4 написаниях Bi-encoder дало ЛОЖНЫЙ done (ColBERT 7).
+    doc = Document()
+    doc.add_paragraph("Модель COLBERT показывает высокое качество.")
+    doc.add_paragraph("ColBERT — базовая архитектура.")
+    doc.add_paragraph("Далее Colbert используется как основа.")
+    idx = index(doc)
+
+    def fake_navigator(outline_text, request):
+        return {"kind": "unify", "rule": None, "ids": [], "anchors": []}
+
+    def fake_unifier(inventory_text, request):
+        assert "COLBERT" in inventory_text and "Colbert" in inventory_text, inventory_text
+        return {"pairs": [["COLBERT", "ColBERT"], ["Colbert", "ColBERT"]], "note": ""}
+
+    def no_editor(*a, **kw):
+        raise AssertionError("Редактор не должен звонить на пути unify")
+
+    def no_checker(*a, **kw):
+        raise AssertionError("Проверяющий-LLM не должен звонить на пути unify — вердикт считает код")
+
+    request = 'Термин записан как «COLBERT», «ColBERT», «Colbert» — приведи к одному варианту по всему документу.'
+    result, doc, idx = run_edit(
+        doc, idx, request,
+        navigator=fake_navigator, editor=no_editor, checker=no_checker, unifier=fake_unifier,
+    )
+    assert result["verdict"] == "done", result
+    assert result["reason"] == "заменено 2 вхождений 2 вариантов", result["reason"]
+    text = " ".join(b["text"] for b in doc_map(doc, idx))
+    assert "COLBERT" not in text and "Colbert" not in text, text
+    assert text.count("ColBERT") == 3, text
+    print("edit_demo: unify заменяет все варианты и даёт done по нулевому остатку")
+
+
+def test_unify_leftover_variant_rolls_back_to_failed():
+    # Абзац несёт ОБА написания: "Bi-encoder" внутри "Bi-encoders" (не по
+    # границе слова) первым в тексте и отдельно стоящее "Bi-encoder" вторым.
+    # validate() смотрит только ПЕРВОЕ совпадение _flex_span в блоке — оно
+    # приклеено к "s" и не считается (word=True), поэтому блок помечается как
+    # "not found" и пара не применяется вовсе, хотя отдельно стоящее написание
+    # реально есть. Итоговый словограничный скан (find.by_regex) это ловит:
+    # правка обязана честно откатиться, а не соврать done с недоделанным полем.
+    doc = Document()
+    doc.add_paragraph("Bi-encoders and Bi-encoder both appear here.")
+    doc.add_paragraph("Здесь пишут Bi-Encoder с большой буквы.")
+    idx = index(doc)
+    before = [b["text"] for b in doc_map(doc, idx)]
+
+    def fake_navigator(outline_text, request):
+        return {"kind": "unify", "rule": None, "ids": [], "anchors": []}
+
+    def fake_unifier(inventory_text, request):
+        return {"pairs": [["Bi-encoder", "Bi-Encoder"]], "note": ""}
+
+    def no_editor(*a, **kw):
+        raise AssertionError("Редактор не должен звонить на пути unify")
+
+    def no_checker(*a, **kw):
+        raise AssertionError("Проверяющий-LLM не должен звонить на пути unify")
+
+    request = 'Термин пишется то «Bi-encoder», то «Bi-Encoder» — приведи к одному варианту по всему документу.'
+    result, doc, idx = run_edit(
+        doc, idx, request,
+        navigator=fake_navigator, editor=no_editor, checker=no_checker, unifier=fake_unifier,
+    )
+    assert result["verdict"] == "failed", result
+    assert "Bi-encoder" in result["reason"], result["reason"]
+    after = [b["text"] for b in doc_map(doc, idx)]
+    assert after == before, "документ обязан остаться прежним после отката"
+    print("edit_demo: unify откатывается и отказывает честно, если остался вариант")
+
+
+def test_unify_word_flag_protects_plural_form():
+    # Тот же класс, что и test_unify_leftover..., но абзацы разные: единичное
+    # "Bi-encoder" стоит ОТДЕЛЬНО от абзаца с "Bi-encoders" — validate находит
+    # его по границе слова, замена проходит, а множественное число ("Bi-
+    # encoders" из другого абзаца) не задето вовсе — это и есть тот самый
+    # случай ColBERT 7 из BUILD_PLAN Ф18.
+    doc = Document()
+    doc.add_paragraph("Bi-encoder — архитектура для быстрого поиска.")
+    doc.add_paragraph("Bi-encoders используются широко в индустрии.")
+    doc.add_paragraph("Здесь пишут Bi-Encoder с большой буквы.")
+    idx = index(doc)
+
+    def fake_navigator(outline_text, request):
+        return {"kind": "unify", "rule": None, "ids": [], "anchors": []}
+
+    def fake_unifier(inventory_text, request):
+        return {"pairs": [["Bi-encoder", "Bi-Encoder"]], "note": ""}
+
+    def no_editor(*a, **kw):
+        raise AssertionError("Редактор не должен звонить на пути unify")
+
+    def no_checker(*a, **kw):
+        raise AssertionError("Проверяющий-LLM не должен звонить на пути unify")
+
+    request = 'Термин пишется то «Bi-encoder», то «Bi-Encoder» — приведи к одному варианту по всему документу.'
+    result, doc, idx = run_edit(
+        doc, idx, request,
+        navigator=fake_navigator, editor=no_editor, checker=no_checker, unifier=fake_unifier,
+    )
+    assert result["verdict"] == "done", result
+    texts = [b["text"] for b in doc_map(doc, idx)]
+    assert texts[0] == "Bi-Encoder — архитектура для быстрого поиска.", texts
+    assert texts[1] == "Bi-encoders используются широко в индустрии.", "множественное число задето быть не должно: " + texts[1]
+    print("edit_demo: флаг word защищает «Bi-encoders» от замены внутри неё «Bi-encoder»")
+
+
+def test_unify_empty_pairs_is_honest_failed():
+    # Модель честно отказалась выбрать канонический вариант — pairs пуст.
+    # Это не провал системы, а легитимный ответ (см. _UNIFY_PROMPT), но
+    # результат правки для документа обязан остаться "failed", а документ —
+    # нетронутым.
+    doc = Document()
+    doc.add_paragraph("Модель COLBERT показывает высокое качество.")
+    doc.add_paragraph("ColBERT — базовая архитектура.")
+    idx = index(doc)
+    before = [b["text"] for b in doc_map(doc, idx)]
+
+    def fake_navigator(outline_text, request):
+        return {"kind": "unify", "rule": None, "ids": [], "anchors": []}
+
+    def fake_unifier(inventory_text, request):
+        return {"pairs": [], "note": "неясно, какой вариант канонический"}
+
+    def no_editor(*a, **kw):
+        raise AssertionError("Редактор не должен звонить на пути unify")
+
+    def no_checker(*a, **kw):
+        raise AssertionError("Проверяющий-LLM не должен звонить на пути unify")
+
+    request = 'Термин записан как «COLBERT», «ColBERT» — приведи к одному варианту по всему документу.'
+    result, doc, idx = run_edit(
+        doc, idx, request,
+        navigator=fake_navigator, editor=no_editor, checker=no_checker, unifier=fake_unifier,
+    )
+    assert result["verdict"] == "failed", result
+    assert result["reason"] == "неясно, какой вариант канонический", result["reason"]
+    after = [b["text"] for b in doc_map(doc, idx)]
+    assert after == before, "документ не должен измениться при пустых pairs"
+    print("edit_demo: unify с пустыми pairs — честный отказ, документ не тронут")
+
+
+def test_unify_falls_through_to_local_when_inventory_thin():
+    # Навигатор промахнулся маршрутом: в документе только ОДНО реальное
+    # написание термина — unify тут не при чём (см. _variant_inventory,
+    # порог < 2 вариантов). Правка обязана уйти обычным локальным путём
+    # (через editor/checker), а unifier — не звониться вовсе.
+    doc = Document()
+    doc.add_paragraph("Bi-encoder — единственное упоминание в документе.")
+    idx = index(doc)
+
+    def fake_navigator(outline_text, request):
+        return {"kind": "unify", "rule": None, "ids": ["p0"], "anchors": []}
+
+    def fake_unifier(inventory_text, request):
+        raise AssertionError("unifier не должен звониться при инвентаре < 2 вариантов")
+
+    def fake_editor(fragment_text, request, feedback=None):
+        return {"ops": [{"op": "replace_text", "id": "p0", "old": "Bi-encoder", "new": "BiEncoder"}]}
+
+    def fake_checker(request, diff):
+        return {"ok": True, "reason": "ok"}
+
+    request = 'Термин «Bi-encoder» пишется неверно, исправь.'
+    result, doc, idx = run_edit(
+        doc, idx, request,
+        navigator=fake_navigator, editor=fake_editor, checker=fake_checker, unifier=fake_unifier,
+    )
+    assert result["verdict"] == "done", result
+    assert doc_map(doc, idx)[0]["text"] == "BiEncoder — единственное упоминание в документе."
+    print("edit_demo: unify с тонким инвентарём падает обратно на локальный путь")
+
+
 if __name__ == "__main__":
     test_split_real_file()
     test_fallback_search_then_honest_refusal()
@@ -1649,3 +1826,8 @@ if __name__ == "__main__":
     test_numeric_literals_are_anchors()
     test_editor_already_gives_already_not_failed()
     test_later_clusters_see_what_earlier_ones_did()
+    test_unify_replaces_every_variant_and_reports_done()
+    test_unify_leftover_variant_rolls_back_to_failed()
+    test_unify_word_flag_protects_plural_form()
+    test_unify_empty_pairs_is_honest_failed()
+    test_unify_falls_through_to_local_when_inventory_thin()

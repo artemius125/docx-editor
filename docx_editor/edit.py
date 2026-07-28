@@ -19,7 +19,7 @@ from docx_editor.parse import _format_note, doc_map, index, render
 
 _NAV_PROMPT = """Ты — навигатор по документу .docx. Тебе дают компактное
 оглавление (id и начало текста абзаца на строку) и текст правки на русском.
-Верни ТОЛЬКО JSON {"kind":"local"|"global","rule":null|"typography"|"quotes",
+Верни ТОЛЬКО JSON {"kind":"local"|"global"|"unify","rule":null|"typography"|"quotes",
 "ids":[...],"anchors":[...]} без пояснений и markdown-обвязки.
 
 - "rule" — только когда правка ГЛОБАЛЬНАЯ типографская и относится РОВНО к
@@ -31,8 +31,19 @@ _NAV_PROMPT = """Ты — навигатор по документу .docx. Те
   остальных случаях rule = null, даже если правка звучит "по всему
   документу". Например, "термин Bi-encoder пишется четырьмя разными
   способами, приведи к одному" — это НЕ rule (это не типографика, а
-  единообразие термина), верни local с ids/anchors на найденные варианты —
-  это работа Редактора, а не нормализации.
+  единообразие термина) — это "unify", см. ниже.
+- "kind" = "unify" — правка требует ОДИНАКОВОГО написания или формата ПО
+  ВСЕМУ документу: термин записан несколькими разными способами и их нужно
+  привести к одному; годы в нескольких разных форматах; числа через точку
+  вместо запятой — везде. Признак — слово «везде»/«по всему документу»/
+  «одинаково», применённое к написанию или формату, а не к содержанию.
+  Положительные примеры: "термин Bi-encoder пишется четырьмя разными
+  способами, приведи к одному"; "годы записаны в трёх разных форматах,
+  сделай одинаково"; "числа через точку — замени на запятую по всему
+  документу". Отрицательный пример: "замени слово в одном-двух названных
+  местах" — это "local", а не "unify". Для "unify" ids/anchors всё равно
+  заполняются найденными вариантами написания — код использует их, чтобы
+  посчитать частоты.
 - "ids" — id блоков из оглавления, которые точно относятся к правке, если
   видишь их явно. Не пиши id внутрь anchors — это отдельное поле.
 - "anchors" — дословные цитаты ИЗ ТЕКСТА ПРАВКИ, самые специфичные, какие
@@ -139,6 +150,29 @@ def _check(request, diff):
     messages = [
         {"role": "system", "content": _CHECK_PROMPT},
         {"role": "user", "content": f"Правка: {request}\n\nИзменения:\n{diff_text}"},
+    ]
+    return llm.chat(messages)
+
+
+_UNIFY_PROMPT = """Ты — редактор, приводящий документ .docx к единообразию.
+Тебе дают инвентарь вариантов написания/формата, посчитанный кодом по всему
+документу (строку "Найдено в документе: «вариант» — N блока/блоков, ..."),
+и текст правки. Выбери ОДИН канонический вариант из инвентаря и перечисли
+КАЖДЫЙ из остальных вариантов инвентаря как пару ["вариант","канонический"]
+— код сам заменит их по всему документу везде, где они встречаются как
+отдельное слово/фраза; ты только решаешь, что на что менять, замену делает
+код. Канонический вариант в pairs на себя не добавляется. Верни ТОЛЬКО JSON
+{"pairs": [["старое","новое"], ...], "note": "..."}. Если по инвентарю
+нельзя понять, какой вариант канонический, или правка на самом деле не про
+единообразие написания/формата — верни {"pairs": [], "note": "почему"}. Это
+честный отказ, а не провал — пустые pairs с внятной note ожидаемы не реже,
+чем список пар."""
+
+
+def _unify_llm(inventory_text, request):
+    messages = [
+        {"role": "system", "content": _UNIFY_PROMPT},
+        {"role": "user", "content": f"{inventory_text}\n\nПравка: {request}"},
     ]
     return llm.chat(messages)
 
@@ -893,6 +927,76 @@ def _run_clusters(doc, idx, blocks, ids, request, editor, checker, nav, fallthro
     return _failed("операции применились, но текст не изменился", nav, editor_replies, tries), doc, idx
 
 
+def _word_pattern(text):
+    """Regex словограничного, пробельно-гибкого поиска text по всему
+    документу — та же техника, что и find._flex_span (части, разбитые по
+    пробельным разрывам, между ними \\s+), плюс границы слова (?<!\\w)…(?!\\w)
+    снаружи, чтобы «Bi-encoder» не считался найденным внутри «Bi-encoders»."""
+    parts = [re.escape(p) for p in re.split(r"\s+", text) if p]
+    return r"(?<!\w)" + r"\s+".join(parts) + r"(?!\w)"
+
+
+def _run_unify(doc, idx, blocks, nav, request, editor, checker, unifier):
+    """Ф18: правки вида «сделай одинаково по всему документу» (унификация
+    термина, дат, чисел) — по замеру w12 самый большой источник провалов и
+    единственный источник лжи (ColBERT 7: вердикт done при ЧЕТЫРЁХ написаниях
+    Bi-encoder в файле). Причина — кластеры (_run_clusters) видят только свой
+    кусок документа и "унифицируют" к тому варианту, который уже стоит перед
+    ними. Здесь ОДИН вызов модели решает, какие пары заменить, а всю мутацию
+    и весь вердикт делает код (инвариант 1/5) — Проверяющий-LLM на этом пути
+    не зовётся вовсе, вердикт — это счёт оставшихся вхождений.
+
+    Инвентарь вариантов (_variant_inventory, переиспользуется, не пишем
+    вторую копию) пуст, если в документе меньше двух реально найденных
+    вариантов — Навигатор промахнулся с маршрутом unify, это обычная
+    локальная (или пустая) правка: тот же путь, что и раньше до Ф18."""
+    inventory = _variant_inventory(blocks, nav, request)
+    if not inventory:
+        return _run_local(doc, idx, blocks, nav, request, editor, checker)
+
+    reply = unifier(inventory, request) or {}
+    pairs = [tuple(p) for p in (reply.get("pairs") or []) if isinstance(p, (list, tuple)) and len(p) == 2]
+    if not pairs:
+        return _failed(reply.get("note") or "модель не предложила ни одной пары для унификации", nav, reply), doc, idx
+
+    # УБЫВАНИЕ длины old — иначе «Bi-encoder» переписал бы внутренность
+    # «Bi-encoders» до того, как до неё дойдёт её собственная пара.
+    pairs = sorted(pairs, key=lambda p: -len(p[0]))
+    snapshot_path = _snapshot(doc)
+    applied, replaced_n = [], 0
+    for old, new in pairs:
+        if old == new or not find.by_text(blocks, old):
+            # old==new — пустая пара; old не найден в документе вовсе — модель
+            # назвала невыдуманный вариант, счёт вхождений в конце решит, была
+            # ли это ошибка (design: "не ошибка, финальный счёт решает").
+            continue
+        op = {"op": "replace_all", "old": old, "new": new, "word": True}
+        err = patch.validate(doc_map(doc, idx), op, doc)
+        if err is not None:
+            continue
+        desc = patch.apply(doc, idx, op)
+        applied.append(desc)
+        m = re.search(r"Заменено (\d+) вхождений", desc)
+        replaced_n += int(m.group(1)) if m else 0
+
+    blocks_after = doc_map(doc, idx)
+    remaining = [old for old, new in pairs if old != new and find.by_regex(blocks_after, _word_pattern(old))]
+    if remaining:
+        doc, idx = _restore(snapshot_path)
+        reason = "не удалось привести к одному написанию, остались варианты: " + ", ".join(f"«{r}»" for r in remaining)
+        return _failed(reason, nav, reply, applied=applied), doc, idx
+
+    diff_all = _diff(blocks, blocks_after)
+    if not diff_all:
+        os.remove(snapshot_path)
+        return _already("документ уже унифицирован — заменять было нечего", nav, reply), doc, idx
+
+    os.remove(snapshot_path)
+    reason = f"заменено {replaced_n} вхождений {len(applied)} вариантов"
+    return {"verdict": "done", "reason": reason, "applied": applied, "ids": [d["id"] for d in diff_all],
+            "iter": 1, "reply": {"nav": nav, "editor": reply}}, doc, idx
+
+
 def _run_local(doc, idx, blocks, nav, request, editor, checker, fallthrough=False):
     """Локальный путь через Редактора: резолв id → кластеризация → цикл
     маленьких шагов (_run_clusters, один вызов Редактора на кластер). Нет
@@ -918,7 +1022,7 @@ def _run_local(doc, idx, blocks, nav, request, editor, checker, fallthrough=Fals
     return _run_clusters(doc, idx, blocks, ids, request, editor, checker, nav, fallthrough)
 
 
-def run_edit(doc, idx, request, navigator=_navigate, editor=_edit_llm, checker=_check):
+def run_edit(doc, idx, request, navigator=_navigate, editor=_edit_llm, checker=_check, unifier=_unify_llm):
     """Один цикл правки. Возвращает (result, doc, idx) — после отката
     (verdict != "done" после применения) doc/idx уже перечитаны из снимка,
     старые ссылки вызывающего использовать нельзя.
@@ -937,12 +1041,18 @@ def run_edit(doc, idx, request, navigator=_navigate, editor=_edit_llm, checker=_
     Change C: пустой diff у rule — не терминал. Код восстанавливает документ
     и продолжает ТЕМ ЖЕ запросом обычным локальным путём (_run_local с
     fallthrough=True) — rule не умеет отличить "уже чисто" от "не умею это
-    делать", это умеет только реальная попытка через Редактора."""
+    делать", это умеет только реальная попытка через Редактора.
+
+    Ф18: kind="unify" (навигатор) уходит в _run_unify — там "editor" в reply
+    не список ответов по кластерам, а ОДИН ответ unifier (пары "старое"→
+    "новое"), Проверяющий-LLM не зовётся вовсе, вердикт считает код."""
     blocks = doc_map(doc, idx)
     nav = navigator(find.outline(blocks), request) or {}
     rule = nav.get("rule")
 
     if not rule:
+        if nav.get("kind") == "unify":
+            return _run_unify(doc, idx, blocks, nav, request, editor, checker, unifier)
         return _run_local(doc, idx, blocks, nav, request, editor, checker)
 
     # Правки типа rule идут мимо Редактора — код нормализует сам, LLM не зовём.
