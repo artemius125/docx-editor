@@ -1,0 +1,351 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>*{box-sizing:border-box}body{margin:0}img{max-width:100%}</style>
+<title>docx-editor: эффективность правок</title>
+
+<style>
+  :root {
+    --paper: #fbfbfd;
+    --card: #ffffff;
+    --ink: #13161d;
+    --muted: #5c6472;
+    --hair: #dfe1e8;
+    --accent: #2f3d8c;
+    --accent-soft: #e8eaf6;
+    --good: #1f6f52;
+    --bad: #a8322a;
+    --grid: #eceef4;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper: #0f1218;
+      --card: #161a22;
+      --ink: #e8eaf0;
+      --muted: #98a1b2;
+      --hair: #262c38;
+      --accent: #8f9fea;
+      --accent-soft: #1c2334;
+      --good: #63c69c;
+      --bad: #e58079;
+      --grid: #20262f;
+    }
+  }
+  :root[data-theme="dark"] {
+    --paper: #0f1218;
+    --card: #161a22;
+    --ink: #e8eaf0;
+    --muted: #98a1b2;
+    --hair: #262c38;
+    --accent: #8f9fea;
+    --accent-soft: #1c2334;
+    --good: #63c69c;
+    --bad: #e58079;
+    --grid: #20262f;
+  }
+  :root[data-theme="light"] {
+    --paper: #fbfbfd;
+    --card: #ffffff;
+    --ink: #13161d;
+    --muted: #5c6472;
+    --hair: #dfe1e8;
+    --accent: #2f3d8c;
+    --accent-soft: #e8eaf6;
+    --good: #1f6f52;
+    --bad: #a8322a;
+    --grid: #eceef4;
+  }
+
+  body {
+    background: var(--paper);
+    color: var(--ink);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+    font-size: 16px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap {
+    max-width: 62rem;
+    margin: 0 auto;
+    padding: 3rem 1.25rem 5rem;
+    display: flex;
+    flex-direction: column;
+    gap: 2.75rem;
+  }
+
+  .eyebrow {
+    font-size: 0.75rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--muted);
+    font-weight: 600;
+  }
+  h1 {
+    font-family: Georgia, "Times New Roman", serif;
+    font-size: clamp(1.9rem, 4vw, 2.8rem);
+    line-height: 1.15;
+    font-weight: 400;
+    text-wrap: balance;
+    margin: 0.4rem 0 0;
+  }
+  h2 {
+    font-family: Georgia, "Times New Roman", serif;
+    font-size: 1.35rem;
+    font-weight: 400;
+    margin: 0 0 0.9rem;
+    text-wrap: balance;
+  }
+  p { margin: 0 0 0.9rem; max-width: 68ch; }
+  p:last-child { margin-bottom: 0; }
+
+  .lede { color: var(--muted); max-width: 62ch; margin-top: 0.9rem; }
+  .formula {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.9rem;
+    background: var(--accent-soft);
+    color: var(--ink);
+    padding: 0.75rem 1rem;
+    border-left: 3px solid var(--accent);
+    margin-top: 1.25rem;
+    overflow-x: auto;
+  }
+
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
+    gap: 1px;
+    background: var(--hair);
+    border: 1px solid var(--hair);
+  }
+  .stat { background: var(--card); padding: 1.1rem 1.15rem; }
+  .stat .k { font-size: 0.72rem; letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); font-weight: 600; }
+  .stat .v {
+    font-family: Georgia, "Times New Roman", serif;
+    font-size: 2.1rem;
+    line-height: 1.1;
+    margin-top: 0.35rem;
+    font-variant-numeric: tabular-nums;
+  }
+  .stat .n { font-size: 0.83rem; color: var(--muted); margin-top: 0.2rem; }
+  .v.bad { color: var(--bad); }
+  .v.good { color: var(--good); }
+
+  .chart-card { border: 1px solid var(--hair); background: var(--card); padding: 1.5rem 1.25rem 1.1rem; }
+  .chart-scroll { overflow-x: auto; }
+  svg { display: block; min-width: 640px; width: 100%; height: auto; }
+  .legend { display: flex; flex-wrap: wrap; gap: 1.25rem; margin-top: 1rem; font-size: 0.82rem; color: var(--muted); }
+  .legend span { display: inline-flex; align-items: center; gap: 0.45rem; }
+  .swatch { width: 1.6rem; height: 0; border-top: 2px solid var(--accent); }
+  .swatch.dash { border-top-style: dashed; border-color: var(--muted); }
+  .dot { width: 0.6rem; height: 0.6rem; border-radius: 50%; background: var(--bad); }
+
+  .table-scroll { overflow-x: auto; border: 1px solid var(--hair); background: var(--card); }
+  table { border-collapse: collapse; width: 100%; font-size: 0.9rem; min-width: 34rem; }
+  th, td { text-align: left; padding: 0.7rem 0.9rem; border-bottom: 1px solid var(--hair); vertical-align: top; }
+  th { font-size: 0.72rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); font-weight: 600; }
+  tr:last-child td { border-bottom: none; }
+  td.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
+  code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.86em;
+    background: var(--accent-soft);
+    padding: 0.1em 0.35em;
+  }
+
+  .findings { display: grid; gap: 1.1rem; }
+  .finding { border-left: 2px solid var(--hair); padding-left: 1rem; }
+  .finding.proved { border-left-color: var(--good); }
+  .finding.disproved { border-left-color: var(--bad); }
+  .finding .tag { font-size: 0.72rem; letter-spacing: 0.1em; text-transform: uppercase; font-weight: 600; color: var(--muted); }
+  .finding .tag.proved { color: var(--good); }
+  .finding .tag.disproved { color: var(--bad); }
+  .finding h3 { font-size: 1rem; margin: 0.25rem 0 0.4rem; font-weight: 600; }
+  .finding p { font-size: 0.94rem; color: var(--muted); margin: 0; }
+
+  footer { border-top: 1px solid var(--hair); padding-top: 1.25rem; font-size: 0.86rem; color: var(--muted); }
+</style>
+</head>
+<body>
+
+<div class="wrap">
+
+  <header>
+    <div class="eyebrow">Стенд приёмки · 28 июля 2026</div>
+    <h1>Эффективность правок: одна метрика, пятнадцать замеров</h1>
+    <p class="lede">Метрику считает не система, а независимый оценщик, который открывает получившийся <code>.docx</code> и проверяет маркеры. Вердикт «сделано» сам по себе не засчитывается никогда, а вердикт, разошедшийся с файлом, вычитается.</p>
+    <div class="formula">Э = (подтверждено оценщиком − ложных вердиктов) ÷ 19 проверяемых правок</div>
+  </header>
+
+  <section class="stats">
+    <div class="stat">
+      <div class="k">Сейчас (w15)</div>
+      <div class="v">79%</div>
+      <div class="n">16 подтверждено, 1 ложь</div>
+    </div>
+    <div class="stat">
+      <div class="k">Лучшая точка</div>
+      <div class="v good">84%</div>
+      <div class="n">w11, 16 подтверждено, лжи нет</div>
+    </div>
+    <div class="stat">
+      <div class="k">От старта</div>
+      <div class="v">×2,5</div>
+      <div class="n">было 32%: 8 правок и 2 лжи</div>
+    </div>
+    <div class="stat">
+      <div class="k">Партия Ф18</div>
+      <div class="v bad">±0</div>
+      <div class="n">три замера, прироста нет</div>
+    </div>
+  </section>
+
+  <section class="chart-card">
+    <h2>Рост по партиям</h2>
+    <div class="chart-scroll">
+      <svg viewBox="0 0 900 380" role="img" aria-label="График роста метрики Э от 32% на старте до 79% в замере w15">
+        <g stroke="var(--grid)" stroke-width="1">
+          <line x1="60" y1="300" x2="880" y2="300" />
+          <line x1="60" y1="235" x2="880" y2="235" />
+          <line x1="60" y1="170" x2="880" y2="170" />
+          <line x1="60" y1="105" x2="880" y2="105" />
+          <line x1="60" y1="40" x2="880" y2="40" />
+        </g>
+        <g fill="var(--muted)" font-size="12" font-family="ui-monospace, monospace" text-anchor="end">
+          <text x="50" y="304">0%</text>
+          <text x="50" y="239">25%</text>
+          <text x="50" y="174">50%</text>
+          <text x="50" y="109">75%</text>
+          <text x="50" y="44">100%</text>
+        </g>
+
+        <!-- накопительный режим: только полные прогоны -->
+        <polyline fill="none" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="5 4"
+          points="70,217 187,178 421,136 597,108 655,108" />
+
+        <!-- изолированный режим -->
+        <polyline fill="none" stroke="var(--accent)" stroke-width="2.5"
+          points="70,217 128,178 187,149 245,108 304,123 362,136 421,108 480,136 538,123 597,81 655,95 713,108 772,136 831,123 880,95" />
+
+        <g>
+          <circle cx="70" cy="217" r="4" fill="var(--bad)" />
+          <circle cx="128" cy="178" r="4" fill="var(--accent)" />
+          <circle cx="187" cy="149" r="4" fill="var(--accent)" />
+          <circle cx="245" cy="108" r="4" fill="var(--accent)" />
+          <circle cx="304" cy="123" r="4" fill="var(--accent)" />
+          <circle cx="362" cy="136" r="4" fill="var(--accent)" />
+          <circle cx="421" cy="108" r="4" fill="var(--accent)" />
+          <circle cx="480" cy="136" r="4" fill="var(--bad)" />
+          <circle cx="538" cy="123" r="4" fill="var(--bad)" />
+          <circle cx="597" cy="81" r="5" fill="var(--good)" />
+          <circle cx="655" cy="95" r="4" fill="var(--accent)" />
+          <circle cx="713" cy="108" r="4" fill="var(--bad)" />
+          <circle cx="772" cy="136" r="4" fill="var(--bad)" />
+          <circle cx="831" cy="123" r="4" fill="var(--accent)" />
+          <circle cx="880" cy="95" r="5" fill="var(--bad)" />
+        </g>
+
+        <g fill="var(--muted)" font-size="11" font-family="ui-monospace, monospace" text-anchor="middle">
+          <text x="70" y="325">база</text>
+          <text x="128" y="325">w4</text>
+          <text x="187" y="325">w5</text>
+          <text x="245" y="325">w6</text>
+          <text x="304" y="325">w7</text>
+          <text x="362" y="325">di</text>
+          <text x="421" y="325">w8</text>
+          <text x="480" y="325">w9</text>
+          <text x="538" y="325">w10</text>
+          <text x="597" y="325">w11</text>
+          <text x="655" y="325">w12</text>
+          <text x="713" y="325">w12b</text>
+          <text x="772" y="325">w13</text>
+          <text x="831" y="325">w14</text>
+          <text x="880" y="325">w15</text>
+        </g>
+
+        <g fill="var(--ink)" font-size="12" font-family="ui-monospace, monospace" text-anchor="middle">
+          <text x="597" y="68">84</text>
+          <text x="880" y="82">79</text>
+        </g>
+
+        <line x1="742" y1="30" x2="742" y2="310" stroke="var(--hair)" stroke-width="1" />
+        <text x="811" y="26" fill="var(--muted)" font-size="11" font-family="ui-monospace, monospace" text-anchor="middle">итерация 28 июля</text>
+      </svg>
+    </div>
+    <div class="legend">
+      <span><i class="swatch"></i> каждая правка на свежей копии — сигнал по механизму</span>
+      <span><i class="swatch dash"></i> весь список подряд по одному документу — правда о продукте</span>
+      <span><i class="dot"></i> в прогоне есть вердикт, разошедшийся с файлом</span>
+    </div>
+  </section>
+
+  <section>
+    <h2>Что мерили сегодня</h2>
+    <p>Три замера подряд на одном и том же корпусе из 40 правок: маршрут «сделай одинаково по всему документу», где модель только выбирает пары замен, а применяет их и выносит вердикт код.</p>
+    <div class="table-scroll">
+      <table>
+        <thead>
+          <tr><th>Замер</th><th class="num">Э</th><th class="num">Подтверждено</th><th class="num">Ложь</th><th>Что показал</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>w12 <span style="color:var(--muted)">точка отсчёта</span></td>
+            <td class="num">79%</td><td class="num">15</td><td class="num">0</td>
+            <td>Состояние до маршрута.</td>
+          </tr>
+          <tr>
+            <td>w13</td>
+            <td class="num">63%</td><td class="num">13</td><td class="num">1</td>
+            <td>Маршрут проверял список модели вместо своего инвентаря — та же ложь, ради которой он делался.</td>
+          </tr>
+          <tr>
+            <td>w14</td>
+            <td class="num">68%</td><td class="num">13</td><td class="num">0</td>
+            <td>Ложь ушла, но маршрут перехватывал чужие правки: кавычки и пробелы делались нормализацией и сломались.</td>
+          </tr>
+          <tr>
+            <td>w15</td>
+            <td class="num">79%</td><td class="num">16</td><td class="num">1</td>
+            <td>Лучшее число подтверждённых за проект. По метрике — ровно уровень w12.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <h2>Что доказано, а что опровергнуто</h2>
+    <div class="findings">
+      <div class="finding proved">
+        <div class="tag proved">Доказано замером</div>
+        <h3>Правка ColBERT 4 прошла оценщика впервые за проект</h3>
+        <p>Шесть чисел, записанных через точку вместо запятой. Помог не сам маршрут, а его отступление: когда пары модели расходятся по нескольким канонам, это не унификация, и правка возвращается на обычный путь вместо отказа.</p>
+      </div>
+      <div class="finding disproved">
+        <div class="tag disproved">Опровергнуто замером</div>
+        <h3>Приоритет нового маршрута над правилами — вред</h3>
+        <p>Решение казалось безопасным и стоило двух правок: кавычки в ColBERT 6 и пробелы в Математике 1 делались кодом-нормализатором, а новый маршрут перехватывал их и валил. Порядок вернули как был.</p>
+      </div>
+      <div class="finding disproved">
+        <div class="tag disproved">Названо вслух</div>
+        <h3>«Вердикт выносит код» верен ровно настолько, насколько полон инвентарь</h3>
+        <p>Ложь в w15 вернулась не из-за модели. Инвентарь вариантов строится из цитат в тексте правки, а не сканом документа: написание «Single-Vector» с большой буквой V никто не процитировал, проверка остатка его не искала, и код честно отчитался по неполному списку.</p>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Решение</h2>
+    <p>Маршрут не принят и не откачен. По правилу проекта прирост меньше трёх пунктов не считается результатом, а 79% против 79% — это ноль. Но замеры шли только в изолированном режиме, где обычный путь и так справляется; обещанный выигрыш маршрута — в накопительном, где документ меняется под ногами от правки к правке.</p>
+    <p>Следующий шаг и правило решения записаны заранее, до прогона: накопительный замер обоих корпусов против накопительного w12 (74%, 15 подтверждено). Прирост есть — маршрут остаётся, нет — удаляется целиком вместе со всей обвязкой.</p>
+  </section>
+
+  <footer>
+    Корпуса: 40 правок обычным языком по двум реальным документам — «Архитектура ColBERT» (116 абзацев) и «Математика как основа». Маркеры оценщика есть у 19 правок из 40; знаменатель метрики постоянный, поэтому оборванный прогон себе не льстит. Разброс между прогонами — ±2 правки.
+  </footer>
+
+</div>
+
+</body>
+</html>
