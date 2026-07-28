@@ -1477,6 +1477,28 @@ def test_targets_computed_after_validate_not_before():
     print("edit_demo: _op_targets не вызывается раньше patch.validate — malformed op не роняет TypeError")
 
 
+def test_numeric_literals_are_anchors():
+    """ПАРТИЯ 2: числа с дробной частью — такие же якоря, как цитаты.
+
+    ColBERT 4 просит «Сделай через запятую: 4.2%, 6.7%, 36.2%, 0.4448,
+    0.4436, 8.8 млн», Навигатор вернул пустые ids и anchors, кавычек в
+    правке нет — искать было нечем, хотя все шесть строк есть в документе.
+    """
+    task = ("Проценты и числа записаны через точку, как в английском. "
+            "Сделай через запятую: 4.2%, 6.7%, 36.2%, 0.4448, 0.4436, 8.8 млн.")
+    lits = edit_mod._literals(task)
+    assert lits == ["4.2%", "6.7%", "36.2%", "0.4448", "0.4436", "8.8"], lits
+
+    # шум без дробной части не берём, цитаты продолжают работать
+    assert edit_mod._literals("«Bi-encoder» и 20 правок") == ["Bi-encoder"]
+
+    doc = Document(REAL_DOC)
+    blocks = doc_map(doc, index(doc))
+    for lit in lits:
+        assert find.by_text(blocks, lit), f"{lit} не найден в документе"
+    print("edit_demo: числа из текста правки работают якорями наравне с цитатами")
+
+
 if __name__ == "__main__":
     test_split_real_file()
     test_fallback_search_then_honest_refusal()
@@ -1521,3 +1543,4 @@ if __name__ == "__main__":
     test_retry_widens_lane_to_match_rerendered_fragment()
     test_cluster_with_removed_targets_skipped_not_dead_end()
     test_targets_computed_after_validate_not_before()
+    test_numeric_literals_are_anchors()

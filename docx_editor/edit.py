@@ -159,6 +159,22 @@ def _quotes(request):
     return out
 
 
+_NUM_RX = re.compile(r"\d+[.,]\d+%?")
+
+
+def _literals(request):
+    """Дословные якоря из текста правки: цитаты в кавычках плюс числа с
+    дробной частью.
+
+    ПАРТИЯ 2. Числа приходится брать отдельно: их не заключают в кавычки, и
+    ColBERT 4 («Проценты записаны через точку… 4.2%, 6.7%, 36.2%, 0.4448,
+    0.4436, 8.8 млн») давала пустой поиск — Навигатор вернул ids: [] и
+    anchors: [], цитат в правке нет, искать было нечем. При этом все шесть
+    строк лежат в документе дословно (p67, p73, p77, p102). Дробная часть
+    обязательна: она отсекает шум вроде «20 правок» и номеров разделов."""
+    return _dedupe(_quotes(request) + _NUM_RX.findall(request))
+
+
 def _clean_ops(ops):
     """Отбрасывает мусорные элементы списка ops — на 26B модель иногда кладёт
     посторонний примитив (например 0) первым элементом рядом с валидными
@@ -206,7 +222,7 @@ def _variant_inventory(blocks, nav, request):
     тексту документа, а домыслен), а если различных вариантов с попаданиями
     меньше двух — для одноцелевой правки это шум, возвращается "".
     """
-    variants = _dedupe([_strip_anchor(a) for a in (nav.get("anchors") or [])] + _quotes(request))
+    variants = _dedupe([_strip_anchor(a) for a in (nav.get("anchors") or [])] + _literals(request))
     counts = [(v, len(find.by_text(blocks, v))) for v in variants]
     counts = [(v, n) for v, n in counts if n > 0]
     if len(counts) < 2:
@@ -244,7 +260,7 @@ def _resolve(blocks, nav, request):
     for anchor in nav.get("anchors") or []:
         anchor = _strip_anchor(anchor)
         ids += find.by_text(blocks, anchor) or find.locate(blocks, anchor)
-    for quote in _quotes(request):
+    for quote in _literals(request):
         ids += find.by_text(blocks, quote) or find.locate(blocks, quote)
     return _dedupe(ids)
 
