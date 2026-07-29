@@ -15,6 +15,13 @@ insert_row/delete_row/insert_col/delete_col — строка и колонка �
 текст); set_format научился адресоваться ячейкой таблицы (id таблицы + row +
 col); validate отбивает буквальный «\\n» в тексте любой операции — этим
 подделывали то, чего нет в контракте (см. диагноз в BUILD_PLAN_V2.md).
+
+В2-бис (поля Word и колонтитулы) — field (одна операция на все инструкции
+поля: PAGE/NUMPAGES/DATE простым w:fldSimple, TOC/REF составным
+w:fldChar begin/separate/end + w:instrText — механизм выбирает код по
+инструкции, не вызывающий) и set_header_footer (текст колонтитула и,
+опционально, поле внутри него — через doc.sections[-1].header/footer,
+которые python-docx уже умеет заводить как отдельные части пакета).
 """
 
 from copy import deepcopy
@@ -38,12 +45,20 @@ _OPS = {
     "set_style", "create_table", "set_cell", "normalize", "replace_all",
     "set_format", "set_list_level", "footnote", "set_list",
     "insert_row", "delete_row", "insert_col", "delete_col", "insert_paragraphs",
+    "field", "set_header_footer",
 }
-_PARAGRAPH_ONLY = {"replace_text", "set_text", "set_style", "set_list_level", "footnote", "set_list"}
+_PARAGRAPH_ONLY = {
+    "replace_text", "set_text", "set_style", "set_list_level", "footnote", "set_list", "field",
+}
 # set_format не входит в _PARAGRAPH_ONLY (В2): адресуется и абзацем, и ячейкой
 # таблицы, поэтому проверку его id/kind ведёт собственная ветка validate.
 _TABLE_ONLY = {"set_cell", "insert_row", "delete_row", "insert_col", "delete_col"}
 _NORMALIZE_RULES = {"typography", "quotes"}
+# В2-бис: замкнутый словарь инструкций поля — "нет парсера выражений поля"
+# означает ровно это: код не разбирает switches/аргументы инструкции, только
+# проверяет, что она начинается с одного из пяти поддерживаемых кодов.
+_FIELD_VERBS = {"PAGE", "NUMPAGES", "DATE", "TOC", "REF"}
+_SIMPLE_FIELD_VERBS = {"PAGE", "NUMPAGES", "DATE"}
 
 
 def _by_id(blocks):
@@ -188,7 +203,18 @@ _REQUIRED_TEXT = {
     "replace_text": ("old", "new"), "replace_all": ("old", "new"),
     "set_format": ("old",), "footnote": ("old", "text"),
     "set_text": ("text",), "insert_after": ("text",),
+    "field": ("instr",), "set_header_footer": ("text",),
 }
+
+
+def _field_verb_error(instr):
+    """None — instr начинается с одного из пяти поддерживаемых кодов поля,
+    иначе текст ошибки. Код НЕ разбирает switches/аргументы инструкции
+    («нет парсера выражений поля», В2-бис) — только первое слово."""
+    verb = instr.split()[0].upper() if instr.split() else ""
+    if verb in _FIELD_VERBS:
+        return None
+    return f"инструкция поля {instr!r} не начинается с одного из поддерживаемых кодов: {sorted(_FIELD_VERBS)}"
 
 
 def validate(blocks, op, doc):
@@ -378,6 +404,31 @@ def validate(blocks, op, doc):
             return f"в {op['id']} нет текста «{old}»"
         if _mid_word_cut(text, span):
             return _mid_word_error(op["id"], old)
+
+    if name == "field":
+        err = _field_verb_error(op["instr"])
+        if err:
+            return err
+        old = op.get("old")
+        if old:
+            text = by_id[op["id"]]["text"]
+            span = _flex_span(text, old)
+            if span is None:
+                return f"в {op['id']} нет текста «{old}»"
+            if _mid_word_cut(text, span):
+                return _mid_word_error(op["id"], old)
+
+    if name == "set_header_footer":
+        which = op.get("which")
+        if which not in ("header", "footer"):
+            return f"which должен быть «header» или «footer», получено {which!r}"
+        field = op.get("field")
+        if field:
+            err = _field_verb_error(field)
+            if err:
+                return err
+        if not op.get("text") and not field:
+            return "ни text, ни field не указаны — операция ничего не меняет"
 
     if name == "set_list_level":
         ilvl = op.get("ilvl")
@@ -741,6 +792,76 @@ def _op_footnote(doc, idx, op):
     return f"В {op['id']} после «{op['old']}» добавлена сноска {fid}: «{op['text']}»"
 
 
+def _fldchar_run(kind):
+    r = OxmlElement("w:r")
+    fld = OxmlElement("w:fldChar")
+    fld.set(qn("w:fldCharType"), kind)
+    r.append(fld)
+    return r
+
+
+_FIELD_CAVEAT = ("значения не будет, пока документ не открыт в Word/LibreOffice и поля не "
+                 "обновлены (выделить всё — Ctrl+A, затем F9)")
+
+
+def _field_elements(instr):
+    """Элементы OOXML для поля Word с инструкцией instr: простое w:fldSimple
+    для PAGE/NUMPAGES/DATE (схема допускает их без вложенной структуры),
+    составное w:fldChar begin/separate/end + w:instrText — для остальных
+    (TOC, REF), где простой формы недостаточно (В2-бис, BUILD_PLAN_V2.md).
+
+    Кэш-значение внутри поля сознательно не кладём: реальный номер страницы
+    или запись оглавления посчитать нечем без движка вёрстки (см. решение
+    честности в В2-бис) — Word/LibreOffice вычисляют его сами при открытии
+    или обновлении полей."""
+    verb = instr.split()[0].upper()
+    if verb in _SIMPLE_FIELD_VERBS:
+        fld = OxmlElement("w:fldSimple")
+        fld.set(qn("w:instr"), instr)
+        return [fld]
+    instr_r = OxmlElement("w:r")
+    instrText = OxmlElement("w:instrText")
+    instrText.set(qn("xml:space"), "preserve")
+    instrText.text = f" {instr} "
+    instr_r.append(instrText)
+    return [_fldchar_run("begin"), instr_r, _fldchar_run("separate"), _fldchar_run("end")]
+
+
+def _op_field(doc, idx, op):
+    el, instr = idx[op["id"]], op["instr"]
+    old = op.get("old")
+    if old:
+        span = _flex_span(_ptext(el), old)
+        if span is None:
+            # validate должен был отсечь это раньше (см. _op_replace_text) — громко падаем.
+            raise ValueError(f"текст {old!r} не найден в {op['id']} на момент применения")
+        ref = _split_span_runs(el, *span)[-1]
+        for e in _field_elements(instr):
+            ref.addnext(e)
+            ref = e
+        where = f"после «{old}» в {op['id']}"
+    else:
+        for e in _field_elements(instr):
+            el.append(e)
+        where = f"в конец {op['id']}"
+    return f"Поле «{instr}» вставлено {where} — {_FIELD_CAVEAT}"
+
+
+def _op_set_header_footer(doc, idx, op):
+    which, text, field = op["which"], op.get("text", ""), op.get("field")
+    target = doc.sections[-1].header if which == "header" else doc.sections[-1].footer
+    target.is_linked_to_previous = False  # заводит отдельную часть пакета и ссылку в w:sectPr
+    p = target.paragraphs[0]
+    p.text = text
+    if field:
+        for e in _field_elements(field):
+            p._p.append(e)
+    ru_which = "Верхний" if which == "header" else "Нижний"
+    note = f'; поле «{field}» — {_FIELD_CAVEAT}' if field else ""
+    return (f"{ru_which} колонтитул изменён{note} — в предпросмотре он не отображается "
+            f"(предпросмотр показывает только тело документа), правку видно в скачанном файле")
+
+
 def _add_borders(tbl):
     """Одиночные границы прямо в tblPr. В контракте create_table нет поля
     style, а из именованных табличных стилей в документе часто есть только
@@ -905,6 +1026,8 @@ _HANDLERS = {
     "insert_col": _op_insert_col,
     "delete_col": _op_delete_col,
     "insert_paragraphs": _op_insert_paragraphs,
+    "field": _op_field,
+    "set_header_footer": _op_set_header_footer,
 }
 
 

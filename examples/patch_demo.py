@@ -1,6 +1,7 @@
 """Приёмка patch.py: девять операций на маленьком документе + валидатор невалидных патчей."""
 
 import io
+import zipfile
 
 from docx import Document
 from docx.opc.constants import RELATIONSHIP_TYPE as RT
@@ -781,6 +782,123 @@ def test_insert_paragraphs_adds_section():
     print("patch_demo: insert_paragraphs вставляет заголовок и текст раздела как два абзаца двух стилей")
 
 
+def test_field_simple_and_compound_round_trip():
+    # В2-бис: PAGE — простое поле (w:fldSimple), REF — составное (w:fldChar
+    # begin/separate/end + w:instrText), одна операция на оба механизма —
+    # код выбирает форму по первому слову instr, не вызывающий. Кэш-значение
+    # внутри поля сознательно не кладём (см. решение честности в
+    # BUILD_PLAN_V2.md, В2-бис) — раны fldChar/instrText дают r.text=="",
+    # поэтому вставка поля не меняет видимый текст абзаца ни на символ.
+    doc = _build()
+    idx = index(doc)
+    blocks = doc_map(doc, idx)
+
+    op_simple = {"op": "field", "id": "p0", "instr": "PAGE"}
+    assert validate(blocks, op_simple, doc) is None
+    apply(doc, idx, op_simple)
+    blocks = doc_map(doc, idx)
+    assert blocks[0]["text"] == "Первый абзац.", "поле не должно менять текст абзаца"
+    assert blocks[0]["fields"] == 1
+    assert idx["p0"].find(qn("w:fldSimple")) is not None
+    assert idx["p0"].find(qn("w:fldSimple")).get(qn("w:instr")) == "PAGE"
+
+    op_compound = {"op": "field", "id": "p2", "old": "Третий", "instr": 'REF bookmark1 \\h'}
+    assert validate(blocks, op_compound, doc) is None
+    apply(doc, idx, op_compound)
+    blocks = doc_map(doc, idx)
+    assert blocks[2]["text"] == "Третий абзац.", "поле не должно менять текст абзаца"
+    assert blocks[2]["fields"] == 1
+    fldchars = idx["p2"].findall(".//" + qn("w:fldChar"))
+    types = [f.get(qn("w:fldCharType")) for f in fldchars]
+    assert types == ["begin", "separate", "end"], types
+    instr_els = idx["p2"].findall(".//" + qn("w:instrText"))
+    assert len(instr_els) == 1 and "REF bookmark1" in instr_els[0].text, instr_els
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+    doc2 = Document(buf)
+    idx2 = index(doc2)
+    blocks2 = doc_map(doc2, idx2)
+    assert blocks2[0]["fields"] == 1 and blocks2[2]["fields"] == 1, "поля обязаны пережить save/reopen"
+    assert idx2["p0"].find(qn("w:fldSimple")).get(qn("w:instr")) == "PAGE"
+
+    print("patch_demo: field вставляет простое (PAGE) и составное (REF) поле, оба переживают save/reopen")
+
+
+def test_field_validate_rejects_unknown_verb_and_table_id():
+    doc = _build()
+    idx = index(doc)
+    blocks = doc_map(doc, idx)
+
+    err = validate(blocks, {"op": "field", "id": "p0", "instr": "AUTHOR"}, doc)
+    assert err and "не начинается" in err, err
+
+    err = validate(blocks, {"op": "field", "id": "p0", "old": "Такого текста нет", "instr": "PAGE"}, doc)
+    assert err and "нет текста" in err, err
+
+    op = {"op": "create_table", "after": "p0", "rows": [["a"]]}
+    apply(doc, idx, op)
+    blocks = doc_map(doc, idx)
+    tbl_id = next(b["id"] for b in blocks if b["kind"] == "t")
+    err = validate(blocks, {"op": "field", "id": tbl_id, "instr": "PAGE"}, doc)
+    assert err and "field работает только с абзацами" in err, err
+
+    print("patch_demo: field отбивает неизвестный код поля, ненайденный якорь и id таблицы")
+
+
+def test_set_header_footer_creates_parts_and_field():
+    # В2-бис: колонтитул — отдельная часть пакета (word/header1.xml,
+    # footer1.xml), связанная через w:sectPr; python-docx заводит её сам
+    # через is_linked_to_previous=False (см. проверку в _op_set_header_footer).
+    doc = _build()
+    idx = index(doc)
+    blocks = doc_map(doc, idx)
+
+    op_footer = {"op": "set_header_footer", "which": "footer", "text": "Страница ", "field": "PAGE"}
+    assert validate(blocks, op_footer, doc) is None
+    report = apply(doc, idx, op_footer)
+    assert "не отображается" in report, report
+
+    op_header = {"op": "set_header_footer", "which": "header", "text": "Регламент компании"}
+    assert validate(blocks, op_header, doc) is None
+    apply(doc, idx, op_header)
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+    names = zipfile.ZipFile(buf).namelist()
+    assert "word/header1.xml" in names and "word/footer1.xml" in names, names
+
+    buf.seek(0)
+    doc2 = Document(buf)
+    sec = doc2.sections[-1]
+    assert sec.header.is_linked_to_previous is False
+    assert sec.footer.is_linked_to_previous is False
+    assert sec.header.paragraphs[0].text == "Регламент компании"
+    assert sec.footer.paragraphs[0].text == "Страница "
+    assert sec.footer.paragraphs[0]._p.find(qn("w:fldSimple")) is not None
+
+    print("patch_demo: set_header_footer заводит header1.xml/footer1.xml, сектор ссылается на них, поле переживает save/reopen")
+
+
+def test_set_header_footer_validate_rejects_bad_input():
+    doc = _build()
+    idx = index(doc)
+    blocks = doc_map(doc, idx)
+
+    err = validate(blocks, {"op": "set_header_footer", "which": "left", "text": "x"}, doc)
+    assert err and "which должен быть" in err, err
+
+    err = validate(blocks, {"op": "set_header_footer", "which": "footer", "text": ""}, doc)
+    assert err and "ничего не меняет" in err, err
+
+    err = validate(blocks, {"op": "set_header_footer", "which": "footer", "text": "", "field": "AUTHOR"}, doc)
+    assert err and "не начинается" in err, err
+
+    print("patch_demo: set_header_footer отбивает неизвестный which, пустую пару text/field и неизвестный код поля")
+
+
 def test_newline_in_op_text_rejected():
     # В2, п.4: буквальный перевод строки в тексте операции — не новый абзац,
     # а подделка того, чего нет в контракте (архитектор поймал модель на
@@ -854,4 +972,8 @@ if __name__ == "__main__":
     test_insert_delete_col_on_real_table()
     test_set_format_on_table_cell()
     test_insert_paragraphs_adds_section()
+    test_field_simple_and_compound_round_trip()
+    test_field_validate_rejects_unknown_verb_and_table_id()
+    test_set_header_footer_creates_parts_and_field()
+    test_set_header_footer_validate_rejects_bad_input()
     test_newline_in_op_text_rejected()

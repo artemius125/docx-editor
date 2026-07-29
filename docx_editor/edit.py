@@ -21,8 +21,8 @@ _NAV_PROMPT = """Ты — навигатор по документу .docx. Те
 оглавление (id и начало текста абзаца на строку) и текст правки на русском.
 Верни ТОЛЬКО JSON {"kind":"local"|"global"|"unify"|"compose",
 "rule":null|"typography"|"quotes","ids":[...],"anchors":[...],
-"position":null|"end","trace":null|"table"|"heading"|"heading+text"|"list"|"footnote",
-"pattern":null|"regex"} без пояснений и markdown-обвязки.
+"position":null|"end","trace":null|"table"|"heading"|"heading+text"|"list"|"footnote"|
+"field"|"header_footer","pattern":null|"regex"} без пояснений и markdown-обвязки.
 
 - "rule" — только когда правка ГЛОБАЛЬНАЯ типографская и относится РОВНО к
   одному из двух названных классов, других классов rule не бывает:
@@ -87,9 +87,17 @@ _NAV_PROMPT = """Ты — навигатор по документу .docx. Те
   добавляет НОВЫЙ РАЗДЕЛ: заголовок И текст раздела, то есть минимум ДВА
   новых абзаца, а не один заголовок с текстом внутри него самого. "list" —
   меняется принадлежность/уровень абзаца в списке. "footnote" — правка
-  добавляет сноску Word. Ставь trace по смыслу ПРАВКИ, а не по kind —
-  "добавь строку в таблицу" это trace="table", даже когда kind="local". Нет
-  такого структурного ожидания — trace=null, а не выдумка.
+  добавляет сноску Word. "field" — правка вставляет поле Word (номер
+  страницы, число страниц, дату, оглавление, перекрёстную ссылку).
+  "header_footer" — правка про верхний или нижний колонтитул (в том числе
+  номер страницы В колонтитуле — тогда это header_footer, а не field: поле
+  внутри колонтитула ставит сама операция set_header_footer). Правка про
+  колонтитул обычно не называет id/цитату из тела документа — это ожидаемо,
+  не пытайся найти anchor там, где его нет; при отсутствии ids/anchors
+  проставь "position":"end", чтобы было к чему прицепить фрагмент для
+  Редактора. Ставь trace по смыслу ПРАВКИ, а не по kind — "добавь строку в
+  таблицу" это trace="table", даже когда kind="local". Нет такого
+  структурного ожидания — trace=null, а не выдумка.
 - "pattern" — регулярное выражение (Python re), когда правку нельзя
   адресовать ни id, ни дословной цитатой, потому что она описывает ФОРМАТ, а
   не конкретный текст: "даты приведи к единому формату ДД.ММ.ГГГГ" — цитаты
@@ -137,8 +145,15 @@ _EDIT_PROMPT = """Ты — редактор документа .docx. Тебе �
 {"op":"insert_col","id":"t3","at":1,"cells":["a","b","c"]} — вставить колонку в СУЩЕСТВУЮЩУЮ таблицу на позицию at, cells — по одному значению на каждую строку
 {"op":"delete_col","id":"t3","col":1} — удалить колонку СУЩЕСТВУЮЩЕЙ таблицы
 {"op":"insert_paragraphs","id":"p12","items":[{"text":"6. Пересмотр","style":"Heading 1"},{"text":"Регламент пересматривается...","style":"Normal"}]} — вставить НЕСКОЛЬКО абзацев разными стилями одной операцией (например заголовок раздела + текст раздела); используй это вместо \\n внутри одного текста — перевод строки внутри "text" любой операции запрещён
+{"op":"field","id":"p12","instr":"PAGE","old":"..."} — вставить поле Word сразу после текста old в абзаце id; instr — РОВНО один из кодов PAGE (номер страницы), NUMPAGES (число страниц в документе), DATE (текущая дата), TOC (оглавление), REF (перекрёстная ссылка на закладку, имя закладки — часть instr, например "REF bookmark1 \\h"); "old" необязателен — без него поле встаёт в конец текста абзаца (например TOC в отдельный пустой абзац, который сначала создай insert_after)
+{"op":"set_header_footer","which":"header","text":"...","field":"PAGE"} — задать текст верхнего (which="header") или нижнего (which="footer") колонтитула целиком и, необязательно, добавить в его конец поле (тот же набор кодов, что у field); text может быть пустой строкой, если нужно только поле
 
 set_format может адресоваться и ячейкой таблицы: {"op":"set_format","id":"t3","row":0,"col":1,"old":"...","b":true} — начертание куска текста внутри ячейки (row/col — как у set_cell), вместо "id" абзаца.
+
+Поле Word (field/set_header_footer) не имеет вычисленного значения, пока
+документ не открыт и поля не обновлены — это ожидаемо, а не повод отказаться
+от операции: используй её всегда, когда правка просит номер страницы,
+оглавление или перекрёстную ссылку.
 
 Если правка просит НОВУЮ формулировку (перепиши, уточни, сожми, поправь
 стиль, расшифруй аббревиатуру) — ты автор, писать новые формулировки твоя
@@ -447,21 +462,28 @@ def _is_heading(b):
     return style.startswith("Heading") or style == "Title"
 
 
-def _trace_error(trace, before, after):
+def _trace_error(trace, before, after, doc=None):
     """В1 (главный пункт партии): Проверяющий видит текстовый diff, и для
     него строка таблицы, ставшая абзацем со своей нотацией "r0c0:...", и
     настоящая строка таблицы неотличимы — обе выглядят как добавившийся
     текст с нужными словами. Здесь код проверяет по СТРУКТУРНЫМ полям блока
-    (kind/rows/level/style/list/footnotes — они читаются parse.py прямо из
-    XML), что изменение того КЛАССА, который назвал Навигатор в "trace", а не
-    просто "текст изменился". None — след найден, иначе честный текст отказа.
+    (kind/rows/level/style/list/footnotes/fields — они читаются parse.py
+    прямо из XML), что изменение того КЛАССА, который назвал Навигатор в
+    "trace", а не просто "текст изменился". None — след найден, иначе
+    честный текст отказа.
 
     Замкнутый словарь (Навигатор ограничен им в _NAV_PROMPT): null (правка
     без структурных ожиданий, доп. проверки нет), "table", "heading",
     "heading+text" (новый РАЗДЕЛ — заголовок И текст, минимум два новых
     абзаца: живой прогон поймал модель на одном Heading 1 без абзаца текста
-    после него), "list", "footnote". Значение вне словаря не проверяется —
-    один невиданный ярлык 26B-модели не должен рубить верную правку.
+    после него), "list", "footnote", "field" (В2-бис — поле Word: PAGE/
+    NUMPAGES/DATE/TOC/REF), "header_footer" (В2-бис — колонтитул стал
+    отдельной частью пакета). Значение вне словаря не проверяется — один
+    невиданный ярлык 26B-модели не должен рубить верную правку.
+
+    doc нужен ТОЛЬКО для "header_footer": колонтитул не часть doc_map(),
+    его след — не в блоках, а в doc.sections (part + w:sectPr-ссылка) —
+    остальные классы проверяются по before/after, doc не трогают.
 
     Вызывается ДО Проверяющего (см. _finish) — несовпавший trace вообще не
     тратит вызов модели: диагноз (BUILD_PLAN_V2 «Диагноз») явно требует,
@@ -517,6 +539,22 @@ def _trace_error(trace, before, after):
         return ("правка названа сноской (trace=footnote), но число footnoteReference в "
                 "документе не выросло")
 
+    if trace == "field":
+        before_f = sum(b.get("fields", 0) for b in before if b["kind"] == "p")
+        after_f = sum(b.get("fields", 0) for b in after if b["kind"] == "p")
+        if after_f > before_f:
+            return None
+        return ("правка названа полем Word (trace=field), но число полей (w:fldSimple/w:fldChar) "
+                "в документе не выросло")
+
+    if trace == "header_footer":
+        sec = doc.sections[-1]
+        if not sec.header.is_linked_to_previous or not sec.footer.is_linked_to_previous:
+            return None
+        return ("правка названа колонтитульной (trace=header_footer), но ни верхний, ни нижний "
+                "колонтитул не стали отдельной частью документа (нет своей части пакета/ссылки в "
+                "w:sectPr)")
+
     return None
 
 
@@ -533,7 +571,8 @@ def _struct_note(b, a):
     Сравнение footnotes добавлено Ф19-бис: footnote не трогает ни текст, ни
     style/level/list/runs абзаца (w:footnoteReference — пустой для python-docx
     ран без w:t) — без счётчика правка терялась тем же способом, что раньше
-    set_style/move_after."""
+    set_style/move_after. Сравнение fields — тот же приём для В2-бис: field
+    (w:fldSimple/w:fldChar) тоже не меняет текст абзаца ни на символ."""
     if b["kind"] != "p" or a["kind"] != "p":
         return None
     parts = []
@@ -545,6 +584,8 @@ def _struct_note(b, a):
         parts.append(f'список {b.get("list")} → {a.get("list")}')
     if b.get("footnotes", 0) != a.get("footnotes", 0):
         parts.append(f'сносок {b.get("footnotes", 0)} → {a.get("footnotes", 0)}')
+    if b.get("fields", 0) != a.get("fields", 0):
+        parts.append(f'полей {b.get("fields", 0)} → {a.get("fields", 0)}')
     if b.get("runs") != a.get("runs"):
         old_fmt = ", ".join(_format_note(b.get("runs") or [])) or "без оформления"
         new_fmt = ", ".join(_format_note(a.get("runs") or [])) or "без оформления"
@@ -627,6 +668,10 @@ _ID_FIELDS = {
     "insert_row": ("id",), "delete_row": ("id",),
     "insert_col": ("id",), "delete_col": ("id",),
     "insert_paragraphs": ("id",),
+    # В2-бис: field адресуется абзацем, как footnote. set_header_footer сюда
+    # не входит — она не называет ни один id тела документа (колонтитул не
+    # часть doc_map()), как normalize/replace_all.
+    "field": ("id",),
 }
 
 
@@ -933,30 +978,57 @@ def _restore_in_place(doc, idx, snapshot_path):
     os.remove(snapshot_path)
 
 
-def _finish(doc, idx, snapshot_path, blocks_before, applied, request, checker, nav, editor_reply, tries):
+def _hf_state(doc):
+    """(header_linked, footer_linked) последнего раздела — снимок ДО
+    применения операций сравнивается с ЭТИМ ЖЕ вызовом ПОСЛЕ (В2-бис): смена
+    False означает, что set_header_footer завёл отдельную часть пакета."""
+    sec = doc.sections[-1]
+    return (sec.header.is_linked_to_previous, sec.footer.is_linked_to_previous)
+
+
+def _finish(doc, idx, snapshot_path, blocks_before, applied, request, checker, nav, editor_reply, tries, hf_before=None):
     """Общий хвост ПОСЛЕ применения операций — общий и для одного вызова
     Редактора, и для нескольких (см. _run_clusters): diff по всему снимку →
     Проверяющий → вердикт → коммит/откат. Ровно один снимок, один diff, один
     вызов Проверяющего на всю правку — граница транзакции не дробится вместе
     с шагами (см. спецификацию задачи про кластеризацию). Возвращает
-    (result, doc, idx, tries); result is None ТОЛЬКО когда diff пуст — смысл
-    пустого diff разный на разных путях (item A/C), решение оставлено
-    вызывающему, а doc/idx в этом случае уже НОВАЯ пара из _restore."""
+    (result, doc, idx, tries); result is None ТОЛЬКО когда diff пуст И
+    колонтитул не менялся — смысл пустого diff разный на разных путях
+    (item A/C), решение оставлено вызывающему, а doc/idx в этом случае уже
+    НОВАЯ пара из _restore.
+
+    hf_before (В2-бис) — снимок _hf_state ДО применения, взятый вызывающим
+    рядом с blocks_before. Колонтитул НЕ часть doc_map() (см. «Контракты» в
+    BUILD_PLAN.md) — правка, менявшая только его, всегда даёт ПУСТОЙ
+    текстовый diff тела документа, и без этого параметра честная правка
+    неотличима от «ничего не изменилось» (item A)."""
     blocks_after = doc_map(doc, idx)
     diff = _diff(blocks_before, blocks_after)
-    if not diff:
+    hf_changed = hf_before is not None and hf_before != _hf_state(doc)
+    if not diff and not hf_changed:
         doc, idx = _restore(snapshot_path)
         return None, doc, idx, tries
 
     # В1: класс изменения проверяется КОДОМ по XML раньше, чем тратится вызов
     # Проверяющего — он видит только текстовый diff и не отличит строку
     # таблицы, ставшую абзацем, от настоящей строки (см. _trace_error).
-    trace_err = _trace_error(nav.get("trace"), blocks_before, blocks_after)
+    trace_err = _trace_error(nav.get("trace"), blocks_before, blocks_after, doc)
     if trace_err is not None:
         doc, idx = _restore(snapshot_path)
         reply = {"nav": nav, "editor": editor_reply}
         return ({"verdict": "failed", "reason": trace_err, "applied": applied, "ids": [],
                   "iter": tries, "reply": reply}, doc, idx, tries)
+
+    if not diff:
+        # Колонтитул изменился, тело — нет: Проверяющему буквально нечего
+        # сравнивать (diff пуст по построению, не по ошибке), а trace_err
+        # выше уже структурно подтвердил, что часть пакета и ссылка в
+        # w:sectPr появились. Дальше звать LLM было бы вызовом ради вызова
+        # (инвариант 1) — вердикт решает код.
+        os.remove(snapshot_path)
+        reason = "колонтитул изменён — подтверждено структурно (часть пакета + ссылка в w:sectPr), текстового diff тела документа для этой правки нет"
+        return ({"verdict": "done", "reason": reason, "applied": applied, "ids": [],
+                  "iter": tries, "reply": {"nav": nav, "editor": editor_reply}}, doc, idx, tries)
 
     try:
         verdict = checker(request, diff) or {}
@@ -1074,6 +1146,7 @@ def _run_clusters(doc, idx, blocks, ids, request, editor, checker, nav, fallthro
     запроса)."""
     snapshot_path = _snapshot(doc)
     blocks_before = doc_map(doc, idx)
+    hf_before = _hf_state(doc)
     clusters = _cluster(blocks, ids, around=len(blocks) if single_cluster else 1)
     inventory = _variant_inventory(blocks, nav, request)
 
@@ -1163,7 +1236,7 @@ def _run_clusters(doc, idx, blocks, ids, request, editor, checker, nav, fallthro
                 "ids": [d["id"] for d in diff_all], "iter": tries_total,
                 "reply": {"nav": nav, "editor": editor_replies}}, doc, idx
 
-    result, doc, idx, tries = _finish(doc, idx, snapshot_path, blocks_before, applied_all, request, checker, nav, editor_replies, tries_total)
+    result, doc, idx, tries = _finish(doc, idx, snapshot_path, blocks_before, applied_all, request, checker, nav, editor_replies, tries_total, hf_before)
     if result is not None:
         return result, doc, idx
     return _failed("операции применились, но текст не изменился", nav, editor_replies, tries), doc, idx

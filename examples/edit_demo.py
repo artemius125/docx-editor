@@ -1321,7 +1321,11 @@ def test_id_fields_covers_all_ops_except_document_wide():
     # и может задеть любой блок документа, а не только показанный Редактору —
     # так и было с "footnote" (добавлена в patch.py, забыта здесь). Полнота
     # проверялась только против _HANDLERS (patch_demo.py), не против гварда.
-    missing = patch._OPS - {"normalize", "replace_all"} - set(edit_mod._ID_FIELDS)
+    #
+    # В2-бис: set_header_footer — третье законное исключение. Она не называет
+    # ни один id ТЕЛА документа (колонтитул не часть doc_map()) — тот же класс,
+    # что normalize/replace_all, документ-широкая операция без адресации блоком.
+    missing = patch._OPS - {"normalize", "replace_all", "set_header_footer"} - set(edit_mod._ID_FIELDS)
     assert not missing, f"_ID_FIELDS не покрывает операции {missing} — гвард полосы их не проверяет"
     print("edit_demo: _ID_FIELDS покрывает все id-несущие операции patch._OPS")
 
@@ -2275,6 +2279,116 @@ def test_trace_footnote_regression_real_footnote_not_blocked():
     print("edit_demo: trace=footnote не блокирует настоящую сноску (регресс-контроль)")
 
 
+def test_trace_field_catches_paragraph_faking_a_page_reference():
+    # В2-бис: «проставь номер страницы» — Редактор мог бы подделать это
+    # обычным текстом («см. стр. 5») вместо настоящего поля Word. trace=field
+    # обязан поймать это ДО Проверяющего — реальных w:fldSimple/w:fldChar
+    # в документе не появилось.
+    doc = Document()
+    doc.add_paragraph("Раздел документа продолжается на следующей странице.")
+    idx = index(doc)
+
+    def fake_navigator(outline_text, request):
+        return {"kind": "local", "rule": None, "ids": ["p0"], "anchors": [], "trace": "field"}
+
+    def fake_editor(fragment_text, request, feedback=None):
+        return {"ops": [{"op": "insert_after", "id": "p0", "text": "см. стр. 5", "style": "Normal"}]}
+
+    def no_checker(request, diff):
+        raise AssertionError("trace=field обязан отклонить подделку текстом ДО вызова Проверяющего")
+
+    result, doc, idx = run_edit(
+        doc, idx, "Добавь поле с номером страницы в конце абзаца.",
+        navigator=fake_navigator, editor=fake_editor, checker=no_checker,
+    )
+
+    assert result["verdict"] == "failed", result
+    after = doc_map(doc, idx)
+    assert not any("см. стр" in b["text"] for b in after if b["kind"] == "p"), "поддельный абзац обязан быть откачен"
+    print(f"edit_demo: trace=field поймал абзац, подделывающий номер страницы текстом: {result['reason']!r}")
+
+
+def test_trace_field_passes_for_real_field_insert():
+    # Регресс-контроль: настоящий field обязан пройти trace=field и дойти до
+    # Проверяющего, как и раньше.
+    doc = Document()
+    doc.add_paragraph("Раздел документа продолжается на следующей странице.")
+    idx = index(doc)
+
+    def fake_navigator(outline_text, request):
+        return {"kind": "local", "rule": None, "ids": ["p0"], "anchors": [], "trace": "field"}
+
+    def fake_editor(fragment_text, request, feedback=None):
+        return {"ops": [{"op": "field", "id": "p0", "instr": "PAGE"}]}
+
+    def ok_checker(request, diff):
+        return {"ok": True, "reason": "поле добавлено"}
+
+    result, doc, idx = run_edit(
+        doc, idx, "Добавь поле с номером страницы в конце абзаца.",
+        navigator=fake_navigator, editor=fake_editor, checker=ok_checker,
+    )
+
+    assert result["verdict"] == "done", result
+    assert idx["p0"].find(qn("w:fldSimple")) is not None
+    print("edit_demo: trace=field пропускает настоящую вставку поля до done")
+
+
+def test_trace_header_footer_catches_paragraph_faking_a_footer():
+    # В2-бис: «добавь номер страницы в нижний колонтитул» — Редактор мог бы
+    # подделать это обычным абзацем в теле документа вместо настоящего
+    # колонтитула. trace=header_footer обязан поймать это ДО Проверяющего —
+    # ни один колонтитул не стал отдельной частью документа.
+    doc = Document()
+    doc.add_paragraph("Тело документа.")
+    idx = index(doc)
+
+    def fake_navigator(outline_text, request):
+        return {"kind": "local", "rule": None, "ids": [], "anchors": [], "position": "end", "trace": "header_footer"}
+
+    def fake_editor(fragment_text, request, feedback=None):
+        return {"ops": [{"op": "insert_after", "id": "p0", "text": "Страница 1", "style": "Normal"}]}
+
+    def no_checker(request, diff):
+        raise AssertionError("trace=header_footer обязан отклонить подделку абзацем ДО вызова Проверяющего")
+
+    result, doc, idx = run_edit(
+        doc, idx, "Добавь номер страницы в нижний колонтитул.",
+        navigator=fake_navigator, editor=fake_editor, checker=no_checker,
+    )
+
+    assert result["verdict"] == "failed", result
+    after = doc_map(doc, idx)
+    assert not any("Страница 1" in b["text"] for b in after if b["kind"] == "p"), "поддельный абзац обязан быть откачен"
+    print(f"edit_demo: trace=header_footer поймал абзац, подделывающий колонтитул: {result['reason']!r}")
+
+
+def test_trace_header_footer_passes_for_real_header_footer_set():
+    # Регресс-контроль: настоящий set_header_footer обязан пройти
+    # trace=header_footer и дойти до Проверяющего, как и раньше.
+    doc = Document()
+    doc.add_paragraph("Тело документа.")
+    idx = index(doc)
+
+    def fake_navigator(outline_text, request):
+        return {"kind": "local", "rule": None, "ids": [], "anchors": [], "position": "end", "trace": "header_footer"}
+
+    def fake_editor(fragment_text, request, feedback=None):
+        return {"ops": [{"op": "set_header_footer", "which": "footer", "text": "Страница ", "field": "PAGE"}]}
+
+    def ok_checker(request, diff):
+        return {"ok": True, "reason": "колонтитул изменён"}
+
+    result, doc, idx = run_edit(
+        doc, idx, "Добавь номер страницы в нижний колонтитул.",
+        navigator=fake_navigator, editor=fake_editor, checker=ok_checker,
+    )
+
+    assert result["verdict"] == "done", result
+    assert doc.sections[-1].footer.is_linked_to_previous is False
+    print("edit_demo: trace=header_footer пропускает настоящее изменение колонтитула до done")
+
+
 def test_pattern_addresses_dates_without_quotable_anchor():
     # В5: «даты приведи к формату ДД.ММ.ГГГГ» не адресуется ни id, ни цитатой
     # — формат нельзя процитировать. Навигатор возвращает pattern (regex),
@@ -2517,6 +2631,10 @@ if __name__ == "__main__":
     test_trace_heading_text_passes_for_real_section()
     test_trace_table_passes_for_real_row_insert()
     test_trace_footnote_regression_real_footnote_not_blocked()
+    test_trace_field_catches_paragraph_faking_a_page_reference()
+    test_trace_field_passes_for_real_field_insert()
+    test_trace_header_footer_catches_paragraph_faking_a_footer()
+    test_trace_header_footer_passes_for_real_header_footer_set()
     test_pattern_addresses_dates_without_quotable_anchor()
     test_pattern_invalid_regex_is_honest_refusal_not_exception()
     test_pattern_matching_implausible_share_treated_as_no_address()

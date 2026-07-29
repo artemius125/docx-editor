@@ -94,6 +94,15 @@ def _footnotes(p_el):
     return len(p_el.findall(".//" + qn("w:footnoteReference")))
 
 
+def _fields(p_el):
+    """Число полей Word (простых w:fldSimple и составных — по числу
+    w:fldChar begin) внутри абзаца (В2-бис: тот же приём, что и
+    _footnotes, — поле не меняет ни текст, ни style/level/list абзаца)."""
+    simple = len(p_el.findall(".//" + qn("w:fldSimple")))
+    begins = [f for f in p_el.findall(".//" + qn("w:fldChar")) if f.get(qn("w:fldCharType")) == "begin"]
+    return simple + len(begins)
+
+
 def doc_map(doc, idx):
     """Блоки в текущем порядке body. Элементы, удалённые из body, выпадают.
 
@@ -119,6 +128,7 @@ def doc_map(doc, idx):
                 "level": _level(el),
                 "list": _list(el),
                 "footnotes": _footnotes(el),
+                "fields": _fields(el),
             })
         elif el.tag == _TBL:
             t = Table(el, doc)
