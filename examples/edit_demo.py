@@ -2364,6 +2364,91 @@ def test_pattern_matching_implausible_share_treated_as_no_address():
     print("edit_demo: regex, нашедший неправдоподобную долю блоков (4 из 4), отклонён как адрес")
 
 
+def test_unify_inflected_russian_word_routes_to_editor_not_replace_all():
+    # В6, первый дефект (измерено дважды на battery): unify заменяет буквально
+    # — канон «литий-ионный» (им.п., ед.ч.) вставал во ВСЕ позиции, включая
+    # те, где текст требовал другого падежа/числа («литий-ионный
+    # аккумуляторы», «литий-ионный состоит»). Русская словоформа обязана
+    # уйти к Редактору (локальный путь), а не через document-wide replace_all.
+    doc = Document()
+    doc.add_paragraph("Новые литий-ионные аккумуляторы поставляются заводом.")
+    doc.add_paragraph("Устройство состоит из литий-ионного накопителя энергии.")
+    idx = index(doc)
+
+    def fake_navigator(outline_text, request):
+        return {"kind": "unify", "rule": None, "ids": [], "anchors": ["литий-ионные", "литий-ионного"]}
+
+    def fake_unifier(inventory_text, request):
+        return {"pairs": [["литий-ионные", "литий-ионный"], ["литий-ионного", "литий-ионный"]], "note": ""}
+
+    editor_calls = []
+
+    def fake_editor(fragment_text, request, feedback=None):
+        editor_calls.append(fragment_text)
+        return {"ops": [], "already": False,
+                "note": "склонение зависит от контекста — унификация написания без контроля падежа испортит согласование"}
+
+    def no_checker(request, diff):
+        raise AssertionError("до Проверяющего не должно дойти — Редактор ничего не применил")
+
+    request = "Термин «литий-ионный» пишется в разных формах — приведи к одному написанию по всему документу."
+    result, doc, idx = run_edit(
+        doc, idx, request,
+        navigator=fake_navigator, editor=fake_editor, checker=no_checker, unifier=fake_unifier,
+    )
+
+    assert editor_calls, "русская словоформа обязана была направить правку Редактору, а не в document-wide replace_all"
+    assert result["verdict"] == "failed", result
+    text = " ".join(b["text"] for b in doc_map(doc, idx))
+    assert "литий-ионные" in text and "литий-ионного" in text, (
+        "unify не должен был стереть словоформы буквальной заменой на именительный падеж: " + text
+    )
+    print("edit_demo: русская словоформа не унифицируется document-wide replace_all — правка ушла к Редактору")
+
+
+def test_unify_word_not_term_kandidat_release_sentence():
+    # В6, второй дефект (живой прогон, реальный документ Регламент.docx):
+    # unify спутал СЛОВО и ТЕРМИН. p16 документа обсуждает единообразие
+    # термина «релиз-кандидат» («кандидат на релиз», «релиз кандидат» —
+    # варианты записи ОДНОГО термина), а p5 использует обычное слово
+    # «кандидата» в другом предложении («Сборка кандидата собирается из ветки
+    # release») — не вариант термина, а самостоятельное слово. Замена его на
+    # «релиз-кандидата» дала ложный done в живом прогоне. Гвард (_inflects,
+    # тот же, что и для склонения) обязан направить это к Редактору.
+    doc = Document(REGLAMENT_DOC)
+    idx = index(doc)
+    p5_before = next(b["text"] for b in doc_map(doc, idx) if b["id"] == "p5")
+    assert "Сборка кандидата собирается из ветки release." in p5_before
+
+    def fake_navigator(outline_text, request):
+        return {"kind": "unify", "rule": None, "ids": [], "anchors": ["релиз-кандидат", "кандидата"]}
+
+    def fake_unifier(inventory_text, request):
+        return {"pairs": [["кандидата", "релиз-кандидата"]], "note": ""}
+
+    editor_calls = []
+
+    def fake_editor(fragment_text, request, feedback=None):
+        editor_calls.append(fragment_text)
+        return {"ops": [], "already": False, "note": "'кандидата' здесь не вариант термина, а обычное слово"}
+
+    def no_checker(request, diff):
+        raise AssertionError("до Проверяющего не должно дойти")
+
+    request = "Термин «релиз-кандидат» записан по-разному — приведи к одному написанию по всему документу."
+    result, doc, idx = run_edit(
+        doc, idx, request,
+        navigator=fake_navigator, editor=fake_editor, checker=no_checker, unifier=fake_unifier,
+    )
+
+    assert editor_calls, "слово 'кандидата' — кириллица не в верхнем регистре, гвард обязан направить правку Редактору"
+    p5_after = next(b["text"] for b in doc_map(doc, idx) if b["id"] == "p5")
+    assert "Сборка кандидата собирается из ветки release." in p5_after, (
+        "unify не должен был подменить обычное слово 'кандидата' в несвязанном предложении: " + p5_after
+    )
+    print("edit_demo: 'Сборка кандидата...' из Регламент.docx больше не искажается unify — слово ушло к Редактору")
+
+
 if __name__ == "__main__":
     test_split_real_file()
     test_fallback_search_then_honest_refusal()
@@ -2435,3 +2520,5 @@ if __name__ == "__main__":
     test_pattern_addresses_dates_without_quotable_anchor()
     test_pattern_invalid_regex_is_honest_refusal_not_exception()
     test_pattern_matching_implausible_share_treated_as_no_address()
+    test_unify_inflected_russian_word_routes_to_editor_not_replace_all()
+    test_unify_word_not_term_kandidat_release_sentence()

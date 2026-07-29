@@ -1178,6 +1178,25 @@ def _word_pattern(text):
     return r"(?<!\w)" + r"\s+".join(parts) + r"(?!\w)"
 
 
+_CYRILLIC_RX = re.compile(r"[а-яё]", re.IGNORECASE)
+
+
+def _inflects(word):
+    """В6: True — word похоже на русскую словоформу, которая может менять
+    окончание по падежу/числу/роду. unify заменяет буквально, без спряжения
+    (replace_all по всему документу) — измерено дважды на battery: канон
+    «литий-ионный» (именительный, ед.ч., муж.р.) встал во ВСЕ позиции,
+    включая те, где нужен был другой падеж/число («литий-ионный
+    аккумуляторы», «литий-ионный состоит»). Такое умеет только Редактор
+    (локальный путь, per-occurrence).
+
+    Латиница, аббревиатуры (ВСЕ буквы прописные — не склоняются как обычное
+    слово), числа и даты — безопасны для буквальной замены, поэтому не
+    кириллица или кириллица целиком в верхнем регистре не считается
+    инфлексией."""
+    return bool(_CYRILLIC_RX.search(word)) and word != word.upper()
+
+
 def _run_unify(doc, idx, blocks, nav, request, editor, checker, unifier):
     """Ф18: правки вида «сделай одинаково по всему документу» (унификация
     термина, дат, чисел) — по замеру w12 самый большой источник провалов и
@@ -1219,6 +1238,12 @@ def _run_unify(doc, idx, blocks, nav, request, editor, checker, unifier):
     # локальный путь её делал. Отказ здесь был чистой потерей: −4 правки.
     variant_set = {v for v, n in counts}
     pairs = [(old, new) for old, new in pairs if old != new and old in variant_set]
+
+    # В6: русская словоформа, способная склоняться, не унифицируется буквальной
+    # заменой (см. _inflects) — это работа Редактора, не document-wide replace_all.
+    if any(_inflects(old) or _inflects(new) for old, new in pairs):
+        return _run_local(doc, idx, blocks, nav, request, editor, checker)
+
     canonicals = {new for old, new in pairs}
     if len(canonicals) != 1:
         return _run_local(doc, idx, blocks, nav, request, editor, checker)
