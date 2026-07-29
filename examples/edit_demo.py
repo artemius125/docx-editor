@@ -2019,6 +2019,79 @@ def test_footnote_only_edit_reaches_done_not_failed():
     print("edit_demo: правка из одной сноски даёт done, а не 'текст не изменился'")
 
 
+def test_compose_single_editor_call_over_scattered_targets():
+    # Ф20: kind="compose" — правка строит одно целое из НЕСКОЛЬКИХ мест
+    # документа, поэтому кластеризация по соседству (обычный local-путь,
+    # см. test_scattered_targets_three_calls_one_verdict — те же три
+    # разнесённых id дают там ТРИ вызова) здесь обязана быть выключена: ОДИН
+    # вызов Редактора должен увидеть ВСЕ резолвленные цели сразу.
+    doc = Document()
+    for i in range(12):
+        doc.add_paragraph(f"Абзац {i}: обычный текст.")
+    idx = index(doc)
+    target_ids = ["p0", "p5", "p10"]
+
+    def fake_navigator(outline_text, request):
+        return {"kind": "compose", "rule": None, "ids": target_ids, "anchors": []}
+
+    calls = []
+
+    def fake_editor(fragment_text, request, feedback=None):
+        calls.append(fragment_text)
+        block_lines = [ln for ln in fragment_text.splitlines() if re.match(r"[pt]\d+ \[", ln)]
+        present = [t for t in target_ids if any(ln.startswith(f"{t} ") for ln in block_lines)]
+        assert present == target_ids, f"compose обязан показать ВСЕ цели в одном фрагменте: {fragment_text!r}"
+        return {"ops": [{"op": "replace_text", "id": t, "old": "обычный", "new": "составной"} for t in present]}
+
+    checker_calls = []
+
+    def fake_checker(request, diff):
+        checker_calls.append(diff)
+        return {"ok": True, "reason": "ok"}
+
+    result, doc, idx = run_edit(
+        doc, idx, "построй таблицу из этих трёх абзацев",
+        navigator=fake_navigator, editor=fake_editor, checker=fake_checker,
+    )
+
+    assert len(calls) == 1, f"compose обязан дать ОДИН вызов Редактора, получили {len(calls)}"
+    assert len(checker_calls) == 1, "Проверяющий остаётся один на правку, как и для local"
+    assert result["verdict"] == "done", result
+    print("edit_demo: compose дал один вызов Редактора над всеми тремя разнесёнными целями")
+
+
+def test_compose_oversized_fragment_refused_document_unchanged():
+    # Ф20: гвард объёма. compose собирает ОДИН фрагмент из всех целей — именно
+    # здесь он способен вырасти за окно модели (ContextWindowExceededError уже
+    # случался, см. Ф13-бис). Порог — код, не модель: Редактор и Проверяющий
+    # не должны вызываться вовсе, документ не должен быть тронут.
+    doc = Document()
+    doc.add_paragraph("Слово " * 3000)  # ~18 тыс. знаков — заведомо выше порога 15000
+    doc.add_paragraph("Второй обычный абзац.")
+    idx = index(doc)
+    before = [b["text"] for b in doc_map(doc, idx)]
+
+    def fake_navigator(outline_text, request):
+        return {"kind": "compose", "rule": None, "ids": ["p0", "p1"], "anchors": []}
+
+    def fake_editor(fragment_text, request, feedback=None):
+        raise AssertionError("Редактор не должен вызываться — гвард объёма обязан отклонить фрагмент раньше")
+
+    def fake_checker(request, diff):
+        raise AssertionError("Проверяющий не должен вызываться")
+
+    result, doc, idx = run_edit(
+        doc, idx, "сравни оба абзаца и сделай вывод",
+        navigator=fake_navigator, editor=fake_editor, checker=fake_checker,
+    )
+
+    assert result["verdict"] == "failed", result
+    assert "15000" in result["reason"] and "знаков" in result["reason"], result["reason"]
+    after = [b["text"] for b in doc_map(doc, idx)]
+    assert after == before, "документ не должен измениться при отказе по объёму"
+    print(f"edit_demo: compose-фрагмент сверх порога честно отклонён: {result['reason']!r}")
+
+
 def test_position_end_resolves_to_last_block():
     # Ф19-бис (battery 20, тот же корень у ColBERT 20): «добавь раздел в конец
     # документа» не адресуется ни id, ни якорем, ни цитатой — Навигатор
@@ -2110,4 +2183,6 @@ if __name__ == "__main__":
     test_rule_wins_when_unify_also_set()
     test_rule_rolled_back_falls_through_to_local_done()
     test_footnote_only_edit_reaches_done_not_failed()
+    test_compose_single_editor_call_over_scattered_targets()
+    test_compose_oversized_fragment_refused_document_unchanged()
     test_position_end_resolves_to_last_block()

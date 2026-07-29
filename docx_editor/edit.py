@@ -19,8 +19,9 @@ from docx_editor.parse import _format_note, doc_map, index, render
 
 _NAV_PROMPT = """Ты — навигатор по документу .docx. Тебе дают компактное
 оглавление (id и начало текста абзаца на строку) и текст правки на русском.
-Верни ТОЛЬКО JSON {"kind":"local"|"global"|"unify","rule":null|"typography"|"quotes",
-"ids":[...],"anchors":[...],"position":null|"end"} без пояснений и markdown-обвязки.
+Верни ТОЛЬКО JSON {"kind":"local"|"global"|"unify"|"compose",
+"rule":null|"typography"|"quotes","ids":[...],"anchors":[...],
+"position":null|"end"} без пояснений и markdown-обвязки.
 
 - "rule" — только когда правка ГЛОБАЛЬНАЯ типографская и относится РОВНО к
   одному из двух названных классов, других классов rule не бывает:
@@ -50,6 +51,18 @@ _NAV_PROMPT = """Ты — навигатор по документу .docx. Те
   места "везде" внутри него. Для "unify" ids/anchors всё равно заполняются
   найденными вариантами написания — код использует их, чтобы посчитать
   частоты.
+- "kind" = "compose" — правка строит ОДНО целое из НЕСКОЛЬКИХ РАЗНЫХ мест
+  документа: результат нельзя получить, применяя одну и ту же правку к
+  каждому месту по отдельности, нужно видеть их ОДНОВРЕМЕННО. Положительные
+  примеры: "собери таблицу из пунктов этого списка"; "составь список
+  литературы из всех источников, упомянутых по тексту"; "при первом
+  упоминании термина добавь расшифровку в скобках" (нужно найти именно
+  первое место среди нескольких); "сравни выводы раздела 2 и раздела 5 и
+  укажи, где они противоречат друг другу". Отрицательный пример: "исправь
+  одну и ту же опечатку в трёх местах, где она встречается" — это НЕ
+  compose, а обычная "local": каждое место правится независимо, результат
+  в одном месте не зависит от текста в другом. ids/anchors заполняются так
+  же, как для "local" — это резолв целей, а не описание правки.
 - "ids" — id блоков из оглавления, которые точно относятся к правке, если
   видишь их явно. Не пиши id внутрь anchors — это отдельное поле.
 - "anchors" — дословные цитаты ИЗ ТЕКСТА ПРАВКИ, самые специфичные, какие
@@ -852,7 +865,10 @@ def _cluster(blocks, ids, around=1):
     return clusters
 
 
-def _run_clusters(doc, idx, blocks, ids, request, editor, checker, nav, fallthrough):
+_FRAGMENT_CHAR_LIMIT = 15000  # Ф20: см. гвард объёма в _run_clusters, ниже
+
+
+def _run_clusters(doc, idx, blocks, ids, request, editor, checker, nav, fallthrough, single_cluster=False):
     """Путь с несколькими маленькими шагами вместо одного большого фрагмента
     (измерено на 40 живых правках: Редактор отказывает по ОБЪЁМУ, а не по
     смыслу, когда целей много — edit с 4 целей до 10 упала done→rolled_back).
@@ -860,6 +876,17 @@ def _run_clusters(doc, idx, blocks, ids, request, editor, checker, nav, fallthro
     получает СВОЙ вызов Редактора на СВЕЖЕМ doc_map (обязательно — предыдущие
     кластеры уже мутировали документ, старая карта дала бы Редактору "old",
     которого больше нет, и validate его отклонит).
+
+    single_cluster=True (Ф20, kind="compose") — правка строит одно целое из
+    нескольких мест документа, и кластеризация по соседству здесь как раз
+    вредна: она специально держит цели раздельными. `around` для _cluster
+    ниже раздувается до размера документа — тогда условие слияния окон
+    (`p - around <= cur_end`) истинно для любой пары id, и _cluster
+    гарантированно возвращает ОДИН кластер из ВСЕХ резолвленных id, в
+    порядке документа. Дальше код тот же самый: один элемент в clusters даёт
+    один вызов Редактора на фрагмент из всех целей плюс их соседи (те же
+    ±1, что и всегда — see find.fragment ниже), транзакция и Проверяющий не
+    меняются — они и так уже одни на всю правку, а не на кластер.
 
     Транзакция и Проверяющий — по-прежнему ОДНИ на правку целиком (_finish):
     шаги дробятся, обязательство — нет. Кластер, где Редактор честно вернул
@@ -888,7 +915,7 @@ def _run_clusters(doc, idx, blocks, ids, request, editor, checker, nav, fallthro
     запроса)."""
     snapshot_path = _snapshot(doc)
     blocks_before = doc_map(doc, idx)
-    clusters = _cluster(blocks, ids, around=1)
+    clusters = _cluster(blocks, ids, around=len(blocks) if single_cluster else 1)
     inventory = _variant_inventory(blocks, nav, request)
 
     applied_all, editor_replies, tries_total, partial, replace_all_seen = [], [], 0, False, set()
@@ -916,6 +943,17 @@ def _run_clusters(doc, idx, blocks, ids, request, editor, checker, nav, fallthro
             fragment_text = f"{done_note}\n\n{fragment_text}"
         if inventory:
             fragment_text = f"{inventory}\n\n{fragment_text}"
+        if len(fragment_text) > _FRAGMENT_CHAR_LIMIT:
+            # Ф20: гвард объёма. compose собирает фрагмент из ВСЕХ резолвленных
+            # целей сразу (single_cluster выше) — именно здесь фрагмент способен
+            # вырасти настолько, что уйдёт за окно модели. Честный отказ вместо
+            # переполнения контекста (ContextWindowExceededError уже случался,
+            # см. Ф13-бис) — код заранее знает размер строки, которую собирается
+            # отправить, доказывать это вызовом не нужно.
+            doc, idx = _restore(snapshot_path)
+            reason = (f"фрагмент для этой правки слишком большой: {len(fragment_text)} знаков "
+                      f"(порог {_FRAGMENT_CHAR_LIMIT}) — не поместится в контекст модели, правка отклонена")
+            return _failed(reason, nav, editor_replies, tries_total, applied_all), doc, idx
         fragment_ids = {b["id"] for b in frag_blocks}
         reply = editor(fragment_text, request) or {}
         editor_replies.append(reply)
@@ -1065,7 +1103,7 @@ def _run_unify(doc, idx, blocks, nav, request, editor, checker, unifier):
             "iter": 1, "reply": {"nav": nav, "editor": reply}}, doc, idx
 
 
-def _run_local(doc, idx, blocks, nav, request, editor, checker, fallthrough=False):
+def _run_local(doc, idx, blocks, nav, request, editor, checker, fallthrough=False, single_cluster=False):
     """Локальный путь через Редактора: резолв id → кластеризация → цикл
     маленьких шагов (_run_clusters, один вызов Редактора на кластер). Нет
     верхней границы на число целей и нет отдельной ветки для одной цели —
@@ -1076,7 +1114,11 @@ def _run_local(doc, idx, blocks, nav, request, editor, checker, fallthrough=Fals
     rule ничего не изменил и цикл перезапускает ТОТ ЖЕ запрос обычным путём.
     fallthrough=True меняет только то, каким вердиктом закрывается "здесь
     нечего резолвить/Редактор честно отказался": already (rule и Редактор
-    согласны — менять нечего), а не failed."""
+    согласны — менять нечего), а не failed.
+
+    single_cluster (Ф20) прокидывается в _run_clusters как есть — resolve и
+    честный отказ "негде править" не меняются вовсе, разница только в форме
+    кластеризации резолвленных id (см. run_edit, kind="compose")."""
     ids = _resolve(blocks, nav, request)
     if not ids:
         if fallthrough:
@@ -1087,7 +1129,7 @@ def _run_local(doc, idx, blocks, nav, request, editor, checker, fallthrough=Fals
             reason = "не нашёл, где это править: ни id и якоря Навигатора, ни дословные цитаты из текста правки не нашли места в документе"
         return verdict_fn(reason, nav), doc, idx
 
-    return _run_clusters(doc, idx, blocks, ids, request, editor, checker, nav, fallthrough)
+    return _run_clusters(doc, idx, blocks, ids, request, editor, checker, nav, fallthrough, single_cluster)
 
 
 def run_edit(doc, idx, request, navigator=_navigate, editor=_edit_llm, checker=_check, unifier=_unify_llm):
@@ -1121,7 +1163,14 @@ def run_edit(doc, idx, request, navigator=_navigate, editor=_edit_llm, checker=_
     Когда Навигатор проставлял оба, а выигрывал unify, ломались ColBERT 6
     (кавычки) и Математика 1 (пробелы) — обе делались нормализацией и обе
     упали. Защита от неверного rule — не приоритет unify, а fallthrough
-    ниже: откат Проверяющего продолжается локальным путём."""
+    ниже: откат Проверяющего продолжается локальным путём.
+
+    Ф20: kind="compose" (Навигатор) идёт тем же _run_local/_run_clusters, что
+    и обычная local-правка — единственная разница в single_cluster=True: одна
+    правка строит одно целое из нескольких мест документа, поэтому
+    кластеризация по соседству здесь противоречит задаче, а не помогает (см.
+    _run_clusters). Своего "editor"/"reply" формата у compose нет — reply
+    остаётся списком из ОДНОГО ответа (один кластер — один вызов)."""
     blocks = doc_map(doc, idx)
     nav = navigator(find.outline(blocks), request) or {}
     rule = nav.get("rule")
@@ -1129,6 +1178,8 @@ def run_edit(doc, idx, request, navigator=_navigate, editor=_edit_llm, checker=_
     if not rule:
         if nav.get("kind") == "unify":
             return _run_unify(doc, idx, blocks, nav, request, editor, checker, unifier)
+        if nav.get("kind") == "compose":
+            return _run_local(doc, idx, blocks, nav, request, editor, checker, single_cluster=True)
         return _run_local(doc, idx, blocks, nav, request, editor, checker)
 
     # Правки типа rule идут мимо Редактора — код нормализует сам, LLM не зовём.
