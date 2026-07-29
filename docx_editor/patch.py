@@ -10,6 +10,7 @@ Word: footnotes.xml + связь в .rels + w:footnoteReference в теле), п
 """
 
 from copy import deepcopy
+from difflib import SequenceMatcher
 
 from docx.enum.style import WD_STYLE_TYPE
 from docx.opc.constants import CONTENT_TYPE as CT, RELATIONSHIP_TYPE as RT
@@ -414,8 +415,30 @@ def _op_replace_text(doc, idx, op):
 
 
 def _op_set_text(doc, idx, op):
+    # В3: Ф19 велит переписывать абзац целиком, но старый/новый текст обычно
+    # разделяют длинные неизменившиеся куски (общий сосед фразы), а не только
+    # первый/последний символ — старый код заменял [0:len(old)) одним куском,
+    # из-за чего ВЕСЬ новый текст оказывался в ранe САМОГО ПЕРВОГО совпавшего
+    # рана (какое бы начертание у него ни было), а раны с остальным
+    # начертанием абзаца становились пустыми — начертание физически
+    # оставалось в документе, но на пустом ранe, невидимо (архитектор поймал
+    # это на живом жирном «0.5%», которое "переехало" в пустой ран).
+    #
+    # Правка: не трогаем совпавшие (SequenceMatcher, tag=="equal") куски
+    # вообще — их раны остаются как были, с текстом и начертанием. Только
+    # реально изменившиеся диапазоны переписываются _replace_span, той же
+    # функцией и с тем же ограничением, что и replace_text: если диапазон
+    # целиком перекрывает несколько по-разному оформленных ранов, новый текст
+    # наследует начертание ПЕРВОГО из них (это старое, уже проверенное
+    # поведение _replace_span, не новое допущение). Диапазоны идут в
+    # обратном порядке (по убыванию начала), чтобы более ранние офсеты не
+    # съехали от более поздней замены — тот же приём, что в _op_replace_all.
     el = idx[op["id"]]
-    _replace_span(el, 0, len(_ptext(el)), op["text"])
+    old_text, new_text = _ptext(el), op["text"]
+    opcodes = SequenceMatcher(None, old_text, new_text, autojunk=False).get_opcodes()
+    for tag, i1, i2, j1, j2 in reversed(opcodes):
+        if tag != "equal":
+            _replace_span(el, i1, i2, new_text[j1:j2])
     return f"Текст {op['id']} заменён целиком"
 
 

@@ -543,12 +543,45 @@ def test_footnote_new_and_existing_part():
     )
 
 
+def test_set_text_preserves_run_formatting_via_diff():
+    # В3: живой случай архитектора — абзац с жирным «0.5%» set_text переписал
+    # правильно, но жирный ран вышел ПУСТЫМ (весь новый текст свалился в
+    # первый ран абзаца целиком, каким бы ни было его начертание). Правка:
+    # SequenceMatcher находит неизменившийся кусок (общий заголовок с «0.5%»
+    # включительно) и не трогает его раны вовсе — начертание остаётся на
+    # месте, переписывается только реально изменившийся хвост.
+    doc = Document()
+    p = doc.add_paragraph()
+    p.add_run("Порог риска — выше ")
+    p.add_run("0.5%").bold = True
+    p.add_run(", релиз откатывается. Решение принимается единолично.")
+    idx = index(doc)
+    blocks = doc_map(doc, idx)
+
+    op = {
+        "op": "set_text", "id": "p0",
+        "text": "Порог риска — выше 0.5%, релиз откатывается только после согласования с директором.",
+    }
+    assert validate(blocks, op, doc) is None
+    apply(doc, idx, op)
+    blocks = doc_map(doc, idx)
+
+    assert blocks[0]["text"] == op["text"], blocks[0]["text"]
+    bold_runs = [r for r in doc.paragraphs[0].runs if r.text and r.bold]
+    assert any("0.5%" in r.text for r in bold_runs), [
+        (r.text, r.bold) for r in doc.paragraphs[0].runs]
+
+    print("patch_demo: set_text (диффом) сохраняет жирное «0.5%» при переписывании хвоста абзаца")
+
+
 def test_set_text_preserves_structure_loses_run_formatting():
-    # Ф19: set_text переписывает абзац целиком (Редактор — автор новой
+    # Ф19/В3: set_text переписывает абзац целиком (Редактор — автор новой
     # формулировки). Фиксируем, что именно сохраняется (стиль, level из
-    # w:outlineLvl, list из w:numPr), а что теряется (начертание отдельных
-    # ранов внутри абзаца — set_text не умеет их сохранить, это ограничение,
-    # записанное в BUILD_PLAN, а не баг).
+    # w:outlineLvl, list из w:numPr) даже при полной перезаписи, а что
+    # ЛЕГИТИМНО теряется: если новый текст не делит с старым НИ ОДНОГО
+    # выровненного по границам ранов куска (здесь — полностью другая фраза),
+    # диффу нечего сопоставлять, и начертание отдельных ранов внутри абзаца
+    # теряется — это записанный предел В3, а не баг.
     doc = _build()
     idx = index(doc)
     p3 = doc.paragraphs[3]
@@ -624,4 +657,5 @@ if __name__ == "__main__":
     test_set_list_rejects_without_numbering_definitions()
     test_replace_all_reports_only_real_changes()
     test_footnote_new_and_existing_part()
+    test_set_text_preserves_run_formatting_via_diff()
     test_set_text_preserves_structure_loses_run_formatting()
