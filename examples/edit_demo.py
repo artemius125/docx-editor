@@ -18,6 +18,7 @@ from docx_editor.parse import doc_map, index, render
 
 REAL_DOC = "/home/artem/Загрузки/Архитектура_ColBERT.docx"
 EDITS_FILE = "/home/artem/Загрузки/Правки_ColBERT_20.md"
+REGLAMENT_DOC = "/home/artem/Документы/artemius125/docx-editor/bench/bench/fixtures/Регламент.docx"
 
 
 def test_split_real_file():
@@ -2123,6 +2124,157 @@ def test_position_end_resolves_to_last_block():
     print("edit_demo: position=end резолвится в последний блок документа, вставка в конец прошла")
 
 
+def test_trace_table_catches_paragraph_faking_a_row():
+    # В1, ложь №1 живого прогона: «Добавь строку в таблицу» — Редактор вписал
+    # абзац "r4c0:Служба безопасности | r4c1:... | r4c2:нет" рядом с таблицей,
+    # которая осталась 4x3. Текстовый diff видит появившийся текст с нужными
+    # словами и раньше говорил done. trace="table" обязан поймать это ДО
+    # Проверяющего — checker вообще не должен вызываться.
+    doc = Document(REGLAMENT_DOC)
+    idx = index(doc)
+    before = doc_map(doc, idx)
+    table_before = next(b for b in before if b["kind"] == "t")
+
+    def fake_navigator(outline_text, request):
+        return {"kind": "local", "rule": None, "ids": ["t0"], "anchors": [], "trace": "table"}
+
+    def fake_editor(fragment_text, request, feedback=None):
+        return {"ops": [{"op": "insert_after", "id": "t0",
+                          "text": "r4c0:Служба безопасности | r4c1:Согласование внепланового выпуска | r4c2:нет",
+                          "style": "Normal"}]}
+
+    def no_checker(request, diff):
+        raise AssertionError("trace=table обязан отклонить подделку ДО вызова Проверяющего")
+
+    result, doc, idx = run_edit(
+        doc, idx, "Добавь строку в таблицу: Служба безопасности | Согласование внепланового выпуска | нет",
+        navigator=fake_navigator, editor=fake_editor, checker=no_checker,
+    )
+
+    assert result["verdict"] == "failed", result
+    after = doc_map(doc, idx)
+    table_after = next(b for b in after if b["kind"] == "t")
+    assert table_after["rows"] == table_before["rows"], "таблица не должна была измениться"
+    assert not any("r4c0" in b["text"] for b in after if b["kind"] == "p"), "поддельный абзац обязан быть откачен"
+    print(f"edit_demo: trace=table поймал абзац, подделывающий строку таблицы: {result['reason']!r}")
+
+
+def test_trace_heading_text_catches_heading_without_body():
+    # В1, ложь №2 живого прогона (второй путь): \\n-гвард (В2) уже блокирует
+    # "6. Пересмотр\\nРегламент...", но модель может просто ОПУСТИТЬ текст
+    # раздела и вставить один Heading 1 без абзаца текста после него —
+    # trace="heading+text" требует ДВУХ новых абзацев, не одного.
+    doc = Document(REGLAMENT_DOC)
+    idx = index(doc)
+    before = [(b["id"], b.get("text"), b.get("rows")) for b in doc_map(doc, idx)]
+
+    def fake_navigator(outline_text, request):
+        return {"kind": "local", "rule": None, "ids": ["p16"], "anchors": [], "trace": "heading+text"}
+
+    def fake_editor(fragment_text, request, feedback=None):
+        return {"ops": [{"op": "insert_after", "id": "p16", "text": "6. Пересмотр", "style": "Heading 1"}]}
+
+    def no_checker(request, diff):
+        raise AssertionError("trace=heading+text обязан отклонить одинокий заголовок ДО Проверяющего")
+
+    result, doc, idx = run_edit(
+        doc, idx, "Добавь раздел «6. Пересмотр» с текстом: Регламент пересматривается ежегодно приказом директора.",
+        navigator=fake_navigator, editor=fake_editor, checker=no_checker,
+    )
+
+    assert result["verdict"] == "failed", result
+    after = [(b["id"], b.get("text"), b.get("rows")) for b in doc_map(doc, idx)]
+    assert after == before, "документ обязан остаться нетронутым — заголовок без текста раздела откачен"
+    print(f"edit_demo: trace=heading+text поймал заголовок без текста раздела: {result['reason']!r}")
+
+
+def test_trace_heading_text_passes_for_real_section():
+    # Регресс-контроль: та же правка, сделанная ПРАВИЛЬНО (insert_paragraphs,
+    # заголовок и текст — два новых абзаца), обязана дойти до Проверяющего и
+    # получить done — trace не должен рубить верные правки этого класса.
+    doc = Document(REGLAMENT_DOC)
+    idx = index(doc)
+
+    def fake_navigator(outline_text, request):
+        return {"kind": "local", "rule": None, "ids": ["p16"], "anchors": [], "trace": "heading+text"}
+
+    def fake_editor(fragment_text, request, feedback=None):
+        return {"ops": [{"op": "insert_paragraphs", "id": "p16", "items": [
+            {"text": "6. Пересмотр", "style": "Heading 1"},
+            {"text": "Регламент пересматривается ежегодно приказом директора.", "style": "Normal"},
+        ]}]}
+
+    def ok_checker(request, diff):
+        return {"ok": True, "reason": "раздел добавлен"}
+
+    result, doc, idx = run_edit(
+        doc, idx, "Добавь раздел «6. Пересмотр» с текстом: Регламент пересматривается ежегодно приказом директора.",
+        navigator=fake_navigator, editor=fake_editor, checker=ok_checker,
+    )
+
+    assert result["verdict"] == "done", result
+    texts = [b["text"] for b in doc_map(doc, idx) if b["kind"] == "p"]
+    assert "6. Пересмотр" in texts and "Регламент пересматривается ежегодно приказом директора." in texts
+    print("edit_demo: trace=heading+text пропускает настоящий раздел (заголовок + текст) до done")
+
+
+def test_trace_table_passes_for_real_row_insert():
+    # Регресс-контроль: настоящий insert_row обязан пройти trace=table и
+    # дойти до Проверяющего, как и раньше.
+    doc = Document(REGLAMENT_DOC)
+    idx = index(doc)
+
+    def fake_navigator(outline_text, request):
+        return {"kind": "local", "rule": None, "ids": ["t0"], "anchors": [], "trace": "table"}
+
+    def fake_editor(fragment_text, request, feedback=None):
+        return {"ops": [{"op": "insert_row", "id": "t0", "at": 1,
+                          "cells": ["Служба безопасности", "Согласование внепланового выпуска", "нет"]}]}
+
+    def ok_checker(request, diff):
+        return {"ok": True, "reason": "строка добавлена"}
+
+    result, doc, idx = run_edit(
+        doc, idx, "Добавь строку в таблицу: Служба безопасности | Согласование внепланового выпуска | нет",
+        navigator=fake_navigator, editor=fake_editor, checker=ok_checker,
+    )
+
+    assert result["verdict"] == "done", result
+    table = next(b for b in doc_map(doc, idx) if b["kind"] == "t")
+    assert len(table["rows"]) == 5 and table["rows"][1][0] == "Служба безопасности"
+    print("edit_demo: trace=table пропускает настоящую вставку строки до done")
+
+
+def test_trace_footnote_regression_real_footnote_not_blocked():
+    # Регресс-контроль из ТЗ: настоящая сноска Word не оставляет текстового
+    # следа в теле документа вовсе (её текст — в word/footnotes.xml,
+    # _struct_note уже считает w:footnoteReference) — trace=footnote не
+    # должен рубить её так же, как раньше не рубил её _diff (Ф19-бис).
+    doc = Document()
+    doc.add_paragraph("Термин имеет спорное определение в литературе.")
+    idx = index(doc)
+
+    def fake_navigator(outline_text, request):
+        return {"kind": "local", "rule": None, "ids": ["p0"], "anchors": [], "trace": "footnote"}
+
+    def fake_editor(fragment_text, request, feedback=None):
+        return {"ops": [{"op": "footnote", "id": "p0", "old": "спорное определение",
+                          "text": "См. обсуждение в разделе 2."}]}
+
+    def ok_checker(request, diff):
+        return {"ok": True, "reason": "сноска добавлена"}
+
+    result, doc, idx = run_edit(
+        doc, idx, "Добавь сноску после «спорное определение».",
+        navigator=fake_navigator, editor=fake_editor, checker=ok_checker,
+    )
+
+    assert result["verdict"] == "done", result
+    refs = idx["p0"].findall(".//" + qn("w:footnoteReference"))
+    assert len(refs) == 1
+    print("edit_demo: trace=footnote не блокирует настоящую сноску (регресс-контроль)")
+
+
 if __name__ == "__main__":
     test_split_real_file()
     test_fallback_search_then_honest_refusal()
@@ -2186,3 +2338,8 @@ if __name__ == "__main__":
     test_compose_single_editor_call_over_scattered_targets()
     test_compose_oversized_fragment_refused_document_unchanged()
     test_position_end_resolves_to_last_block()
+    test_trace_table_catches_paragraph_faking_a_row()
+    test_trace_heading_text_catches_heading_without_body()
+    test_trace_heading_text_passes_for_real_section()
+    test_trace_table_passes_for_real_row_insert()
+    test_trace_footnote_regression_real_footnote_not_blocked()

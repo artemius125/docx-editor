@@ -21,7 +21,8 @@ _NAV_PROMPT = """Ты — навигатор по документу .docx. Те
 оглавление (id и начало текста абзаца на строку) и текст правки на русском.
 Верни ТОЛЬКО JSON {"kind":"local"|"global"|"unify"|"compose",
 "rule":null|"typography"|"quotes","ids":[...],"anchors":[...],
-"position":null|"end"} без пояснений и markdown-обвязки.
+"position":null|"end","trace":null|"table"|"heading"|"heading+text"|"list"|"footnote"}
+без пояснений и markdown-обвязки.
 
 - "rule" — только когда правка ГЛОБАЛЬНАЯ типографская и относится РОВНО к
   одному из двух названных классов, других классов rule не бывает:
@@ -76,7 +77,19 @@ _NAV_PROMPT = """Ты — навигатор по документу .docx. Те
   текстом: "добавь раздел в конец документа", "допиши в самом конце" — цитаты
   или id тут нет и быть не может, потому что цель определена структурно, не
   лексически. Во всех остальных случаях, включая любую правку, для которой
-  можно назвать текст-ориентир, — null."""
+  можно назвать текст-ориентир, — null.
+- "trace" — ожидаемый СЛЕД правки в документе: код проверит его по XML ДО
+  Проверяющего, и несовпадение — честный отказ БЕЗ вызова Проверяющего.
+  null — обычная текстовая правка, доп. проверки не нужно. "table" — правка
+  обязана изменить ТАБЛИЦУ (строку/колонку/ячейку), а не пририсовать текст
+  рядом с ней. "heading" — абзац должен стать или появиться заголовком
+  (стиль Heading*/Title или структурный уровень). "heading+text" — правка
+  добавляет НОВЫЙ РАЗДЕЛ: заголовок И текст раздела, то есть минимум ДВА
+  новых абзаца, а не один заголовок с текстом внутри него самого. "list" —
+  меняется принадлежность/уровень абзаца в списке. "footnote" — правка
+  добавляет сноску Word. Ставь trace по смыслу ПРАВКИ, а не по kind —
+  "добавь строку в таблицу" это trace="table", даже когда kind="local". Нет
+  такого структурного ожидания — trace=null, а не выдумка."""
 
 _EDIT_PROMPT = """Ты — редактор документа .docx. Тебе дают фрагмент блоков
 (построчно: "pNN [метаданные] текст" для абзацев, "tNN [table RxC] ..." для
@@ -382,6 +395,88 @@ def _restore(snapshot_path):
 
 def _btext(b):
     return b["text"] if b["kind"] == "p" else " | ".join(c for row in b["rows"] for c in row)
+
+
+def _is_heading(b):
+    """Абзац — заголовок: структурный уровень (w:outlineLvl) или именованный
+    стиль Heading*/Title (В1: см. _trace_error)."""
+    if b.get("level") is not None:
+        return True
+    style = b.get("style") or ""
+    return style.startswith("Heading") or style == "Title"
+
+
+def _trace_error(trace, before, after):
+    """В1 (главный пункт партии): Проверяющий видит текстовый diff, и для
+    него строка таблицы, ставшая абзацем со своей нотацией "r0c0:...", и
+    настоящая строка таблицы неотличимы — обе выглядят как добавившийся
+    текст с нужными словами. Здесь код проверяет по СТРУКТУРНЫМ полям блока
+    (kind/rows/level/style/list/footnotes — они читаются parse.py прямо из
+    XML), что изменение того КЛАССА, который назвал Навигатор в "trace", а не
+    просто "текст изменился". None — след найден, иначе честный текст отказа.
+
+    Замкнутый словарь (Навигатор ограничен им в _NAV_PROMPT): null (правка
+    без структурных ожиданий, доп. проверки нет), "table", "heading",
+    "heading+text" (новый РАЗДЕЛ — заголовок И текст, минимум два новых
+    абзаца: живой прогон поймал модель на одном Heading 1 без абзаца текста
+    после него), "list", "footnote". Значение вне словаря не проверяется —
+    один невиданный ярлык 26B-модели не должен рубить верную правку.
+
+    Вызывается ДО Проверяющего (см. _finish) — несовпавший trace вообще не
+    тратит вызов модели: диагноз (BUILD_PLAN_V2 «Диагноз») явно требует,
+    чтобы класс изменения проверял код, а не промпт Проверяющего."""
+    if not trace:
+        return None
+    b_by_id = {b["id"]: b for b in before}
+    a_by_id = {b["id"]: b for b in after}
+
+    if trace == "table":
+        for i, blk in a_by_id.items():
+            if blk["kind"] == "t" and (i not in b_by_id or b_by_id[i]["rows"] != blk["rows"]):
+                return None
+        if any(b["kind"] == "t" and i not in a_by_id for i, b in b_by_id.items()):
+            return None
+        return ("правка названа табличной (trace=table), но ни одна таблица в документе не "
+                "изменилась — похоже на подделку текстом вместо реальной правки таблицы")
+
+    if trace == "heading":
+        for i, blk in a_by_id.items():
+            if blk["kind"] == "p" and _is_heading(blk) and not (i in b_by_id and _is_heading(b_by_id[i])):
+                return None
+        return ("правка названа заголовком раздела (trace=heading), но ни один абзац не стал "
+                "и не появился заголовком (стиль Heading*/Title или структурный уровень)")
+
+    if trace == "heading+text":
+        has_heading = has_body = False
+        for i, blk in a_by_id.items():
+            if blk["kind"] != "p" or i in b_by_id:
+                continue  # интересуют только НОВЫЕ абзацы — раздел это вставка, не правка на месте
+            if _is_heading(blk):
+                has_heading = True
+            elif blk["text"].strip():
+                has_body = True
+        if has_heading and has_body:
+            return None
+        return ("правка добавляет раздел (заголовок и текст, trace=heading+text), но в документе "
+                "появился только заголовок без текста раздела (или наоборот) — новый раздел это "
+                "минимум ДВА новых абзаца (insert_paragraphs), а не один")
+
+    if trace == "list":
+        for i, blk in a_by_id.items():
+            if blk["kind"] == "p" and blk.get("list") != (b_by_id.get(i) or {}).get("list"):
+                return None
+        return ("правка названа списочной (trace=list), но принадлежность/уровень списка "
+                "(numPr) ни одного абзаца не изменились")
+
+    if trace == "footnote":
+        before_fn = sum(b.get("footnotes", 0) for b in before if b["kind"] == "p")
+        after_fn = sum(b.get("footnotes", 0) for b in after if b["kind"] == "p")
+        if after_fn > before_fn:
+            return None
+        return ("правка названа сноской (trace=footnote), но число footnoteReference в "
+                "документе не выросло")
+
+    return None
 
 
 def _struct_note(b, a):
@@ -806,10 +901,21 @@ def _finish(doc, idx, snapshot_path, blocks_before, applied, request, checker, n
     (result, doc, idx, tries); result is None ТОЛЬКО когда diff пуст — смысл
     пустого diff разный на разных путях (item A/C), решение оставлено
     вызывающему, а doc/idx в этом случае уже НОВАЯ пара из _restore."""
-    diff = _diff(blocks_before, doc_map(doc, idx))
+    blocks_after = doc_map(doc, idx)
+    diff = _diff(blocks_before, blocks_after)
     if not diff:
         doc, idx = _restore(snapshot_path)
         return None, doc, idx, tries
+
+    # В1: класс изменения проверяется КОДОМ по XML раньше, чем тратится вызов
+    # Проверяющего — он видит только текстовый diff и не отличит строку
+    # таблицы, ставшую абзацем, от настоящей строки (см. _trace_error).
+    trace_err = _trace_error(nav.get("trace"), blocks_before, blocks_after)
+    if trace_err is not None:
+        doc, idx = _restore(snapshot_path)
+        reply = {"nav": nav, "editor": editor_reply}
+        return ({"verdict": "failed", "reason": trace_err, "applied": applied, "ids": [],
+                  "iter": tries, "reply": reply}, doc, idx, tries)
 
     try:
         verdict = checker(request, diff) or {}
