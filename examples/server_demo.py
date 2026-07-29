@@ -18,6 +18,8 @@ from docx import Document
 from fastapi.testclient import TestClient
 
 import docx_editor.llm as llm
+from docx_editor import edit as edit_mod
+from docx_editor import server as server_mod
 from docx_editor.server import app
 
 # Настоящая chat() — остальные тесты в файле подменяют llm.chat фикстурой
@@ -370,6 +372,64 @@ def test_ping_keeps_stream_alive_during_slow_edit():
     asyncio.run(_run_ping_scenario())
 
 
+def test_transport_retry_survives_and_continues():
+    """В4: обрыв транспорта на одной правке из списка не должен убивать поток
+    остальных (BUILD_PLAN_V2, В4 — прогон за рулём убил правки 2-10 из 10).
+    Подменяем edit_mod.run_edit (не llm.chat — здесь важен именно уровень
+    правки, а не роли модели) фейком: правка 2 из 3 всегда бросает
+    httpx.TransportError, 1 и 3 — обычный успех. RETRY_PAUSE патчится в 0,
+    чтобы тест не спал 2×5с реальных."""
+    orig_run_edit = edit_mod.run_edit
+    server_mod.RETRY_PAUSE = 0
+    attempts_on_2 = []
+
+    def fake_run_edit(doc, idx, task):
+        if "вторая правка" in task:
+            attempts_on_2.append(1)
+            raise httpx.TransportError("оборвано тестом (имитация обрыва провайдера)")
+        result = {
+            "iter": 1, "verdict": "done", "reason": "тестовая правка применена",
+            "applied": [f"применено: {task}"], "ids": [], "reply": {"editor": None},
+        }
+        return result, doc, idx
+
+    edit_mod.run_edit = fake_run_edit
+    try:
+        client = TestClient(app)
+        with open(DOC, "rb") as f:
+            data = f.read()
+        files = {"file": ("doc.docx", io.BytesIO(data), "application/octet-stream")}
+        session = client.post("/upload", files=files).json()["session"]
+
+        prompt = "1. первая правка.\n2. вторая правка.\n3. третья правка."
+        edit_resp = client.post("/edit", data={"prompt": prompt, "session": session})
+    finally:
+        edit_mod.run_edit = orig_run_edit
+        server_mod.RETRY_PAUSE = 5
+
+    assert edit_resp.status_code == 200
+    events = [json.loads(l) for l in edit_resp.text.splitlines() if l.strip()]
+    op_events = [e for e in events if e["type"] == "op"]
+
+    assert len(op_events) == 3, op_events
+    assert [e["task"] for e in op_events] == [1, 2, 3], op_events
+    assert len(attempts_on_2) == 3, "все 3 попытки должны были уйти в fake_run_edit"
+
+    assert op_events[0]["verdict"] == "done" and op_events[0]["status"] == "done"
+    assert op_events[2]["verdict"] == "done" and op_events[2]["status"] == "done"
+
+    dead = op_events[1]
+    assert dead["status"] == "failed", dead
+    assert dead["verdict"] == "crashed", dead
+    assert "обрыв" in dead["text"].lower() and "TransportError" in dead["text"], dead["text"]
+
+    assert events[-1]["type"] == "result", events[-1]
+    assert events[-1]["failed"] == [dead["text"]], events[-1]
+    assert events[-1]["done"] == [op_events[0]["text"], op_events[2]["text"]], events[-1]
+
+    print("server_demo: обрыв транспорта на правке 2 из 3 не рвёт поток, даёт честный failed и доходит до result")
+
+
 def _fake_response(status_code, *, json_body=None, text_body=None):
     request = httpx.Request("POST", "https://fake.test/chat/completions")
     content = json.dumps(json_body).encode() if json_body is not None else text_body.encode()
@@ -446,6 +506,7 @@ if __name__ == "__main__":
     test_already_streams_as_done()
     test_journal_iter_retry()
     test_ping_keeps_stream_alive_during_slow_edit()
+    test_transport_retry_survives_and_continues()
     test_llm_chat_http_error_surfaces_body_and_size()
     test_llm_chat_200_still_returns_parsed_json()
     test_llm_chat_transport_retry_unchanged()

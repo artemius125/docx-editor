@@ -6,6 +6,7 @@ import time
 import uuid
 from pathlib import Path
 
+import httpx
 from docx import Document
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
@@ -20,6 +21,12 @@ OUT = ROOT / "out"
 OUT.mkdir(exist_ok=True)
 
 app = FastAPI()
+
+# В4: обрыв транспорта (bench/run_seq.py, Ф17) — та же форма ретрая здесь,
+# в продукте. Модульные константы, а не литералы в коде — тесту нужно
+# подменить паузу на 0, чтобы не спать реальные секунды.
+_RETRY_ATTEMPTS = 3
+RETRY_PAUSE = 5
 
 
 def _session_path(session: str) -> Path:
@@ -69,13 +76,41 @@ async def edit(prompt: str = Form(...), session: str = Form(...)):
             # успевать слать пинг: облачный туннель рвёт соединение по тишине, не по
             # длительности (Ф10). Пинг игнорируется клиентом (неизвестный type) —
             # web/index.html не трогаем.
-            edit_task = asyncio.create_task(asyncio.to_thread(edit_mod.run_edit, doc, idx, task))
-            while not edit_task.done():
-                try:
-                    await asyncio.wait_for(asyncio.shield(edit_task), timeout=5)
-                except asyncio.TimeoutError:
-                    yield json.dumps({"type": "ping"}) + "\n"
-            result, doc, idx = edit_task.result()
+            #
+            # В4: обрыв транспорта (httpx.TransportError) роняет ТОЛЬКО эту правку,
+            # а не весь поток — ретрай той же правки на месте, до _RETRY_ATTEMPTS
+            # попыток с паузой RETRY_PAUSE (форма из bench/run_seq.py). doc/idx либо
+            # не тронуты run_edit, либо он сам откатил их — в любой попытке те же
+            # doc/idx уходят в следующий вызов. Не-транспортное исключение (др. баг)
+            # по-прежнему летит наружу необработанным (инвариант 6, test_crash_*).
+            transport_err = None
+            for attempt in range(_RETRY_ATTEMPTS):
+                transport_err = None
+                edit_task = asyncio.create_task(asyncio.to_thread(edit_mod.run_edit, doc, idx, task))
+                while not edit_task.done():
+                    try:
+                        await asyncio.wait_for(asyncio.shield(edit_task), timeout=5)
+                    except asyncio.TimeoutError:
+                        yield json.dumps({"type": "ping"}) + "\n"
+                    except httpx.TransportError as e:
+                        transport_err = e
+                if transport_err is None:
+                    try:
+                        result, doc, idx = edit_task.result()
+                    except httpx.TransportError as e:
+                        transport_err = e
+                if transport_err is None:
+                    break
+                if attempt < _RETRY_ATTEMPTS - 1:
+                    await asyncio.sleep(RETRY_PAUSE)
+            if transport_err is not None:
+                result = {
+                    "iter": None, "verdict": "crashed", "ids": [], "applied": [], "reply": None,
+                    "reason": (
+                        f"обрыв соединения с моделью после {_RETRY_ATTEMPTS} попыток: "
+                        f"{type(transport_err).__name__}: {transport_err}"
+                    ),
+                }
             doc.save(str(path))  # сразу после правки — файл и событие не должны расходиться
             log.append(session, {
                 "task": task_n,
