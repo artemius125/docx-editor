@@ -2296,6 +2296,80 @@ def test_trace_table_passes_for_real_row_insert():
     print("edit_demo: trace=table пропускает настоящую вставку строки до done")
 
 
+def test_trace_heading_passes_when_paragraph_already_had_outline_level():
+    # В11 (находка Н66, «В1 инвертирован», замер w18 colbert#9/math#4): реальный
+    # набор документов несёт w:outlineLvl ПРЯМО на абзаце независимо от именного
+    # стиля («жирный абзац» может уже структурно значиться как заголовок в
+    # навигации Word, даже стилем Normal) — старая проверка требовала ПЕРЕХОДА
+    # "не был заголовком → стал", и такой абзац не проходил её никогда: он и
+    # ДО set_style уже читался как заголовок кодом (_is_heading по level), хотя
+    # для человека это была просто "жирная строка". Правка выполнена ПРАВИЛЬНОЙ
+    # операцией (set_style на Heading 1) — она обязана дойти до done, ярлык
+    # trace тут ни при чём: реальный applied-op доказывает сделанное.
+    doc = Document()
+    doc.add_paragraph("Заголовок документа")
+    doc.add_paragraph("Обычный абзац ниже.")
+    idx = index(doc)
+    p0 = idx["p0"]
+    pPr = p0.get_or_add_pPr()
+    outline = OxmlElement("w:outlineLvl")
+    outline.set(qn("w:val"), "0")
+    pPr.append(outline)
+    assert doc_map(doc, idx)[0]["level"] == 0, "фикстура обязана уже нести level ДО правки"
+
+    def fake_navigator(outline_text, request):
+        return {"kind": "local", "rule": None, "ids": ["p0"], "anchors": [], "trace": "heading"}
+
+    def fake_editor(fragment_text, request, feedback=None):
+        return {"ops": [{"op": "set_style", "id": "p0", "style": "Heading 1"}]}
+
+    def ok_checker(request, diff):
+        return {"ok": True, "reason": "заголовок оформлен стилем"}
+
+    result, doc, idx = run_edit(
+        doc, idx, "Заголовок документа сейчас просто жирный абзац. Сделай его нормальным заголовком через стиль Word.",
+        navigator=fake_navigator, editor=fake_editor, checker=ok_checker,
+    )
+
+    assert result["verdict"] == "done", result
+    assert doc_map(doc, idx)[0]["style"] == "Heading 1"
+    print("edit_demo: trace=heading пропускает set_style, даже если абзац уже нёс outlineLvl до правки")
+
+
+def test_trace_table_passes_when_navigator_mislabels_unrelated_edit():
+    # В11 (находка Н66, замер w18 colbert#16): Навигатор наугад проставил
+    # trace=table правке про перепутанные обозначения в формулах — таблиц в
+    # деле вообще не было, только replace_text по абзацам. Раньше это рубилось
+    # («ни одна таблица не изменилась»), хотя правка не имела к таблицам
+    # никакого отношения. Среди применённого нет НИ операции, способной
+    # оставить table-след, НИ операции, способной его подделать текстом
+    # (replace_text — точечная правка существующего текста, не тот класс) —
+    # ярлыку Навигатора в этом случае просто нечего было подделывать.
+    doc = Document()
+    doc.add_paragraph("В формуле сумма идёт по m, максимум по n.")
+    idx = index(doc)
+
+    def fake_navigator(outline_text, request):
+        return {"kind": "local", "rule": None, "ids": ["p0"], "anchors": [], "trace": "table"}
+
+    def fake_editor(fragment_text, request, feedback=None):
+        return {"ops": [{"op": "replace_text", "id": "p0",
+                          "old": "сумма идёт по m, максимум по n",
+                          "new": "сумма идёт по n, максимум по m"}]}
+
+    def ok_checker(request, diff):
+        return {"ok": True, "reason": "обозначения исправлены"}
+
+    result, doc, idx = run_edit(
+        doc, idx, "В формуле перепутаны обозначения — сумма должна идти по n, максимум по m.",
+        navigator=fake_navigator, editor=fake_editor, checker=ok_checker,
+    )
+
+    assert result["verdict"] == "done", result
+    assert doc_map(doc, idx)[0]["text"] == "В формуле сумма идёт по n, максимум по m."
+    print("edit_demo: ошибочный trace=table на правке без единой таблицы не рубит верную правку")
+
+
 def test_trace_footnote_regression_real_footnote_not_blocked():
     # Регресс-контроль из ТЗ: настоящая сноска Word не оставляет текстового
     # следа в теле документа вовсе (её текст — в word/footnotes.xml,
@@ -2678,6 +2752,8 @@ if __name__ == "__main__":
     test_trace_heading_text_catches_heading_without_body()
     test_trace_heading_text_passes_for_real_section()
     test_trace_table_passes_for_real_row_insert()
+    test_trace_heading_passes_when_paragraph_already_had_outline_level()
+    test_trace_table_passes_when_navigator_mislabels_unrelated_edit()
     test_trace_footnote_regression_real_footnote_not_blocked()
     test_trace_field_catches_paragraph_faking_a_page_reference()
     test_trace_field_passes_for_real_field_insert()

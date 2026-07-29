@@ -462,54 +462,94 @@ def _is_heading(b):
     return style.startswith("Heading") or style == "Title"
 
 
-def _trace_error(trace, before, after, doc=None):
-    """В1 (главный пункт партии): Проверяющий видит текстовый diff, и для
-    него строка таблицы, ставшая абзацем со своей нотацией "r0c0:...", и
-    настоящая строка таблицы неотличимы — обе выглядят как добавившийся
-    текст с нужными словами. Здесь код проверяет по СТРУКТУРНЫМ полям блока
-    (kind/rows/level/style/list/footnotes/fields — они читаются parse.py
-    прямо из XML), что изменение того КЛАССА, который назвал Навигатор в
-    "trace", а не просто "текст изменился". None — след найден, иначе
-    честный текст отказа.
+_TRACE_PRODUCING_OPS = {
+    # В11 (находка Н66, «В1 инвертирован»): операции, СПОСОБНЫЕ оставить
+    # заявленный trace — "heading" проверяется отдельно ниже (нужен ещё и
+    # стиль операции, не только её имя).
+    "table": {"create_table", "insert_row", "delete_row", "insert_col", "delete_col", "set_cell"},
+    "list": {"set_list", "set_list_level"},
+    "footnote": {"footnote"},
+    "field": {"field"},
+    "header_footer": {"set_header_footer"},
+}
+# Операции, способные ВНЕСТИ новый или переписанный текст, которым можно
+# подделать структурный след (вписать «r0c0:...» вместо строки таблицы,
+# поставить одинокий заголовок вместо настоящего раздела). Точечные правки
+# существующего текста (replace_text/set_format/…) под эту категорию не
+# попадают — ими нельзя «нарисовать» новую структуру, разве что исказить
+# существующую, а это уже отдельный контроль (heading+text, список и т.д.).
+_CONTENT_FORGE_OPS = {"insert_after", "insert_paragraphs", "create_table", "insert_row", "insert_col", "set_text"}
+
+
+def _is_heading_style(style):
+    return bool(style) and (style.startswith("Heading") or style == "Title")
+
+
+def _trace_op_applied(trace, applied_ops):
+    """True — среди РЕАЛЬНО применённых операций (не среди того, что Навигатор
+    ЗАЯВИЛ в trace) есть хотя бы одна, способная оставить заявленный след.
+    "heading" проверяется по стилю операции (set_style/insert_after/
+    insert_paragraphs на Heading*/Title), "table" отдельно ловит "delete"
+    целой таблицы (op.get("id") указывал на блок kind="t" в before)."""
+    if trace == "heading":
+        for op in applied_ops:
+            name = op.get("op")
+            if name in ("set_style", "insert_after") and _is_heading_style(op.get("style")):
+                return True
+            if name == "insert_paragraphs" and any(_is_heading_style(it.get("style")) for it in op.get("items") or []):
+                return True
+        return False
+    return any(op.get("op") in _TRACE_PRODUCING_OPS.get(trace, ()) for op in applied_ops)
+
+
+def _trace_error(trace, before, after, doc=None, applied_ops=()):
+    """В1/В11 (находка Н66, «В1 инвертирован»): Проверяющий видит текстовый
+    diff, и для него строка таблицы, ставшая абзацем со своей нотацией
+    "r0c0:...", и настоящая строка таблицы неотличимы — обе выглядят как
+    добавившийся текст с нужными словами. Раньше код проверял, СОВПАЛО ЛИ
+    итоговое структурное состояние документа с ярлыком trace, который
+    выдал Навигатор, — но Навигатор ошибается в классификации чаще, чем
+    кажется (26B), и правки, реально выполненные ПРАВИЛЬНОЙ операцией,
+    отказывались из-за чужой ошибки ярлыка (замер w18: `colbert#9`/`math#4`
+    — реальный `set_style` на Heading１/2 отказан как "ни один абзац не стал
+    заголовком", потому что абзац УЖЕ нёс `w:outlineLvl` до правки — код
+    искал ПЕРЕХОД в heading, а не факт применения нужной операции; `colbert#16`
+    — Навигатор наугад проставил trace=table абзацу с правкой формул, где
+    таблицы вообще не было в деле). Это прямое нарушение инварианта 4
+    (модель предлагает — код проверяет, а не наоборот).
+
+    Починка: код смотрит на СДЕЛАННОЕ — какие операции реально применились
+    (`applied_ops`), а не на итоговое состояние относительно ярлыка.
+    Однозначная подпись подделки — trace заявлен, а НИ ОДНА применённая
+    операция не способна его оставить (`_trace_op_applied`), И среди
+    применённого есть операция, СПОСОБНАЯ подделать структуру текстом
+    (`_CONTENT_FORGE_OPS` — insert_after/insert_paragraphs/set_text/…): это
+    ровно форма обеих лжей прогона за рулём («нарисовать» строку/заголовок
+    текстом вместо настоящей операции). Если ничего из «подделывающих»
+    операций не применялось вовсе (например правка вообще не про trace —
+    как `colbert#16`, где шли только replace_text по формулам) — заявленным
+    классом просто нечего было подделать, отказывать не за что, ярлык
+    Навигатора в этом случае действительно не имеет значения.
 
     Замкнутый словарь (Навигатор ограничен им в _NAV_PROMPT): null (правка
     без структурных ожиданий, доп. проверки нет), "table", "heading",
     "heading+text" (новый РАЗДЕЛ — заголовок И текст, минимум два новых
-    абзаца: живой прогон поймал модель на одном Heading 1 без абзаца текста
-    после него), "list", "footnote", "field" (В2-бис — поле Word: PAGE/
-    NUMPAGES/DATE/TOC/REF), "header_footer" (В2-бис — колонтитул стал
-    отдельной частью пакета). Значение вне словаря не проверяется — один
-    невиданный ярлык 26B-модели не должен рубить верную правку.
-
-    doc нужен ТОЛЬКО для "header_footer": колонтитул не часть doc_map(),
-    его след — не в блоках, а в doc.sections (part + w:sectPr-ссылка) —
-    остальные классы проверяются по before/after, doc не трогают.
+    абзаца — проверяется ПО-СТАРОМУ, через before/after, см. ниже: этого
+    дефекта её логика не касалась), "list", "footnote", "field" (В2-бис),
+    "header_footer" (В2-бис). Значение вне словаря не проверяется.
 
     Вызывается ДО Проверяющего (см. _finish) — несовпавший trace вообще не
-    тратит вызов модели: диагноз (BUILD_PLAN_V2 «Диагноз») явно требует,
-    чтобы класс изменения проверял код, а не промпт Проверяющего."""
+    тратит вызов модели."""
     if not trace:
         return None
-    b_by_id = {b["id"]: b for b in before}
-    a_by_id = {b["id"]: b for b in after}
-
-    if trace == "table":
-        for i, blk in a_by_id.items():
-            if blk["kind"] == "t" and (i not in b_by_id or b_by_id[i]["rows"] != blk["rows"]):
-                return None
-        if any(b["kind"] == "t" and i not in a_by_id for i, b in b_by_id.items()):
-            return None
-        return ("правка названа табличной (trace=table), но ни одна таблица в документе не "
-                "изменилась — похоже на подделку текстом вместо реальной правки таблицы")
-
-    if trace == "heading":
-        for i, blk in a_by_id.items():
-            if blk["kind"] == "p" and _is_heading(blk) and not (i in b_by_id and _is_heading(b_by_id[i])):
-                return None
-        return ("правка названа заголовком раздела (trace=heading), но ни один абзац не стал "
-                "и не появился заголовком (стиль Heading*/Title или структурный уровень)")
 
     if trace == "heading+text":
+        # Единственная ветка, не задетая находкой Н66 — она и раньше смотрела
+        # на НОВЫЕ абзацы (вставку раздела), а не на переход "стало героем"
+        # относительно before, поэтому ложного отказа тут не было и менять
+        # логику незачем (regression control: test_trace_heading_text_*).
+        b_by_id = {b["id"]: b for b in before}
+        a_by_id = {b["id"]: b for b in after}
         has_heading = has_body = False
         for i, blk in a_by_id.items():
             if blk["kind"] != "p" or i in b_by_id:
@@ -524,38 +564,42 @@ def _trace_error(trace, before, after, doc=None):
                 "появился только заголовок без текста раздела (или наоборот) — новый раздел это "
                 "минимум ДВА новых абзаца (insert_paragraphs), а не один")
 
-    if trace == "list":
-        for i, blk in a_by_id.items():
-            if blk["kind"] == "p" and blk.get("list") != (b_by_id.get(i) or {}).get("list"):
-                return None
-        return ("правка названа списочной (trace=list), но принадлежность/уровень списка "
-                "(numPr) ни одного абзаца не изменились")
+    if trace not in ("table", "heading", "list", "footnote", "field", "header_footer"):
+        return None
 
-    if trace == "footnote":
-        before_fn = sum(b.get("footnotes", 0) for b in before if b["kind"] == "p")
-        after_fn = sum(b.get("footnotes", 0) for b in after if b["kind"] == "p")
-        if after_fn > before_fn:
+    if _trace_op_applied(trace, applied_ops):
+        return None
+
+    # "table"-исключение: целая таблица удалена операцией delete — это тоже
+    # законный способ выполнить правку про таблицу, а "delete" сам по себе не
+    # входит в _TRACE_PRODUCING_OPS (она удаляет ЛЮБОЙ блок, не только таблицы).
+    if trace == "table":
+        b_by_id = {b["id"]: b for b in before}
+        if any(op.get("op") == "delete" and (b_by_id.get(op.get("id")) or {}).get("kind") == "t"
+               for op in applied_ops):
             return None
-        return ("правка названа сноской (trace=footnote), но число footnoteReference в "
-                "документе не выросло")
 
-    if trace == "field":
-        before_f = sum(b.get("fields", 0) for b in before if b["kind"] == "p")
-        after_f = sum(b.get("fields", 0) for b in after if b["kind"] == "p")
-        if after_f > before_f:
-            return None
-        return ("правка названа полем Word (trace=field), но число полей (w:fldSimple/w:fldChar) "
-                "в документе не выросло")
+    if not any(op.get("op") in _CONTENT_FORGE_OPS for op in applied_ops):
+        # Среди применённого нет ничего, чем можно подделать структуру текстом
+        # (только точечные правки существующего содержимого, например
+        # replace_text по формулам) — заявленным классом нечего было
+        # подделать, ярлык Навигатора здесь просто неточен, а не подделка.
+        return None
 
-    if trace == "header_footer":
-        sec = doc.sections[-1]
-        if not sec.header.is_linked_to_previous or not sec.footer.is_linked_to_previous:
-            return None
-        return ("правка названа колонтитульной (trace=header_footer), но ни верхний, ни нижний "
-                "колонтитул не стали отдельной частью документа (нет своей части пакета/ссылки в "
-                "w:sectPr)")
-
-    return None
+    _REASONS = {
+        "table": ("правка названа табличной (trace=table), но ни одна операция над таблицей не "
+                  "применилась — похоже на подделку текстом вместо реальной правки таблицы"),
+        "heading": ("правка названа заголовком раздела (trace=heading), но ни одна операция не "
+                    "поставила абзацу стиль заголовка (Heading*/Title)"),
+        "list": ("правка названа списочной (trace=list), но ни одна операция не изменила "
+                 "принадлежность/уровень списка (numPr)"),
+        "footnote": "правка названа сноской (trace=footnote), но сноска Word не была добавлена",
+        "field": ("правка названа полем Word (trace=field), но поле (w:fldSimple/w:fldChar) не "
+                  "было добавлено"),
+        "header_footer": ("правка названа колонтитульной (trace=header_footer), но колонтитул не был "
+                           "изменён отдельной операцией — похоже на подделку абзацем в теле документа"),
+    }
+    return _REASONS[trace]
 
 
 def _struct_note(b, a):
@@ -833,13 +877,19 @@ def _redundant_in_batch(op, idx, written):
     return False
 
 
-def _apply_ops(doc, idx, ops, fragment_text, request, editor, fragment_ids=None, written=None):
+def _apply_ops(doc, idx, ops, fragment_text, request, editor, fragment_ids=None, written=None, ops_out=None):
     """Применяет ops по очереди; на невалидной операции — один ретрай к
     Редактору с текстом ошибки (editor=None — ретрая нет, путь rule). Второй
     провал (или провал без Редактора) останавливает применение немедленно.
     Возвращает (описания применённых операций, причина отказа-или-None,
     tries) — tries=2, если к Редактору пришлось обращаться повторно
     (для журнала правки, поле "iter"), иначе 1.
+
+    ops_out (В11, находка Н66) — необязательный список, в который, помимо
+    текстовых описаний, копится СЫРОЙ op каждой успешно применённой операции
+    (в порядке применения). Нужен `_trace_error`, чтобы проверять СДЕЛАННОЕ
+    (какого рода операции реально применились), а не верить ярлыку `trace`
+    Навигатора — описания в `applied` для этого не годятся, там только текст.
 
     fragment_ids=None — гвард выключен (путь rule: editor=None, id-полей у
     normalize нет). Иначе — set id блоков фрагмента, который видел Редактор;
@@ -889,6 +939,8 @@ def _apply_ops(doc, idx, ops, fragment_text, request, editor, fragment_ids=None,
         if err is None:
             before_ids = set(idx)
             applied.append(patch.apply(doc, idx, op))
+            if ops_out is not None:
+                ops_out.append(op)
             if fragment_ids is not None:
                 fragment_ids |= set(idx) - before_ids
             if targets:
@@ -986,7 +1038,8 @@ def _hf_state(doc):
     return (sec.header.is_linked_to_previous, sec.footer.is_linked_to_previous)
 
 
-def _finish(doc, idx, snapshot_path, blocks_before, applied, request, checker, nav, editor_reply, tries, hf_before=None):
+def _finish(doc, idx, snapshot_path, blocks_before, applied, request, checker, nav, editor_reply, tries,
+            hf_before=None, applied_ops=()):
     """Общий хвост ПОСЛЕ применения операций — общий и для одного вызова
     Редактора, и для нескольких (см. _run_clusters): diff по всему снимку →
     Проверяющий → вердикт → коммит/откат. Ровно один снимок, один diff, один
@@ -1001,7 +1054,11 @@ def _finish(doc, idx, snapshot_path, blocks_before, applied, request, checker, n
     рядом с blocks_before. Колонтитул НЕ часть doc_map() (см. «Контракты» в
     BUILD_PLAN.md) — правка, менявшая только его, всегда даёт ПУСТОЙ
     текстовый diff тела документа, и без этого параметра честная правка
-    неотличима от «ничего не изменилось» (item A)."""
+    неотличима от «ничего не изменилось» (item A).
+
+    applied_ops (В11, находка Н66) — сырые op РЕАЛЬНО применённых операций
+    (см. _apply_ops/ops_out), нужны _trace_error, чтобы проверять СДЕЛАННОЕ,
+    а не верить ярлыку trace от Навигатора."""
     blocks_after = doc_map(doc, idx)
     diff = _diff(blocks_before, blocks_after)
     hf_changed = hf_before is not None and hf_before != _hf_state(doc)
@@ -1009,10 +1066,11 @@ def _finish(doc, idx, snapshot_path, blocks_before, applied, request, checker, n
         doc, idx = _restore(snapshot_path)
         return None, doc, idx, tries
 
-    # В1: класс изменения проверяется КОДОМ по XML раньше, чем тратится вызов
-    # Проверяющего — он видит только текстовый diff и не отличит строку
-    # таблицы, ставшую абзацем, от настоящей строки (см. _trace_error).
-    trace_err = _trace_error(nav.get("trace"), blocks_before, blocks_after, doc)
+    # В1: класс изменения проверяется КОДОМ по РЕАЛЬНО применённым операциям
+    # раньше, чем тратится вызов Проверяющего — он видит только текстовый
+    # diff и не отличит строку таблицы, ставшую абзацем, от настоящей строки
+    # (см. _trace_error).
+    trace_err = _trace_error(nav.get("trace"), blocks_before, blocks_after, doc, applied_ops)
     if trace_err is not None:
         doc, idx = _restore(snapshot_path)
         reply = {"nav": nav, "editor": editor_reply}
@@ -1061,13 +1119,15 @@ def _apply_and_check(doc, idx, ops, fragment_text, request, use_editor, nav, edi
     (единственным путём для локальных правок через Редактора)."""
     snapshot_path = _snapshot(doc)
     blocks_before = doc_map(doc, idx)
-    applied, err, tries = _apply_ops(doc, idx, ops, fragment_text, request, use_editor)
+    ops_applied = []
+    applied, err, tries = _apply_ops(doc, idx, ops, fragment_text, request, use_editor, ops_out=ops_applied)
 
     if not applied:
         doc, idx = _restore(snapshot_path)
         return _failed(err or "ни одна операция не применилась", nav, editor_reply, tries, applied), doc, idx, tries
 
-    return _finish(doc, idx, snapshot_path, blocks_before, applied, request, checker, nav, editor_reply, tries)
+    return _finish(doc, idx, snapshot_path, blocks_before, applied, request, checker, nav, editor_reply, tries,
+                    applied_ops=ops_applied)
 
 
 def _cluster(blocks, ids, around=1):
@@ -1151,6 +1211,7 @@ def _run_clusters(doc, idx, blocks, ids, request, editor, checker, nav, fallthro
     inventory = _variant_inventory(blocks, nav, request)
 
     applied_all, editor_replies, tries_total, partial, replace_all_seen = [], [], 0, False, set()
+    ops_all = []  # В11: сырые op успешно применённых операций, см. _apply_ops/ops_out и _trace_error
     written = {}  # общий на все кластеры правки, см. _apply_ops
     try:
         for cluster_ids in clusters:
@@ -1202,7 +1263,7 @@ def _run_clusters(doc, idx, blocks, ids, request, editor, checker, nav, fallthro
             replace_all_seen |= {(o.get("old"), o.get("new")) for o in ops if o.get("op") == "replace_all"}
             if not ops:
                 continue
-            applied, err, cluster_tries = _apply_ops(doc, idx, ops, fragment_text, request, editor, fragment_ids, written)
+            applied, err, cluster_tries = _apply_ops(doc, idx, ops, fragment_text, request, editor, fragment_ids, written, ops_out=ops_all)
             tries_total += cluster_tries - 1  # первый вызов кластера уже посчитан выше, тут доучитывается только ретрай
             applied_all += applied
             if err is not None:
@@ -1251,7 +1312,8 @@ def _run_clusters(doc, idx, blocks, ids, request, editor, checker, nav, fallthro
                 "ids": [d["id"] for d in diff_all], "iter": tries_total,
                 "reply": {"nav": nav, "editor": editor_replies}}, doc, idx
 
-    result, doc, idx, tries = _finish(doc, idx, snapshot_path, blocks_before, applied_all, request, checker, nav, editor_replies, tries_total, hf_before)
+    result, doc, idx, tries = _finish(doc, idx, snapshot_path, blocks_before, applied_all, request, checker, nav,
+                                       editor_replies, tries_total, hf_before, ops_all)
     if result is not None:
         return result, doc, idx
     return _failed("операции применились, но текст не изменился", nav, editor_replies, tries), doc, idx
