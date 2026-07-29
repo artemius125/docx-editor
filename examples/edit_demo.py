@@ -335,6 +335,53 @@ def test_checker_exception_restores_document_and_cleans_snapshot():
     print("edit_demo: исключение Проверяющего долетает наружу, doc восстановлен на месте, снимок не течёт")
 
 
+def test_editor_exception_mid_batch_restores_earlier_cluster():
+    # В11 (замер w18, colbert#4/math#4): обрыв транспорта у Редактора ВТОРОГО
+    # кластера — уже ПОСЛЕ того, как первый кластер успешно применил set_style
+    # к живому doc, — раньше улетал наружу, минуя восстановление: doc
+    # оставался наполовину мутированным, а вызывающий (bench/server.py),
+    # ретраящий ТУ ЖЕ правку на ТЕХ ЖЕ doc/idx, получал уже испорченный
+    # документ и не знал об этом. Стиль первого кластера обязан откатиться
+    # ТАК ЖЕ, как checker-исключение откатывает текст (см. тест выше).
+    doc = Document()
+    for i in range(12):
+        doc.add_paragraph(f"Абзац {i}: обычный текст.")
+    idx = index(doc)
+    before_styles = [b["style"] for b in doc_map(doc, idx)]
+
+    def fake_navigator(outline_text, request):
+        return {"kind": "local", "rule": None, "ids": ["p0", "p8"], "anchors": []}
+
+    calls = []
+
+    def fake_editor(fragment_text, request, feedback=None):
+        calls.append(fragment_text)
+        if len(calls) == 1:
+            return {"ops": [{"op": "set_style", "id": "p0", "style": "Heading 1"}]}
+        raise ConnectionError("обрыв транспорта на втором кластере (тест)")
+
+    def no_checker(request, diff):
+        raise AssertionError("до Проверяющего дойти не должно — исключение случается раньше")
+
+    raised = False
+    try:
+        run_edit(
+            doc, idx, "сделай оба абзаца заголовками",
+            navigator=fake_navigator, editor=fake_editor, checker=no_checker,
+        )
+    except ConnectionError:
+        raised = True
+
+    assert raised, "исключение Редактора обязано долететь наружу, а не проглотиться"
+    assert len(calls) == 2, "второй кластер обязан был получить свой вызов Редактора"
+    after_styles = [b["style"] for b in doc_map(doc, idx)]
+    assert after_styles == before_styles, (
+        "стиль p0, применённый первым кластером, обязан откатиться при исключении второго: "
+        f"{after_styles}"
+    )
+    print("edit_demo: исключение Редактора между кластерами откатывает уже применённый первый кластер")
+
+
 def test_set_style_diff_reaches_checker():
     # Change A: _diff раньше сравнивал только текст — set_style была ей
     # невидима, Проверяющий получал пустой diff, и run_edit откатывал правку
@@ -2574,6 +2621,7 @@ if __name__ == "__main__":
     test_non_rule_empty_diff_stays_failed()
     test_quoted_phrase_always_merges_with_navigator_hit()
     test_checker_exception_restores_document_and_cleans_snapshot()
+    test_editor_exception_mid_batch_restores_earlier_cluster()
     test_set_style_diff_reaches_checker()
     test_diff_move_and_insert()
     test_set_list_level_diff_reaches_checker()

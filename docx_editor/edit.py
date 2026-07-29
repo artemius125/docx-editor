@@ -1152,63 +1152,78 @@ def _run_clusters(doc, idx, blocks, ids, request, editor, checker, nav, fallthro
 
     applied_all, editor_replies, tries_total, partial, replace_all_seen = [], [], 0, False, set()
     written = {}  # общий на все кластеры правки, см. _apply_ops
-    for cluster_ids in clusters:
-        pre_cluster = doc_map(doc, idx)
-        frag_blocks = find.fragment(pre_cluster, cluster_ids, around=1)
-        if not frag_blocks:
-            # Ф16, item 3: цели этого кластера уже пропали (удалены/слиты более
-            # ранним кластером) — пустой фрагмент даёт ПУСТОЕ множество
-            # fragment_ids, гвард полосы активен и отклонит любой ответ
-            # Редактора; тупик, ретрай не спасает. Пропускаем кластер честно.
-            continue
-        fragment_text = render(frag_blocks)
-        # ПАРТИЯ 5: кластеры слепы друг к другу, а текст правки каждый получает
-        # ЦЕЛИКОМ — отсюда двойная работа и откат чужой. Замерено: ColBERT 14
-        # расшифровала MRR@10 дважды в двух кластерах (Проверяющий завернул
-        # всю правку), ColBERT 4 — третий кластер предложил вернуть точку
-        # вместо запятой в числе, которое первый уже исправил. Форма та же,
-        # что у инвентаря вариантов: посчитанная кодом строка в начало
-        # фрагмента, лишнего вызова модели не нужно.
-        if applied_all:
-            done_note = "Уже сделано в этой правке (не повторяй и не отменяй):\n" + "\n".join(
-                f"- {a}" for a in applied_all)
-            fragment_text = f"{done_note}\n\n{fragment_text}"
-        if inventory:
-            fragment_text = f"{inventory}\n\n{fragment_text}"
-        if len(fragment_text) > _FRAGMENT_CHAR_LIMIT:
-            # Ф20: гвард объёма. compose собирает фрагмент из ВСЕХ резолвленных
-            # целей сразу (single_cluster выше) — именно здесь фрагмент способен
-            # вырасти настолько, что уйдёт за окно модели. Честный отказ вместо
-            # переполнения контекста (ContextWindowExceededError уже случался,
-            # см. Ф13-бис) — код заранее знает размер строки, которую собирается
-            # отправить, доказывать это вызовом не нужно.
-            doc, idx = _restore(snapshot_path)
-            reason = (f"фрагмент для этой правки слишком большой: {len(fragment_text)} знаков "
-                      f"(порог {_FRAGMENT_CHAR_LIMIT}) — не поместится в контекст модели, правка отклонена")
-            return _failed(reason, nav, editor_replies, tries_total, applied_all), doc, idx
-        fragment_ids = {b["id"] for b in frag_blocks}
-        reply = editor(fragment_text, request) or {}
-        editor_replies.append(reply)
-        tries_total += 1
-        ops = _clean_ops(reply.get("ops"))
-        # Ф16, item 1: replace_all документ-широкая, и каждый кластер видит
-        # ПОЛНЫЙ текст правки — один и тот же replace_all может прийти от
-        # нескольких кластеров подряд (written внутри _apply_ops этого не
-        # ловит, он заводится заново на каждый вызов). Повтор молча не меняет
-        # текст, diff кластера пуст → partial → откатывает уже верную работу
-        # более раннего кластера. Дедуплицируем по (old, new) между кластерами.
-        ops = [o for o in ops if o.get("op") != "replace_all" or (o.get("old"), o.get("new")) not in replace_all_seen]
-        replace_all_seen |= {(o.get("old"), o.get("new")) for o in ops if o.get("op") == "replace_all"}
-        if not ops:
-            continue
-        applied, err, cluster_tries = _apply_ops(doc, idx, ops, fragment_text, request, editor, fragment_ids, written)
-        tries_total += cluster_tries - 1  # первый вызов кластера уже посчитан выше, тут доучитывается только ретрай
-        applied_all += applied
-        if err is not None:
-            doc, idx = _restore(snapshot_path)
-            return _failed(err, nav, editor_replies, tries_total, applied_all), doc, idx
-        if not _diff(pre_cluster, doc_map(doc, idx)):
-            partial = True  # ops применились без ошибки, но эта цель по факту не обработана
+    try:
+        for cluster_ids in clusters:
+            pre_cluster = doc_map(doc, idx)
+            frag_blocks = find.fragment(pre_cluster, cluster_ids, around=1)
+            if not frag_blocks:
+                # Ф16, item 3: цели этого кластера уже пропали (удалены/слиты более
+                # ранним кластером) — пустой фрагмент даёт ПУСТОЕ множество
+                # fragment_ids, гвард полосы активен и отклонит любой ответ
+                # Редактора; тупик, ретрай не спасает. Пропускаем кластер честно.
+                continue
+            fragment_text = render(frag_blocks)
+            # ПАРТИЯ 5: кластеры слепы друг к другу, а текст правки каждый получает
+            # ЦЕЛИКОМ — отсюда двойная работа и откат чужой. Замерено: ColBERT 14
+            # расшифровала MRR@10 дважды в двух кластерах (Проверяющий завернул
+            # всю правку), ColBERT 4 — третий кластер предложил вернуть точку
+            # вместо запятой в числе, которое первый уже исправил. Форма та же,
+            # что у инвентаря вариантов: посчитанная кодом строка в начало
+            # фрагмента, лишнего вызова модели не нужно.
+            if applied_all:
+                done_note = "Уже сделано в этой правке (не повторяй и не отменяй):\n" + "\n".join(
+                    f"- {a}" for a in applied_all)
+                fragment_text = f"{done_note}\n\n{fragment_text}"
+            if inventory:
+                fragment_text = f"{inventory}\n\n{fragment_text}"
+            if len(fragment_text) > _FRAGMENT_CHAR_LIMIT:
+                # Ф20: гвард объёма. compose собирает фрагмент из ВСЕХ резолвленных
+                # целей сразу (single_cluster выше) — именно здесь фрагмент способен
+                # вырасти настолько, что уйдёт за окно модели. Честный отказ вместо
+                # переполнения контекста (ContextWindowExceededError уже случался,
+                # см. Ф13-бис) — код заранее знает размер строки, которую собирается
+                # отправить, доказывать это вызовом не нужно.
+                doc, idx = _restore(snapshot_path)
+                reason = (f"фрагмент для этой правки слишком большой: {len(fragment_text)} знаков "
+                          f"(порог {_FRAGMENT_CHAR_LIMIT}) — не поместится в контекст модели, правка отклонена")
+                return _failed(reason, nav, editor_replies, tries_total, applied_all), doc, idx
+            fragment_ids = {b["id"] for b in frag_blocks}
+            reply = editor(fragment_text, request) or {}
+            editor_replies.append(reply)
+            tries_total += 1
+            ops = _clean_ops(reply.get("ops"))
+            # Ф16, item 1: replace_all документ-широкая, и каждый кластер видит
+            # ПОЛНЫЙ текст правки — один и тот же replace_all может прийти от
+            # нескольких кластеров подряд (written внутри _apply_ops этого не
+            # ловит, он заводится заново на каждый вызов). Повтор молча не меняет
+            # текст, diff кластера пуст → partial → откатывает уже верную работу
+            # более раннего кластера. Дедуплицируем по (old, new) между кластерами.
+            ops = [o for o in ops if o.get("op") != "replace_all" or (o.get("old"), o.get("new")) not in replace_all_seen]
+            replace_all_seen |= {(o.get("old"), o.get("new")) for o in ops if o.get("op") == "replace_all"}
+            if not ops:
+                continue
+            applied, err, cluster_tries = _apply_ops(doc, idx, ops, fragment_text, request, editor, fragment_ids, written)
+            tries_total += cluster_tries - 1  # первый вызов кластера уже посчитан выше, тут доучитывается только ретрай
+            applied_all += applied
+            if err is not None:
+                doc, idx = _restore(snapshot_path)
+                return _failed(err, nav, editor_replies, tries_total, applied_all), doc, idx
+            if not _diff(pre_cluster, doc_map(doc, idx)):
+                partial = True  # ops применились без ошибки, но эта цель по факту не обработана
+    except Exception:
+        # В11 (находка): editor() зовётся ПОСЛЕ того, как более ранние кластеры
+        # этого же батча уже мутировали doc через patch.apply. Раньше исключение
+        # из этого вызова (например обрыв транспорта) улетало наружу СРАЗУ, минуя
+        # весь код восстановления ниже (он написан как return-путь, а не
+        # try/except) — doc оставался мутированным напополовину, а вызывающий
+        # (bench/run_seq.py, run.py, server.py) при ретрае той же правки на тех
+        # же doc/idx получал уже испорченный документ и не знал об этом (замер
+        # w18: colbert#4 и math#4 — верные по кластеру правки survived в файле
+        # под вердиктом failed/rolled_back). Восстанавливаем ТЕ ЖЕ doc/idx на
+        # месте (см. _restore_in_place — обычный _restore тут не годится, мы не
+        # можем сделать return из except) и поднимаем исходное исключение дальше.
+        _restore_in_place(doc, idx, snapshot_path)
+        raise
 
     if not applied_all:
         doc, idx = _restore(snapshot_path)
