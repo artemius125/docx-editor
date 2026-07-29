@@ -1053,6 +1053,31 @@ def _hf_state(doc):
     return (sec.header.is_linked_to_previous, sec.footer.is_linked_to_previous)
 
 
+def _move_no_op_error(applied_ops, before, after):
+    """В11 (находка Н68): «перенеси пункт про окно на первое место» дала два
+    move_after, которые в сумме вернули список в исходный порядок — оба
+    применились без ошибки (patch.apply не бросает исключение просто потому,
+    что итог оказался бессмысленным), и вердикт был done. Код обязан судить
+    по ИТОГОВОМУ порядку конкретно ПЕРЕМЕЩАЕМЫХ id, а не по факту применения
+    операции: если КАЖДЫЙ id, который двигала хотя бы одна move_after этого
+    батча, оказался на ТОЙ ЖЕ позиции, что и до правки, — перенос отменил сам
+    себя, реально ничего не переместилось. Позиция сравнивается по индексу в
+    полном списке блоков (move_after не меняет состав id, только порядок).
+    None — хотя бы один из перемещаемых id реально сменил позицию (обычный
+    случай), проверять больше нечего."""
+    moved_ids = {op["id"] for op in applied_ops if op.get("op") == "move_after"}
+    if not moved_ids:
+        return None
+    pos_before = {b["id"]: i for i, b in enumerate(before)}
+    pos_after = {b["id"]: i for i, b in enumerate(after)}
+    if any(pos_before.get(i) != pos_after.get(i) for i in moved_ids):
+        return None
+    return ("правка перемещает " + ", ".join(sorted(moved_ids)) + ", но итоговая позиция "
+            + ("этого блока" if len(moved_ids) == 1 else "этих блоков")
+            + " в документе совпадает с исходной — перенос отменил сам себя, "
+              "фактически ничего не переместилось")
+
+
 def _finish(doc, idx, snapshot_path, blocks_before, applied, request, checker, nav, editor_reply, tries,
             hf_before=None, applied_ops=()):
     """Общий хвост ПОСЛЕ применения операций — общий и для одного вызова
@@ -1071,9 +1096,10 @@ def _finish(doc, idx, snapshot_path, blocks_before, applied, request, checker, n
     текстовый diff тела документа, и без этого параметра честная правка
     неотличима от «ничего не изменилось» (item A).
 
-    applied_ops (В11, находка Н66) — сырые op РЕАЛЬНО применённых операций
-    (см. _apply_ops/ops_out), нужны _trace_error, чтобы проверять СДЕЛАННОЕ,
-    а не верить ярлыку trace от Навигатора."""
+    applied_ops (В11, находки Н66/Н68) — сырые op РЕАЛЬНО применённых операций
+    (см. _apply_ops/ops_out), нужны _trace_error (проверять СДЕЛАННОЕ, а не
+    верить ярлыку trace от Навигатора) и _move_no_op_error (перенос, отменивший
+    сам себя, не должен считаться перемещением)."""
     blocks_after = doc_map(doc, idx)
     diff = _diff(blocks_before, blocks_after)
     hf_changed = hf_before is not None and hf_before != _hf_state(doc)
@@ -1090,6 +1116,15 @@ def _finish(doc, idx, snapshot_path, blocks_before, applied, request, checker, n
         doc, idx = _restore(snapshot_path)
         reply = {"nav": nav, "editor": editor_reply}
         return ({"verdict": "failed", "reason": trace_err, "applied": applied, "ids": [],
+                  "iter": tries, "reply": reply}, doc, idx, tries)
+
+    # Н68: move_after, применившийся без ошибки, ещё не значит «переместил» —
+    # судим по итоговой позиции конкретно перемещаемых id, не по факту apply.
+    move_err = _move_no_op_error(applied_ops, blocks_before, blocks_after)
+    if move_err is not None:
+        doc, idx = _restore(snapshot_path)
+        reply = {"nav": nav, "editor": editor_reply}
+        return ({"verdict": "failed", "reason": move_err, "applied": applied, "ids": [],
                   "iter": tries, "reply": reply}, doc, idx, tries)
 
     if not diff:

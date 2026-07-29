@@ -446,6 +446,48 @@ def test_diff_move_and_insert():
     print("edit_demo: move_after даёт ровно одну запись в diff, insert_after не даёт ложных move-записей")
 
 
+def test_move_that_cancels_itself_is_not_done():
+    # Н68 (живой прогон): «перенеси пункт про окно на первое место» дала два
+    # move_after на ТОТ ЖЕ блок (сначала после C, потом обратно после B) —
+    # итоговая позиция блока совпала с исходной, перенос отменил сам себя, а
+    # вердикт был done. patch.apply не бросает исключение просто потому, что
+    # итог бессмыслен — судить обязан код по ИТОГОВОЙ позиции, не по факту
+    # применения. Батч несёт ЕЩЁ и настоящую правку текста (typo), чтобы diff
+    # был непустым и правка не перехватывалась более ранним гвардом «текст не
+    # изменился» — проверяем именно новый, более точный, гвард переноса.
+    doc = Document()
+    for t in ("Пункт А.", "Пункт Б.", "Пункт про окно.", "Пункт В."):
+        doc.add_paragraph(t)
+    doc.add_paragraph("Тут опечтака в отдельном абзаце.")
+    idx = index(doc)
+
+    def fake_navigator(outline_text, request):
+        return {"kind": "local", "rule": None, "ids": ["p2", "p4"], "anchors": []}
+
+    def fake_editor(fragment_text, request, feedback=None):
+        return {"ops": [
+            {"op": "move_after", "id": "p2", "after": "p3"},  # сначала уводит "окно" в конец списка
+            {"op": "move_after", "id": "p2", "after": "p1"},  # и тут же возвращает его на исходное место
+            {"op": "replace_text", "id": "p4", "old": "опечтака", "new": "опечатка"},
+        ]}
+
+    def no_checker(request, diff):
+        raise AssertionError("гвард переноса обязан отказать ДО вызова Проверяющего")
+
+    result, doc, idx = run_edit(
+        doc, idx, "Перенеси пункт про окно на первое место и заодно поправь опечатку.",
+        navigator=fake_navigator, editor=fake_editor, checker=no_checker,
+    )
+
+    assert result["verdict"] == "failed", result
+    assert "отменил сам себя" in result["reason"], result["reason"]
+    texts = [b["text"] for b in doc_map(doc, idx)]
+    assert texts[2] == "Пункт про окно." and "опечтака" in texts[4], (
+        "документ обязан остаться нетронутым — самоотменившийся перенос откачен целиком: " + str(texts)
+    )
+    print(f"edit_demo: перенос, отменивший сам себя, не считается перемещением: {result['reason']!r}")
+
+
 def test_set_list_level_diff_reaches_checker():
     # Ф15: set_list_level не трогает текст абзаца вовсе, только w:ilvl —
     # без сравнения b.get("list") != a.get("list") в _struct_note (уже было
@@ -2737,6 +2779,7 @@ if __name__ == "__main__":
     test_editor_exception_mid_batch_restores_earlier_cluster()
     test_set_style_diff_reaches_checker()
     test_diff_move_and_insert()
+    test_move_that_cancels_itself_is_not_done()
     test_set_list_level_diff_reaches_checker()
     test_rule_fallthrough_to_editor_done()
     test_rule_fallthrough_editor_declines_stays_already()
