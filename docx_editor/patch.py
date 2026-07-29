@@ -2,11 +2,19 @@
 
 Патч — список операций из контракта BUILD_PLAN.md: replace_text, set_text,
 insert_after, delete, move_after, set_style, create_table, set_cell, normalize,
-replace_all, плюс из Ф15 — set_format (начертание рана), set_list_level
-(уровень вложенности уже существующего списка) и footnote (настоящая сноска
-Word: footnotes.xml + связь в .rels + w:footnoteReference в теле), плюс из
-Ф19-бис — set_list (обычный абзац становится элементом списка через уже
-существующую в документе нумерацию).
+replace_all, плюс из Ф15 — set_format (начертание рана — абзаца ИЛИ, с В2,
+ячейки таблицы), set_list_level (уровень вложенности уже существующего
+списка) и footnote (настоящая сноска Word: footnotes.xml + связь в .rels +
+w:footnoteReference в теле), плюс из Ф19-бис — set_list (обычный абзац
+становится элементом списка через уже существующую в документе нумерацию).
+
+В2 (дыры контракта, найденные на первом же обычном офисном документе):
+insert_row/delete_row/insert_col/delete_col — строка и колонка СУЩЕСТВУЮЩЕЙ
+таблицы (create_table остаётся только для новой); insert_paragraphs —
+несколько абзацев разными стилями одной операцией («раздел» = заголовок +
+текст); set_format научился адресоваться ячейкой таблицы (id таблицы + row +
+col); validate отбивает буквальный «\\n» в тексте любой операции — этим
+подделывали то, чего нет в контракте (см. диагноз в BUILD_PLAN_V2.md).
 """
 
 from copy import deepcopy
@@ -29,8 +37,12 @@ _OPS = {
     "replace_text", "set_text", "insert_after", "delete", "move_after",
     "set_style", "create_table", "set_cell", "normalize", "replace_all",
     "set_format", "set_list_level", "footnote", "set_list",
+    "insert_row", "delete_row", "insert_col", "delete_col", "insert_paragraphs",
 }
-_PARAGRAPH_ONLY = {"replace_text", "set_text", "set_style", "set_format", "set_list_level", "footnote", "set_list"}
+_PARAGRAPH_ONLY = {"replace_text", "set_text", "set_style", "set_list_level", "footnote", "set_list"}
+# set_format не входит в _PARAGRAPH_ONLY (В2): адресуется и абзацем, и ячейкой
+# таблицы, поэтому проверку его id/kind ведёт собственная ветка validate.
+_TABLE_ONLY = {"set_cell", "insert_row", "delete_row", "insert_col", "delete_col"}
 _NORMALIZE_RULES = {"typography", "quotes"}
 
 
@@ -131,6 +143,43 @@ def _mid_word_error(block_id, old):
     )
 
 
+def _find_newline(value):
+    """Первая строка с буквальным «\\n», найденная внутри value (рекурсивно —
+    поля вроде rows/cells/items несут списки строк или списков строк), или None."""
+    if isinstance(value, str):
+        return value if "\n" in value else None
+    if isinstance(value, list):
+        for v in value:
+            found = _find_newline(v)
+            if found is not None:
+                return found
+    if isinstance(value, dict):
+        for v in value.values():
+            found = _find_newline(v)
+            if found is not None:
+                return found
+    return None
+
+
+def _newline_error(op):
+    """В2, п.4: буквальный перевод строки внутри текста операции — не новый
+    абзац, а именно так модель подделывает то, чего нет в контракте (найдено
+    на «Добавь раздел „6. Пересмотр“» — Heading 1 с «6. Пересмотр\\nРегламент…»
+    внутри одного абзаца). Ошибка называет это прямо, чтобы модель поправилась
+    на insert_paragraphs вместо \\n."""
+    for key, value in op.items():
+        found = _find_newline(value)
+        if found is not None:
+            return (
+                f"поле «{key}» операции {op.get('op')!r} содержит перевод строки (\\n) в тексте "
+                f"«{found}» — перевод строки внутри абзаца не создаёт новый абзац, это ровно то, "
+                f"чем подделывают операцию, которой нет в контракте. Раздели текст на отдельные "
+                f"абзацы через insert_paragraphs (список {{\"text\",\"style\"}}), а не через \\n "
+                f"внутри одной строки."
+            )
+    return None
+
+
 _REQUIRED_TEXT = {
     # Поля-строки, без которых операция не просто бессмысленна, а роняет код:
     # _flex_span(text, None) и _replace_span(..., None) дают TypeError. Модель
@@ -155,14 +204,25 @@ def validate(blocks, op, doc):
     if name not in _OPS:
         return f"неизвестная операция {name!r}; допустимые: {sorted(_OPS)}"
 
+    err = _newline_error(op)
+    if err:
+        return err
+
     by_id = _by_id(blocks)
 
-    if name in _PARAGRAPH_ONLY or name in ("insert_after", "delete", "move_after"):
+    if name in _PARAGRAPH_ONLY or name in ("insert_after", "delete", "move_after", "insert_paragraphs"):
         block_id = op.get("id")
         if block_id not in by_id:
             return f"блок {block_id!r} не найден в документе"
         if name in _PARAGRAPH_ONLY and by_id[block_id]["kind"] != "p":
             return f"{block_id} — это таблица, {name} работает только с абзацами"
+
+    if name in _TABLE_ONLY:
+        block_id = op.get("id")
+        if block_id not in by_id:
+            return f"блок {block_id!r} не найден в документе"
+        if by_id[block_id]["kind"] != "t":
+            return f"{block_id} — это абзац, {name} работает только с таблицами"
 
     if name == "set_text" and _ellipsis_truncation(by_id[block_id]["text"], op.get("text")):
         return _ellipsis_error(block_id)
@@ -171,6 +231,19 @@ def validate(blocks, op, doc):
         err = _style_error(op["style"], doc)
         if err:
             return err
+
+    if name == "insert_paragraphs":
+        items = op.get("items")
+        if not isinstance(items, list) or not items:
+            return "insert_paragraphs: items не может быть пустым списком"
+        for i, item in enumerate(items):
+            if not isinstance(item, dict) or not isinstance(item.get("text"), str):
+                return f"insert_paragraphs: items[{i}] должен быть объектом со строковым полем text"
+            style = item.get("style")
+            if style:
+                err = _style_error(style, doc)
+                if err:
+                    return err
 
     if name == "move_after":
         after = op.get("after")
@@ -189,17 +262,48 @@ def validate(blocks, op, doc):
             return f"create_table: строки разной длины: {[len(r) for r in rows]}"
 
     if name == "set_cell":
-        block_id = op.get("id")
-        if block_id not in by_id:
-            return f"блок {block_id!r} не найден в документе"
-        block = by_id[block_id]
-        if block["kind"] != "t":
-            return f"{block_id} — это абзац, set_cell работает только с таблицами"
+        block = by_id[op["id"]]
         nrows = len(block["rows"])
         ncols = len(block["rows"][0]) if nrows else 0
         row, col = op.get("row"), op.get("col")
         if not (isinstance(row, int) and 0 <= row < nrows) or not (isinstance(col, int) and 0 <= col < ncols):
-            return f"ячейка ({row},{col}) вне таблицы {block_id}: размер {nrows}x{ncols}"
+            return f"ячейка ({row},{col}) вне таблицы {op['id']}: размер {nrows}x{ncols}"
+
+    if name in ("insert_row", "delete_row"):
+        block = by_id[op["id"]]
+        nrows = len(block["rows"])
+        ncols = len(block["rows"][0]) if nrows else 0
+        if name == "insert_row":
+            at = op.get("at")
+            if not (isinstance(at, int) and not isinstance(at, bool) and 0 <= at <= nrows):
+                return f"at должен быть целым числом от 0 до {nrows} (строк в {op['id']}: {nrows}), получено {at!r}"
+            cells = op.get("cells")
+            if not isinstance(cells, list) or len(cells) != ncols or not all(isinstance(v, str) for v in cells):
+                return f"cells должен быть списком из {ncols} строк (по числу колонок {op['id']}), получено {cells!r}"
+        else:
+            row = op.get("row")
+            if not (isinstance(row, int) and not isinstance(row, bool) and 0 <= row < nrows):
+                return f"row вне таблицы {op['id']}: строк {nrows}, получено {row!r}"
+            if nrows <= 1:
+                return f"{op['id']}: нельзя удалить последнюю оставшуюся строку таблицы"
+
+    if name in ("insert_col", "delete_col"):
+        block = by_id[op["id"]]
+        nrows = len(block["rows"])
+        ncols = len(block["rows"][0]) if nrows else 0
+        if name == "insert_col":
+            at = op.get("at")
+            if not (isinstance(at, int) and not isinstance(at, bool) and 0 <= at <= ncols):
+                return f"at должен быть целым числом от 0 до {ncols} (колонок в {op['id']}: {ncols}), получено {at!r}"
+            cells = op.get("cells")
+            if not isinstance(cells, list) or len(cells) != nrows or not all(isinstance(v, str) for v in cells):
+                return f"cells должен быть списком из {nrows} строк (по числу строк {op['id']}), получено {cells!r}"
+        else:
+            col = op.get("col")
+            if not (isinstance(col, int) and not isinstance(col, bool) and 0 <= col < ncols):
+                return f"col вне таблицы {op['id']}: колонок {ncols}, получено {col!r}"
+            if ncols <= 1:
+                return f"{op['id']}: нельзя удалить последнюю оставшуюся колонку таблицы"
 
     for field in _REQUIRED_TEXT.get(name, ()):
         if not isinstance(op.get(field), str):
@@ -240,15 +344,29 @@ def validate(blocks, op, doc):
                 return _mid_word_error(None, old)
 
     if name == "set_format":
+        block_id = op.get("id")
+        if block_id not in by_id:
+            return f"блок {block_id!r} не найден в документе"
         if op.get("b") is None and op.get("i") is None and op.get("u") is None:
-            return f"{op['id']}: не указано ни одного из b/i/u — операция ничего не меняет"
+            return f"{block_id}: не указано ни одного из b/i/u — операция ничего не меняет"
+        block = by_id[block_id]
+        if block["kind"] == "t":
+            # В2, п.3: set_format адресуется ячейкой таблицы (row+col) — то же,
+            # чем set_cell находит ячейку для замены текста.
+            nrows = len(block["rows"])
+            ncols = len(block["rows"][0]) if nrows else 0
+            row, col = op.get("row"), op.get("col")
+            if not (isinstance(row, int) and 0 <= row < nrows) or not (isinstance(col, int) and 0 <= col < ncols):
+                return f"ячейка ({row},{col}) вне таблицы {block_id}: размер {nrows}x{ncols}"
+            text = block["rows"][row][col]
+        else:
+            text = block["text"]
         old = op.get("old")
-        text = by_id[op["id"]]["text"]
         span = _flex_span(text, old)
         if span is None:
-            return f"в {op['id']} нет текста «{old}»"
+            return f"в {block_id} нет текста «{old}»"
         if _mid_word_cut(text, span):
-            return _mid_word_error(op["id"], old)
+            return _mid_word_error(block_id, old)
 
     if name == "footnote":
         if not op.get("text"):
@@ -451,6 +569,21 @@ def _op_insert_after(doc, idx, op):
     return f"После {op['id']} вставлен новый абзац {new_id}"
 
 
+def _op_insert_paragraphs(doc, idx, op):
+    # В2, п.2: «раздел» — заголовок плюс текст, минимум два абзаца двух
+    # стилей одной операцией; без style у элемента — обычный стиль по
+    # умолчанию (в отличие от insert_after, здесь стиль каждого абзаца несёт
+    # смысл операции, наследовать стиль соседа было бы неверно).
+    ref = idx[op["id"]]
+    new_ids = []
+    for item in op["items"]:
+        new_p = doc.add_paragraph(item["text"], style=item.get("style"))
+        ref.addnext(new_p._p)
+        ref = new_p._p
+        new_ids.append(_register(idx, "p", new_p._p))
+    return f"После {op['id']} вставлено {len(new_ids)} абзацев: {', '.join(new_ids)}"
+
+
 def _op_delete(doc, idx, op):
     el = idx[op["id"]]
     el.getparent().remove(el)
@@ -470,6 +603,9 @@ def _op_set_style(doc, idx, op):
 
 def _op_set_format(doc, idx, op):
     el = idx[op["id"]]
+    if el.tag == qn("w:tbl"):
+        # В2, п.3: ячейка таблицы — тот же способ найти её абзац, что у set_cell
+        el = Table(el, doc).cell(op["row"], op["col"]).paragraphs[0]._p
     span = _flex_span(_ptext(el), op["old"])
     if span is None:
         # validate должен был отсечь это раньше (см. _op_replace_text) — громко падаем.
@@ -645,6 +781,70 @@ def _op_set_cell(doc, idx, op):
     return f"Ячейка {op['id']}[{op['row']}][{op['col']}] заменена на «{op['text']}»"
 
 
+def _op_insert_row(doc, idx, op):
+    # В2, п.1: строка СУЩЕСТВУЮЩЕЙ таблицы — то, чем модель раньше подделывала
+    # правку абзацем со своей нотацией "r4c0:… | r4c1:…". table.add_row()
+    # добавляет строку в конец (как и рамки — см. _add_borders, общие на
+    # всю таблицу, per-cell ничего добавлять не нужно); если целевая позиция
+    # не последняя, physически переносим новый <w:tr> перед нужным соседом —
+    # тот же приём addprevious/addnext, что и у move_after/insert_after.
+    table = Table(idx[op["id"]], doc)
+    at, cells = op["at"], op["cells"]
+    nrows_before = len(table.rows)
+    new_row = table.add_row()
+    if at < nrows_before:
+        table.rows[at]._tr.addprevious(new_row._tr)
+    for c, val in enumerate(cells):
+        table.cell(at, c).text = val
+    return f"В {op['id']} вставлена строка на позицию {at}: {cells}"
+
+
+def _op_delete_row(doc, idx, op):
+    tr = Table(idx[op["id"]], doc).rows[op["row"]]._tr
+    tr.getparent().remove(tr)
+    return f"Из {op['id']} удалена строка {op['row']}"
+
+
+def _op_insert_col(doc, idx, op):
+    # Аналог insert_row по колонке: своего "insert в середину" метода у
+    # python-docx нет (Table.add_column только дописывает справа), поэтому
+    # gridCol и по одной ячейке в каждой строке добавляются напрямую в XML
+    # (add_gridCol/add_tc — то же автогенерируемое API, которым пользуется
+    # сам python-docx в Table.add_row/add_column) и при необходимости
+    # переносятся на нужную позицию тем же addprevious.
+    tbl = idx[op["id"]]
+    at, cells = op["at"], op["cells"]
+    grid_cols = tbl.tblGrid.gridCol_lst
+    ncols_before = len(grid_cols)
+    ref_col = grid_cols[min(at, ncols_before - 1)]
+    new_col = tbl.tblGrid.add_gridCol()
+    if ref_col.w is not None:
+        new_col.w = ref_col.w
+    if at < ncols_before:
+        ref_col.addprevious(new_col)
+    for tr in tbl.tr_lst:
+        tcs = tr.tc_lst
+        ref_tc = tcs[min(at, len(tcs) - 1)]
+        new_tc = tr.add_tc()
+        if at < len(tcs):
+            ref_tc.addprevious(new_tc)
+    table = Table(tbl, doc)
+    for r, val in enumerate(cells):
+        table.cell(r, at).text = val
+    return f"В {op['id']} вставлена колонка на позицию {at}: {cells}"
+
+
+def _op_delete_col(doc, idx, op):
+    tbl = idx[op["id"]]
+    col = op["col"]
+    grid_col = tbl.tblGrid.gridCol_lst[col]
+    grid_col.getparent().remove(grid_col)
+    for tr in tbl.tr_lst:
+        tc = tr.tc_lst[col]
+        tc.getparent().remove(tc)
+    return f"Из {op['id']} удалена колонка {col}"
+
+
 def _op_replace_all(doc, idx, op):
     old, new, word = op["old"], op["new"], op.get("word")
     total = blocks_touched = 0
@@ -700,6 +900,11 @@ _HANDLERS = {
     "set_list_level": _op_set_list_level,
     "footnote": _op_footnote,
     "set_list": _op_set_list,
+    "insert_row": _op_insert_row,
+    "delete_row": _op_delete_row,
+    "insert_col": _op_insert_col,
+    "delete_col": _op_delete_col,
+    "insert_paragraphs": _op_insert_paragraphs,
 }
 
 

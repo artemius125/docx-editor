@@ -83,7 +83,20 @@
 {"op":"normalize","rule":"typography"|"quotes"}
 {"op":"replace_all","old":"...","new":"..."}
 {"op":"set_list","id":"p12","ilvl":0}
+{"op":"set_format","id":"p12"|"t3","row":0,"col":1,"old":"...","b":true,"i":false,"u":null}
+{"op":"insert_row","id":"t3","at":1,"cells":["a","b","c"]}
+{"op":"delete_row","id":"t3","row":1}
+{"op":"insert_col","id":"t3","at":1,"cells":["a","b","c"]}
+{"op":"delete_col","id":"t3","col":1}
+{"op":"insert_paragraphs","id":"p12","items":[{"text":"...","style":"Heading 1"},{"text":"...","style":"Normal"}]}
 ```
+
+`set_format`: row/col — только когда id указывает на таблицу (адресация ячейки,
+как у set_cell); для абзаца — обычный span по old, row/col не передаются.
+
+Валидатор отбивает буквальный `\n` в тексте ЛЮБОЙ операции (В2): перевод
+строки внутри абзаца — не новый абзац, а подделка того, чего нет в
+контракте; несколько абзацев одной операцией — `insert_paragraphs`.
 
 ## Очередь работ
 

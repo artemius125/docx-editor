@@ -7,11 +7,13 @@ from docx.opc.constants import RELATIONSHIP_TYPE as RT
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.oxml.parser import parse_xml
+from docx.table import Table
 
 from docx_editor.parse import doc_map, index
 from docx_editor.patch import _HANDLERS, _OPS, apply, validate
 
 REAL_DOC = "/home/artem/Загрузки/Архитектура_ColBERT.docx"
+REGLAMENT_DOC = "/home/artem/Документы/artemius125/docx-editor/bench/bench/fixtures/Регламент.docx"
 
 
 def _build():
@@ -614,6 +616,195 @@ def test_set_text_preserves_structure_loses_run_formatting():
     print("patch_demo: set_text сохраняет стиль/level/list, теряет начертание ранов внутри абзаца")
 
 
+def test_insert_delete_row_on_real_table():
+    # В2, п.1: реальная таблица 4x3 из Регламент.docx (заголовок + 3 строки).
+    # Раньше строку добавить было нечем — модель подделывала её абзацем со
+    # своей нотацией "r4c0:… | r4c1:…". insert_row/delete_row обязаны менять
+    # РЕАЛЬНУЮ структуру таблицы (число <w:tr>, gridCol не трогается), а не
+    # пририсовывать текст рядом.
+    doc = Document(REGLAMENT_DOC)
+    idx = index(doc)
+    blocks = doc_map(doc, idx)
+    table = next(b for b in blocks if b["kind"] == "t")
+    tbl = idx[table["id"]]
+    nrows_before = len(table["rows"])
+    ncols = len(table["rows"][0])
+
+    op = {"op": "insert_row", "id": table["id"], "at": 1,
+          "cells": ["Служба безопасности", "Согласование внепланового выпуска", "нет"]}
+    assert validate(blocks, op, doc) is None
+    apply(doc, idx, op)
+    blocks = doc_map(doc, idx)
+    table = next(b for b in blocks if b["kind"] == "t")
+    assert len(table["rows"]) == nrows_before + 1
+    assert table["rows"][1] == ["Служба безопасности", "Согласование внепланового выпуска", "нет"]
+    assert table["rows"][0][0] == "Роль", "заголовок не должен был сдвинуться"
+    assert len(tbl.tblGrid.findall(qn("w:gridCol"))) == ncols, "insert_row не должен трогать колонки"
+    assert all(len(tr.findall(qn("w:tc"))) == ncols for tr in tbl.findall(qn("w:tr")))
+
+    op_del = {"op": "delete_row", "id": table["id"], "row": 1}
+    assert validate(blocks, op_del, doc) is None
+    apply(doc, idx, op_del)
+    blocks = doc_map(doc, idx)
+    table = next(b for b in blocks if b["kind"] == "t")
+    assert len(table["rows"]) == nrows_before
+    assert table["rows"][1][0] == "Релиз-менеджер", "после удаления вставленной строки таблица должна вернуться к исходному виду"
+
+    # нельзя удалить последнюю оставшуюся строку
+    tiny = Document()
+    tiny.add_table(rows=1, cols=2)
+    tidx = index(tiny)
+    tblocks = doc_map(tiny, tidx)
+    t1 = next(b for b in tblocks if b["kind"] == "t")
+    err = validate(tblocks, {"op": "delete_row", "id": t1["id"], "row": 0}, tiny)
+    assert isinstance(err, str) and "строку" in err, err
+
+    # round-trip save/reopen — проверка, что XML реально валиден для Word,
+    # не только для живых lxml-объектов в памяти
+    buf = io.BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+    doc2 = Document(buf)
+    idx2 = index(doc2)
+    blocks2 = doc_map(doc2, idx2)
+    table2 = next(b for b in blocks2 if b["kind"] == "t")
+    assert len(table2["rows"]) == nrows_before
+
+    print("patch_demo: insert_row/delete_row меняют реальную структуру таблицы 4x3, откат на последней строке отбит")
+
+
+def test_insert_delete_col_on_real_table():
+    # В2, п.1 (колонка): gridCol в w:tblGrid и w:tc в КАЖДОЙ строке обязаны
+    # прирастать/убывать синхронно — иначе таблица не откроется в Word.
+    doc = Document(REGLAMENT_DOC)
+    idx = index(doc)
+    blocks = doc_map(doc, idx)
+    table = next(b for b in blocks if b["kind"] == "t")
+    tbl = idx[table["id"]]
+    nrows = len(table["rows"])
+    ncols_before = len(table["rows"][0])
+
+    op = {"op": "insert_col", "id": table["id"], "at": 1, "cells": ["x", "y", "z", "w"]}
+    assert validate(blocks, op, doc) is None
+    apply(doc, idx, op)
+    blocks = doc_map(doc, idx)
+    table = next(b for b in blocks if b["kind"] == "t")
+    assert len(table["rows"][0]) == ncols_before + 1
+    assert [row[1] for row in table["rows"]] == ["x", "y", "z", "w"]
+    assert table["rows"][0][0] == "Роль" and table["rows"][0][2] == "Зона ответственности", (
+        "соседние колонки не должны были сдвинуться содержимым")
+    assert len(tbl.tblGrid.findall(qn("w:gridCol"))) == ncols_before + 1
+    assert all(len(tr.findall(qn("w:tc"))) == ncols_before + 1 for tr in tbl.findall(qn("w:tr")))
+
+    op_del = {"op": "delete_col", "id": table["id"], "col": 1}
+    assert validate(blocks, op_del, doc) is None
+    apply(doc, idx, op_del)
+    blocks = doc_map(doc, idx)
+    table = next(b for b in blocks if b["kind"] == "t")
+    assert len(table["rows"][0]) == ncols_before
+    assert table["rows"][0] == ["Роль", "Зона ответственности", "Замена"]
+    assert len(tbl.tblGrid.findall(qn("w:gridCol"))) == ncols_before
+
+    # нельзя удалить последнюю оставшуюся колонку
+    tiny = Document()
+    tiny.add_table(rows=nrows, cols=1)
+    tidx = index(tiny)
+    tblocks = doc_map(tiny, tidx)
+    t1 = next(b for b in tblocks if b["kind"] == "t")
+    err = validate(tblocks, {"op": "delete_col", "id": t1["id"], "col": 0}, tiny)
+    assert isinstance(err, str) and "колонку" in err, err
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+    doc2 = Document(buf)
+    idx2 = index(doc2)
+    blocks2 = doc_map(doc2, idx2)
+    table2 = next(b for b in blocks2 if b["kind"] == "t")
+    assert len(table2["rows"][0]) == ncols_before
+
+    print("patch_demo: insert_col/delete_col держат gridCol и tc каждой строки в синхроне, откат на последней колонке отбит")
+
+
+def test_set_format_on_table_cell():
+    # В2, п.3: «выдели первый столбец жирным» раньше было невыразимо — у
+    # set_format был только id абзаца. Теперь id таблицы + row + col находят
+    # ячейку тем же способом, что и set_cell.
+    doc = Document(REGLAMENT_DOC)
+    idx = index(doc)
+    blocks = doc_map(doc, idx)
+    table = next(b for b in blocks if b["kind"] == "t")
+
+    op = {"op": "set_format", "id": table["id"], "row": 1, "col": 0, "old": "Релиз-менеджер", "b": True}
+    assert validate(blocks, op, doc) is None
+    apply(doc, idx, op)
+    blocks = doc_map(doc, idx)
+    table = next(b for b in blocks if b["kind"] == "t")
+    assert table["rows"][1][0] == "Релиз-менеджер", "текст ячейки не должен был измениться"
+    cell_p = Table(idx[table["id"]], doc).cell(1, 0).paragraphs[0]
+    assert all(r.bold for r in cell_p.runs if r.text)
+    # соседняя ячейка той же строки не тронута
+    neighbor_p = Table(idx[table["id"]], doc).cell(1, 1).paragraphs[0]
+    assert not any(r.bold for r in neighbor_p.runs if r.text)
+
+    # плохие row/col — честный отказ, тем же классом ошибки, что у set_cell
+    err = validate(blocks, {"op": "set_format", "id": table["id"], "row": 9, "col": 0, "old": "x", "b": True}, doc)
+    assert isinstance(err, str) and "вне таблицы" in err, err
+
+    print("patch_demo: set_format адресует ячейку таблицы (row+col), соседние ячейки не тронуты")
+
+
+def test_insert_paragraphs_adds_section():
+    # В2, п.2: «раздел» — заголовок плюс текст, минимум два абзаца двух
+    # стилей одной операцией. Раньше модель подделывала это одним абзацем
+    # Heading 1 с "6. Пересмотр\nРегламент пересматривается…" внутри.
+    doc = _build()
+    idx = index(doc)
+    blocks = doc_map(doc, idx)
+    last_id = blocks[-1]["id"]
+
+    op = {
+        "op": "insert_paragraphs", "id": last_id,
+        "items": [
+            {"text": "6. Пересмотр", "style": "Heading 1"},
+            {"text": "Регламент пересматривается ежегодно приказом директора.", "style": "Normal"},
+        ],
+    }
+    assert validate(blocks, op, doc) is None
+    apply(doc, idx, op)
+    blocks = doc_map(doc, idx)
+
+    new = blocks[len(blocks) - 2:]
+    assert new[0]["style"] == "Heading 1" and new[0]["text"] == "6. Пересмотр"
+    assert new[1]["style"] == "Normal" and new[1]["text"] == "Регламент пересматривается ежегодно приказом директора."
+
+    print("patch_demo: insert_paragraphs вставляет заголовок и текст раздела как два абзаца двух стилей")
+
+
+def test_newline_in_op_text_rejected():
+    # В2, п.4: буквальный перевод строки в тексте операции — не новый абзац,
+    # а подделка того, чего нет в контракте (архитектор поймал модель на
+    # "6. Пересмотр\nРегламент пересматривается…" внутри одного Heading 1).
+    doc = _build()
+    idx = index(doc)
+    blocks = doc_map(doc, idx)
+
+    bad_ops = [
+        {"op": "set_text", "id": "p0", "text": "Первая строка\nВторая строка"},
+        {"op": "insert_after", "id": "p0", "text": "раз\nдва"},
+        {"op": "replace_text", "id": "p0", "old": "Первый", "new": "Пер\nвый"},
+        {"op": "insert_row", "id": "p0", "at": 0, "cells": ["a", "b\nc"]},
+    ]
+    for op in bad_ops:
+        err = validate(blocks, op, doc)
+        assert isinstance(err, str) and "перевод строки" in err, (op, err)
+
+    # легитимная операция без \n не отбивается этой защитой
+    assert validate(blocks, {"op": "set_text", "id": "p0", "text": "Обычный текст без переводов строк"}, doc) is None
+
+    print("patch_demo: перевод строки в тексте любой операции отбит валидатором с понятной причиной")
+
+
 def test_all_ops_have_handlers():
     # Находка BUILD_PLAN: коммит однажды завёл set_format в _OPS без записи
     # в _HANDLERS — apply() падал бы KeyError на первом же применении.
@@ -659,3 +850,8 @@ if __name__ == "__main__":
     test_footnote_new_and_existing_part()
     test_set_text_preserves_run_formatting_via_diff()
     test_set_text_preserves_structure_loses_run_formatting()
+    test_insert_delete_row_on_real_table()
+    test_insert_delete_col_on_real_table()
+    test_set_format_on_table_cell()
+    test_insert_paragraphs_adds_section()
+    test_newline_in_op_text_rejected()
