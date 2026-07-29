@@ -24,6 +24,13 @@ def load(label, seq=False):
         for line in open(path, encoding="utf-8"):
             r = json.loads(line)
             r["corpus"] = corpus
+            # В8: путь к сохранённому .docx этой правки — некоторым проверкам
+            # (m19, сноска) нужен сам пакет, а не только текст/стили. В seq-
+            # режиме файл на диске перезаписывается тем же именем ПОСЛЕ КАЖДОЙ
+            # правки — к концу прогона это состояние после 20-й, а не срез
+            # после n-й, подставлять его для n<20 значило бы врать проверке,
+            # поэтому None (честный n/a у неё же).
+            r["docx_path"] = None if seq else runs_dir / corpus / f"e{r['n']:02d}.docx"
             rows.append(r)
     if not rows:
         sys.exit(f"нет данных для label={label!r}: нет ни одного .jsonl в {runs_dir}")
@@ -36,8 +43,9 @@ def score_one(r):
     if check is None:
         oracle = "n/a"
     else:
-        ok = check(r["blocks_before"], r["blocks_after"], r["styles_before"], r["styles_after"])
-        oracle = "pass" if ok else "fail"
+        ok = check(r["blocks_before"], r["blocks_after"], r["styles_before"], r["styles_after"],
+                    r.get("docx_path"))
+        oracle = "n/a" if ok is None else ("pass" if ok else "fail")
 
     verdict = r["verdict"]
     honest = True
