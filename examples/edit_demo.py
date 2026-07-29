@@ -907,6 +907,45 @@ def test_op_on_block_created_in_same_batch_applies():
     print("edit_demo: операция на блок, созданный этим же батчем, применилась, verdict=done")
 
 
+def test_two_insert_after_same_anchor_keep_order():
+    # Н67 (замер, живой документ): «добавь раздел «6. Пересмотр» с текстом» —
+    # Редактор дал ДВЕ операции insert_after с ОДНИМ и тем же якорем p16
+    # (заголовок раздела, затем текст раздела). Раньше вторая вставка ложилась
+    # ВПЛОТНУЮ к якорю и вытесняла первую вниз — в файле получался текст
+    # раздела, а заголовок ПОСЛЕ него (перевёрнутый порядок). Второй
+    # insert_after на тот же якорь обязан цепляться за ПЕРВУЮ вставку, а не
+    # снова за якорь.
+    doc = Document()
+    doc.add_paragraph("5. Некоторый предыдущий раздел.")
+    idx = index(doc)
+
+    def fake_navigator(outline_text, request):
+        return {"kind": "local", "rule": None, "ids": ["p0"], "anchors": [], "trace": "heading+text"}
+
+    def fake_editor(fragment_text, request, feedback=None):
+        return {"ops": [
+            {"op": "insert_after", "id": "p0", "text": "6. Пересмотр", "style": "Heading 1"},
+            {"op": "insert_after", "id": "p0", "text": "Регламент пересматривается ежегодно.", "style": "Normal"},
+        ]}
+
+    def ok_checker(request, diff):
+        return {"ok": True, "reason": "раздел добавлен"}
+
+    result, doc, idx = run_edit(
+        doc, idx, "Добавь раздел «6. Пересмотр» с текстом: Регламент пересматривается ежегодно.",
+        navigator=fake_navigator, editor=fake_editor, checker=ok_checker,
+    )
+
+    assert result["verdict"] == "done", result
+    texts = [b["text"] for b in doc_map(doc, idx)]
+    assert texts == [
+        "5. Некоторый предыдущий раздел.",
+        "6. Пересмотр",
+        "Регламент пересматривается ежегодно.",
+    ], texts
+    print("edit_demo: два insert_after с одним якорем сохраняют порядок операций (заголовок, затем текст)")
+
+
 def test_render_full_text_outline_stays_short():
     # Ф12: 50 из 116 абзацев ColBERT-документа длиннее 300 знаков — render()
     # обязан отдавать их ЦЕЛИКОМ (иначе Редактор режет цитату на границе
@@ -2711,6 +2750,7 @@ if __name__ == "__main__":
     test_out_of_lane_retry_recovers_within_fragment()
     test_replace_all_not_blocked_by_lane_guard()
     test_op_on_block_created_in_same_batch_applies()
+    test_two_insert_after_same_anchor_keep_order()
     test_render_full_text_outline_stays_short()
     test_defect1_mid_word_cut_rejected()
     test_defect2_batch_collision_colbert11()

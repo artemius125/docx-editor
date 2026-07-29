@@ -921,8 +921,20 @@ def _apply_ops(doc, idx, ops, fragment_text, request, editor, fragment_ids=None,
     applied, retried, i = [], False, 0
     if written is None:
         written = {}
+    anchor_chain = {}  # Н67: последний вставленный insert_after на каждый исходный якорь этого батча
     while i < len(ops):
         op = ops[i]
+        # Н67: два insert_after с ОДНИМ якорем этого же батча дают обратный
+        # порядок — оба целятся "после p16", второй ложится вплотную к якорю
+        # и вытесняет первый вниз (модель добросовестно назвала верный якорь,
+        # это механика addnext, а не суждение модели). Второй и последующие
+        # insert_after на ТОТ ЖЕ исходный якорь перенаправляются на абзац,
+        # вставленный ПРЕДЫДУЩИМ insert_after этого якоря — тогда порядок
+        # вставок совпадает с порядком операций в ответе модели.
+        anchor_id = op.get("id") if op.get("op") == "insert_after" else None
+        if anchor_id is not None and anchor_id in anchor_chain:
+            op = {**op, "id": anchor_chain[anchor_id]}
+            ops[i] = op
         out = _out_of_lane(op, fragment_ids) if fragment_ids is not None else None
         if out is not None:
             targets, collision, err = [], None, f"блок {out!r} вне фрагмента, показанного в этом вызове — правь только то, что было показано"
@@ -939,10 +951,13 @@ def _apply_ops(doc, idx, ops, fragment_text, request, editor, fragment_ids=None,
         if err is None:
             before_ids = set(idx)
             applied.append(patch.apply(doc, idx, op))
+            new_ids = set(idx) - before_ids
+            if anchor_id is not None and new_ids:
+                anchor_chain[anchor_id] = next(iter(new_ids))
             if ops_out is not None:
                 ops_out.append(op)
             if fragment_ids is not None:
-                fragment_ids |= set(idx) - before_ids
+                fragment_ids |= new_ids
             if targets:
                 _record_batch_write(op, targets, written)
             i += 1
