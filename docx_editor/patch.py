@@ -4,7 +4,9 @@
 insert_after, delete, move_after, set_style, create_table, set_cell, normalize,
 replace_all, плюс из Ф15 — set_format (начертание рана), set_list_level
 (уровень вложенности уже существующего списка) и footnote (настоящая сноска
-Word: footnotes.xml + связь в .rels + w:footnoteReference в теле).
+Word: footnotes.xml + связь в .rels + w:footnoteReference в теле), плюс из
+Ф19-бис — set_list (обычный абзац становится элементом списка через уже
+существующую в документе нумерацию).
 """
 
 from copy import deepcopy
@@ -25,9 +27,9 @@ from docx_editor.find import _flex_span
 _OPS = {
     "replace_text", "set_text", "insert_after", "delete", "move_after",
     "set_style", "create_table", "set_cell", "normalize", "replace_all",
-    "set_format", "set_list_level", "footnote",
+    "set_format", "set_list_level", "footnote", "set_list",
 }
-_PARAGRAPH_ONLY = {"replace_text", "set_text", "set_style", "set_format", "set_list_level", "footnote"}
+_PARAGRAPH_ONLY = {"replace_text", "set_text", "set_style", "set_format", "set_list_level", "footnote", "set_list"}
 _NORMALIZE_RULES = {"typography", "quotes"}
 
 
@@ -49,6 +51,19 @@ def _style_error(style, doc):
     if style in names:
         return None
     return f"стиль {style!r} не найден; доступны стили абзацев: {', '.join(names)}"
+
+
+def _numbering_ids(doc):
+    """[numId, ...] нумераций, реально определённых в word/numbering.xml
+    документа, [] если часть отсутствует (Ф19-бис: set_list превращает
+    обычный абзац в элемент списка, ссылаясь на УЖЕ существующее определение
+    нумерации — придумывать своё нельзя, а создание numbering.xml с нуля не
+    поддержано python-docx, см. NumberingPart.new())."""
+    try:
+        part = doc.part.part_related_by(RT.NUMBERING)
+    except KeyError:
+        return []
+    return [int(n.get(qn("w:numId"))) for n in part.element.findall(qn("w:num"))]
 
 
 _ELLIPSIS = ("…", "...")
@@ -252,6 +267,16 @@ def validate(blocks, op, doc):
         if by_id[op["id"]]["list"] is None:
             return f"{op['id']} не является элементом списка (нет w:numPr) — сменить уровень нельзя"
 
+    if name == "set_list":
+        if by_id[op["id"]]["list"] is not None:
+            return f"{op['id']} уже является элементом списка — используй set_list_level, чтобы сменить уровень"
+        ilvl = op.get("ilvl", 0)
+        if not (isinstance(ilvl, int) and not isinstance(ilvl, bool) and ilvl >= 0):
+            return f"ilvl должен быть неотрицательным целым числом, получено {ilvl!r}"
+        if not _numbering_ids(doc):
+            return ("в документе нет ни одной определённой нумерации (word/numbering.xml отсутствует "
+                     "или пуст) — сделать абзац элементом списка нечем")
+
     if name == "set_style":
         err = _style_error(op.get("style"), doc)
         if err:
@@ -448,6 +473,20 @@ def _op_set_list_level(doc, idx, op):
     return f"Уровень списка {op['id']} изменён на {op['ilvl']}"
 
 
+def _op_set_list(doc, idx, op):
+    # get_or_add_numPr (в отличие от pPr.append) ставит w:numPr в схемную
+    # позицию pPr сам — важно, если у абзаца уже есть другие свойства
+    # (w:jc, w:spacing и т.п.), которые обязаны идти ПОСЛЕ w:numPr.
+    numPr = idx[op["id"]].get_or_add_pPr().get_or_add_numPr()
+    ilvl_el = OxmlElement("w:ilvl")
+    ilvl_el.set(qn("w:val"), str(op.get("ilvl", 0)))
+    numId_el = OxmlElement("w:numId")
+    numId_el.set(qn("w:val"), str(_numbering_ids(doc)[0]))
+    numPr.append(ilvl_el)
+    numPr.append(numId_el)
+    return f"Абзац {op['id']} сделан элементом списка (уровень {op.get('ilvl', 0)})"
+
+
 _FOOTNOTES_PARTNAME = PackURI("/word/footnotes.xml")
 # id -1 и 0 — зарезервированы OOXML под разделитель/разделитель-продолжение
 # (17.3.1.11); настоящие сноски нумеруются с 1, чтобы никогда с ними не
@@ -637,6 +676,7 @@ _HANDLERS = {
     "set_format": _op_set_format,
     "set_list_level": _op_set_list_level,
     "footnote": _op_footnote,
+    "set_list": _op_set_list,
 }
 
 

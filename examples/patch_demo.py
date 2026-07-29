@@ -381,6 +381,46 @@ def test_set_list_level():
     print("patch_demo: set_list_level меняет ilvl и сохраняет numId, отказан на абзаце вне списка")
 
 
+def test_set_list_turns_plain_paragraph_into_list_item():
+    # Ф19-бис (battery 10): set_list_level умеет менять уровень уже существующего
+    # списка, но не умеет превратить ОБЫЧНЫЙ абзац в элемент списка — set_list
+    # закрывает именно это, ссылаясь на нумерацию, УЖЕ определённую в документе
+    # (word/numbering.xml), а не выдумывая маркер-символ.
+    doc = _build()
+    idx = index(doc)
+    blocks = doc_map(doc, idx)
+    assert blocks[0]["list"] is None, "p0 не должен быть списком до операции"
+
+    op = {"op": "set_list", "id": "p0"}  # ilvl не указан — по умолчанию 0
+    assert validate(blocks, op, doc) is None
+    apply(doc, idx, op)
+    blocks = doc_map(doc, idx)
+    assert blocks[0]["list"]["ilvl"] == 0, blocks[0]["list"]
+    real_num_ids = {int(n.get(qn("w:numId"))) for n in doc.part.part_related_by(RT.NUMBERING).element.findall(qn("w:num"))}
+    assert blocks[0]["list"]["numId"] in real_num_ids, "numId обязан ссылаться на РЕАЛЬНОЕ определение нумерации документа"
+
+    # уже список — set_list не годится, только set_list_level
+    err = validate(blocks, {"op": "set_list", "id": "p0"}, doc)
+    assert isinstance(err, str) and "set_list_level" in err, err
+    print("patch_demo: set_list сделал обычный абзац элементом списка с реальным numId, отказан на уже-списке")
+
+
+def test_set_list_rejects_without_numbering_definitions():
+    # Документ без единого определения нумерации (как Математика как основа.docx,
+    # где word/numbering.xml отсутствует вовсе) — сделать абзац элементом списка
+    # нечем, честный отказ, а не выдуманный numId.
+    doc = _build()
+    part = doc.part.part_related_by(RT.NUMBERING)
+    for n in part.element.findall(qn("w:num")):
+        part.element.remove(n)
+    idx = index(doc)
+    blocks = doc_map(doc, idx)
+
+    err = validate(blocks, {"op": "set_list", "id": "p0"}, doc)
+    assert isinstance(err, str) and "нумерации" in err, err
+    print(f"patch_demo: set_list честно отказан без единого определения нумерации: {err!r}")
+
+
 def test_replace_all_reports_only_real_changes():
     # replace_all отчитывался по числу СОВПАДЕНИЙ, а не изменений: _flex_span
     # нормализует пробельные разрывы при поиске, и повторное применение той
@@ -580,6 +620,8 @@ if __name__ == "__main__":
     test_set_format_splits_run_boundary()
     test_set_format_rejects_no_flags()
     test_set_list_level()
+    test_set_list_turns_plain_paragraph_into_list_item()
+    test_set_list_rejects_without_numbering_definitions()
     test_replace_all_reports_only_real_changes()
     test_footnote_new_and_existing_part()
     test_set_text_preserves_structure_loses_run_formatting()

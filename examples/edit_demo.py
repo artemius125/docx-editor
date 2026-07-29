@@ -2019,6 +2019,37 @@ def test_footnote_only_edit_reaches_done_not_failed():
     print("edit_demo: правка из одной сноски даёт done, а не 'текст не изменился'")
 
 
+def test_position_end_resolves_to_last_block():
+    # Ф19-бис (battery 20, тот же корень у ColBERT 20): «добавь раздел в конец
+    # документа» не адресуется ни id, ни якорем, ни цитатой — Навигатор
+    # обязан выставить position="end", а _resolve обязан подставить последний
+    # блок документа как адрес, когда обычный резолв ничего не дал.
+    doc = Document()
+    for t in ("Первый абзац.", "Второй абзац.", "Третий и последний абзац."):
+        doc.add_paragraph(t)
+    idx = index(doc)
+
+    def fake_navigator(outline_text, request):
+        return {"kind": "local", "rule": None, "ids": [], "anchors": [], "position": "end"}
+
+    def fake_editor(fragment_text, request, feedback=None):
+        assert "Третий и последний абзац" in fragment_text, fragment_text
+        return {"ops": [{"op": "insert_after", "id": "p2", "text": "Новый раздел в конце.", "style": "Normal"}]}
+
+    def fake_checker(request, diff):
+        return {"ok": True, "reason": "ok"}
+
+    result, doc, idx = run_edit(
+        doc, idx, "добавь раздел в конец документа",
+        navigator=fake_navigator, editor=fake_editor, checker=fake_checker,
+    )
+
+    assert result["verdict"] == "done", result
+    texts = [b["text"] for b in doc_map(doc, idx)]
+    assert texts[-1] == "Новый раздел в конце.", texts
+    print("edit_demo: position=end резолвится в последний блок документа, вставка в конец прошла")
+
+
 if __name__ == "__main__":
     test_split_real_file()
     test_fallback_search_then_honest_refusal()
@@ -2079,3 +2110,4 @@ if __name__ == "__main__":
     test_rule_wins_when_unify_also_set()
     test_rule_rolled_back_falls_through_to_local_done()
     test_footnote_only_edit_reaches_done_not_failed()
+    test_position_end_resolves_to_last_block()
