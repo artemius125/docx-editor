@@ -18,7 +18,7 @@ from docx_editor.parse import doc_map, index, render
 
 REAL_DOC = "/home/artem/Загрузки/Архитектура_ColBERT.docx"
 EDITS_FILE = "/home/artem/Загрузки/Правки_ColBERT_20.md"
-REGLAMENT_DOC = "/home/artem/Документы/artemius125/docx-editor/bench/bench/fixtures/Регламент.docx"
+REGLAMENT_DOC = "/home/artem/Документы/artemius125/docx-editor/bench/fixtures/Регламент.docx"
 
 
 def test_split_real_file():

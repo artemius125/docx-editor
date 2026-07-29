@@ -115,7 +115,7 @@
   `test_trace_footnote_regression_real_footnote_not_blocked` подтверждает:
   настоящая сноска не рубится, как того требует контроль ТЗ.
 - Оба обманутых сценария живого прогона закрыты демо на РЕАЛЬНОЙ фикстуре
-  `bench/bench/fixtures/Регламент.docx` (настоящая таблица 4×3, настоящие
+  `bench/fixtures/Регламент.docx` (настоящая таблица 4×3, настоящие
   стили Heading 1): `test_trace_table_catches_paragraph_faking_a_row` и
   `test_trace_heading_text_catches_heading_without_body` — оба дают
   `verdict="failed"` ДО вызова Проверяющего (фейковый checker кидает
@@ -368,7 +368,7 @@
   `_run_local`), `replace_all` не запускался — обе исходные словоформы в
   документе остались нетронуты, а не заменены именительным падежом.
 - Демо `test_unify_word_not_term_kandidat_release_sentence` — НЕ придуманный
-  документ, а `bench/bench/fixtures/Регламент.docx`: абзац `p5` этой
+  документ, а `bench/fixtures/Регламент.docx`: абзац `p5` этой
   фикстуры буквально содержит «Сборка кандидата собирается из ветки
   release.» — ровно предложение из живого прогона. Пара `["кандидата",
   "релиз-кандидата"]` от фейкового unifier'а закрыта гвардом, `p5` после

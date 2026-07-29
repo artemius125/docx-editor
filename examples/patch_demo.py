@@ -13,7 +13,7 @@ from docx_editor.parse import doc_map, index
 from docx_editor.patch import _HANDLERS, _OPS, apply, validate
 
 REAL_DOC = "/home/artem/Загрузки/Архитектура_ColBERT.docx"
-REGLAMENT_DOC = "/home/artem/Документы/artemius125/docx-editor/bench/bench/fixtures/Регламент.docx"
+REGLAMENT_DOC = "/home/artem/Документы/artemius125/docx-editor/bench/fixtures/Регламент.docx"
 
 
 def _build():
