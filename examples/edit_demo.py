@@ -2765,6 +2765,56 @@ def test_unify_word_not_term_kandidat_release_sentence():
     print("edit_demo: 'Сборка кандидата...' из Регламент.docx больше не искажается unify — слово ушло к Редактору")
 
 
+def test_off_term_op_blocked_on_local_path_after_unify_fallthrough():
+    # В11 (находка Н69): предыдущий тест проверял ГВАРД `_inflects` (unify
+    # уступает Редактору), но Редактор там — заглушка, которая сама честно
+    # отказывается. В живом прогоне РЕАЛЬНЫЙ Редактор попытку не отклонил —
+    # он предложил ту же порчу (replace_text «кандидата» → «релиз-кандидата»)
+    # уже НА ЛОКАЛЬНОМ пути, потому что защита В6/Н62 стояла только на
+    # маршруте unify. Навигатор здесь называет p5 явным id (эту же ошибку
+    # ловит В6 на маршруте unify, но здесь p5 попадает в резолв НЕ через
+    # инвентарь) — а инвентарь вариантов термина (anchors — РЕАЛЬНЫЕ варианты
+    # из p16: «релиз-кандидат», «кандидат на релиз», «релиз кандидат») его не
+    # содержит вовсе. Код обязан отклонить операцию, чей old не входит в уже
+    # посчитанный инвентарь, ДО Проверяющего.
+    doc = Document(REGLAMENT_DOC)
+    idx = index(doc)
+    p5_before = next(b["text"] for b in doc_map(doc, idx) if b["id"] == "p5")
+    assert "Сборка кандидата собирается из ветки release." in p5_before
+
+    def fake_navigator(outline_text, request):
+        return {"kind": "unify", "rule": None, "ids": ["p5"],
+                "anchors": ["релиз-кандидат", "кандидат на релиз", "релиз кандидат"]}
+
+    def fake_unifier(inventory_text, request):
+        return {"pairs": [["кандидат на релиз", "релиз-кандидат"], ["релиз кандидат", "релиз-кандидат"]], "note": ""}
+
+    def misbehaving_editor(fragment_text, request, feedback=None):
+        # Настоящий Редактор в живом прогоне не отказался — он честно (но
+        # ошибочно) предложил заменить обычное слово термином. Повторяет то
+        # же самое и на ретрае — как модель, не понимающая, в чём проблема.
+        if not any(ln.startswith("p5 ") for ln in fragment_text.splitlines()):
+            return {"ops": [], "already": False, "note": "нет цели в этом кластере"}
+        return {"ops": [{"op": "replace_text", "id": "p5", "old": "кандидата", "new": "релиз-кандидата"}]}
+
+    def no_checker(request, diff):
+        raise AssertionError("гвард обязан отклонить операцию ДО вызова Проверяющего")
+
+    request = "Термин «релиз-кандидат» записан по-разному — приведи к одному написанию по всему документу."
+    result, doc, idx = run_edit(
+        doc, idx, request,
+        navigator=fake_navigator, editor=misbehaving_editor, checker=no_checker, unifier=fake_unifier,
+    )
+
+    assert result["verdict"] == "failed", result
+    assert "не один из вариантов термина" in result["reason"], result["reason"]
+    p5_after = next(b["text"] for b in doc_map(doc, idx) if b["id"] == "p5")
+    assert "Сборка кандидата собирается из ветки release." in p5_after, (
+        "документ обязан остаться нетронутым: " + p5_after
+    )
+    print("edit_demo: Редактор на локальном пути (после unify-фолбэка) не смог тронуть чужое слово 'кандидата'")
+
+
 if __name__ == "__main__":
     test_split_real_file()
     test_fallback_search_then_honest_refusal()
@@ -2847,3 +2897,4 @@ if __name__ == "__main__":
     test_pattern_matching_implausible_share_treated_as_no_address()
     test_unify_inflected_russian_word_routes_to_editor_not_replace_all()
     test_unify_word_not_term_kandidat_release_sentence()
+    test_off_term_op_blocked_on_local_path_after_unify_fallthrough()

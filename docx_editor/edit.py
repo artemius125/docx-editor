@@ -730,6 +730,28 @@ def _out_of_lane(op, fragment_ids):
     return None
 
 
+def _off_term_error(op, term_variants):
+    """В11 (находка Н69): правка класса «единое написание термина» бьёт по
+    ЧУЖОЙ фразе не только на маршруте unify (В6/Н62 — «Сборка кандидата» →
+    «Сборка релиз-кандидата»), но и на ЛОКАЛЬНОМ пути, когда Навигатор не
+    распознал unify и правка идёт обычным _run_clusters — там защиты не было
+    вовсе. term_variants — множество вариантов термина, уже посчитанное
+    кодом (_variant_counts, то же самое, что строит инвентарь для промпта, —
+    второй инвентарь не заводим). None — эта правка не того класса (инвентарь
+    пуст/не считался), гвард выключен. Иначе: replace_text/replace_all,
+    чей "old" не совпадает НИ С ОДНИМ посчитанным вариантом, трогает не
+    термин, а что-то похожее рядом — отклоняется тем же путём, что и любая
+    другая невалидная операция."""
+    if term_variants is None or op.get("op") not in ("replace_text", "replace_all"):
+        return None
+    old = op.get("old")
+    if old in term_variants:
+        return None
+    return (f'операция трогает «{old}», а это не один из вариантов термина, посчитанных в документе '
+            f'({", ".join(sorted(term_variants))}) — правка класса «единое написание термина» должна '
+            f'трогать ТОЛЬКО вхождения самих вариантов термина, а не похожие слова/фразы рядом')
+
+
 def _collision_source(targets, written):
     """op, который записал диапазон, пересекающийся с targets, или None — тот
     же обход, что раньше делал _overlaps, но Change 2 требует не только факт
@@ -877,7 +899,8 @@ def _redundant_in_batch(op, idx, written):
     return False
 
 
-def _apply_ops(doc, idx, ops, fragment_text, request, editor, fragment_ids=None, written=None, ops_out=None):
+def _apply_ops(doc, idx, ops, fragment_text, request, editor, fragment_ids=None, written=None, ops_out=None,
+                term_variants=None):
     """Применяет ops по очереди; на невалидной операции — один ретрай к
     Редактору с текстом ошибки (editor=None — ретрая нет, путь rule). Второй
     провал (или провал без Редактора) останавливает применение немедленно.
@@ -890,6 +913,14 @@ def _apply_ops(doc, idx, ops, fragment_text, request, editor, fragment_ids=None,
     (в порядке применения). Нужен `_trace_error`, чтобы проверять СДЕЛАННОЕ
     (какого рода операции реально применились), а не верить ярлыку `trace`
     Навигатора — описания в `applied` для этого не годятся, там только текст.
+
+    term_variants (В11, находка Н69) — множество вариантов термина, уже
+    посчитанное `_variant_counts` (тот же инвентарь, что уходит в промпт
+    Редактору как «Найдено в документе: …»), или None — правка не того
+    класса, гвард выключен. См. `_off_term_error`: replace_text/replace_all,
+    чей "old" не входит в этот набор, отклоняется как невалидная операция —
+    защита В6/Н62 («Сборка кандидата» → «Сборка релиз-кандидата») раньше
+    стояла только на маршруте unify, здесь распространена на локальный путь.
 
     fragment_ids=None — гвард выключен (путь rule: editor=None, id-полей у
     normalize нет). Иначе — set id блоков фрагмента, который видел Редактор;
@@ -936,8 +967,11 @@ def _apply_ops(doc, idx, ops, fragment_text, request, editor, fragment_ids=None,
             op = {**op, "id": anchor_chain[anchor_id]}
             ops[i] = op
         out = _out_of_lane(op, fragment_ids) if fragment_ids is not None else None
+        term_err = _off_term_error(op, term_variants) if out is None else None
         if out is not None:
             targets, collision, err = [], None, f"блок {out!r} вне фрагмента, показанного в этом вызове — правь только то, что было показано"
+        elif term_err is not None:
+            targets, collision, err = [], None, term_err
         else:
             # Change (Ф16, item 4): targets/collision требуют полей вроде "old",
             # которые validate и создан проверять — считаем их только когда op
@@ -966,8 +1000,11 @@ def _apply_ops(doc, idx, ops, fragment_text, request, editor, fragment_ids=None,
         # нарушает другую границу: кластер правит блок, которого ему не
         # показывали. Общий на всю правку written сделал такие операции
         # «избыточными» и глушил гвард полосы — поймано демо
-        # test_invalid_cluster_aborts_whole_edit.
-        if out is None and _redundant_in_batch(op, idx, written):
+        # test_invalid_cluster_aborts_whole_edit. Операция вне вариантов
+        # термина (term_err, Н69) — та же логика: это отказ по ГРАНИЦЕ
+        # применимости правки, не по совпадению с уже написанным этим же
+        # батчем, молчаливый пропуск здесь замаскировал бы порчу чужой фразы.
+        if out is None and term_err is None and _redundant_in_batch(op, idx, written):
             applied.append(f'пропущена операция {op.get("op")} (old={op.get("old")!r}) — избыточна относительно более ранней операции этого же батча: {err}')
             i += 1
             continue
@@ -1259,6 +1296,16 @@ def _run_clusters(doc, idx, blocks, ids, request, editor, checker, nav, fallthro
     hf_before = _hf_state(doc)
     clusters = _cluster(blocks, ids, around=len(blocks) if single_cluster else 1)
     inventory = _variant_inventory(blocks, nav, request)
+    # Н69: та же правка класса «единое написание термина», но упавшая на
+    # ЛОКАЛЬНЫЙ путь (см. _run_unify → _run_local при _inflects/без единого
+    # канона) — инвентарь уже посчитан для промпта (см. inventory выше),
+    # берём его же набором вариантов для _off_term_error, второй инвентарь не
+    # строим. Только когда Навигатор НАЗВАЛ класс unify (nav["kind"]) — иначе
+    # это обычная local-правка, у которой инвентарь варьируется по ДРУГОЙ
+    # причине (несколько цитат старого/нового текста, см. edit_demo.py
+    # test_edit_12_on_real_doc_fixture) и не означает «трогать только термин».
+    term_variants = ({v for v, n in _variant_counts(blocks, nav, request)}
+                      if inventory and nav.get("kind") == "unify" else None)
 
     applied_all, editor_replies, tries_total, partial, replace_all_seen = [], [], 0, False, set()
     ops_all = []  # В11: сырые op успешно применённых операций, см. _apply_ops/ops_out и _trace_error
@@ -1313,7 +1360,8 @@ def _run_clusters(doc, idx, blocks, ids, request, editor, checker, nav, fallthro
             replace_all_seen |= {(o.get("old"), o.get("new")) for o in ops if o.get("op") == "replace_all"}
             if not ops:
                 continue
-            applied, err, cluster_tries = _apply_ops(doc, idx, ops, fragment_text, request, editor, fragment_ids, written, ops_out=ops_all)
+            applied, err, cluster_tries = _apply_ops(doc, idx, ops, fragment_text, request, editor, fragment_ids, written,
+                                                      ops_out=ops_all, term_variants=term_variants)
             tries_total += cluster_tries - 1  # первый вызов кластера уже посчитан выше, тут доучитывается только ретрай
             applied_all += applied
             if err is not None:
