@@ -1471,6 +1471,16 @@ def test_edit_prompt_mentions_every_op():
     print("edit_demo: _EDIT_PROMPT упоминает каждую операцию patch._OPS (кроме normalize)")
 
 
+def test_edit_prompt_frames_insert_col_header_row():
+    # В11 (находка Н70, замер w18): «добавь колонку „Телефон“» дала колонку
+    # из пяти пустых ячеек, включая шапку, — операция cells принимает, модель
+    # их не заполнила. Рамка промпта (не механизм): первая строка таблицы —
+    # обычно шапка, cells[0] обязана нести осмысленный заголовок колонки.
+    insert_col_line = next(ln for ln in edit_mod._EDIT_PROMPT.splitlines() if ln.startswith('{"op":"insert_col"'))
+    assert "шапка" in insert_col_line and "не оставляй" in insert_col_line, insert_col_line
+    print("edit_demo: _EDIT_PROMPT указывает Редактору заполнять заголовок колонки (insert_col), не оставлять пустым")
+
+
 def test_replace_all_deduped_across_clusters():
     # Item 1 (di-base math#1, живой прогон: verdict rolled_back, iter=3,
     # applied нёс одну и ту же пару дважды). Каждый кластер получает ПОЛНЫЙ
@@ -2859,6 +2869,7 @@ if __name__ == "__main__":
     test_failed_records_ops_applied_before_batch_failure()
     test_id_fields_covers_all_ops_except_document_wide()
     test_edit_prompt_mentions_every_op()
+    test_edit_prompt_frames_insert_col_header_row()
     test_replace_all_deduped_across_clusters()
     test_retry_widens_lane_to_match_rerendered_fragment()
     test_cluster_with_removed_targets_skipped_not_dead_end()
