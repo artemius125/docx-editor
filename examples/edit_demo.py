@@ -2275,6 +2275,95 @@ def test_trace_footnote_regression_real_footnote_not_blocked():
     print("edit_demo: trace=footnote не блокирует настоящую сноску (регресс-контроль)")
 
 
+def test_pattern_addresses_dates_without_quotable_anchor():
+    # В5: «даты приведи к формату ДД.ММ.ГГГГ» не адресуется ни id, ни цитатой
+    # — формат нельзя процитировать. Навигатор возвращает pattern (regex),
+    # код сам находит ВСЕ совпадения через find.by_regex.
+    doc = Document()
+    doc.add_paragraph("Совещание состоится 5 января 2024 года, отчёт сдать позже.")
+    doc.add_paragraph("Вторая встреча запланирована на 12 марта 2025 года.")
+    doc.add_paragraph("Повестка дня согласуется отдельно с каждым участником.")
+    doc.add_paragraph("Протокол ведёт секретарь комиссии.")
+    doc.add_paragraph("Итоги рассылаются всем участникам совещания.")
+    idx = index(doc)
+
+    date_pattern = r"\d{1,2}\s+[а-яё]+\s+\d{4}\s+года"
+
+    def fake_navigator(outline_text, request):
+        return {"kind": "local", "rule": None, "ids": [], "anchors": [], "pattern": date_pattern}
+
+    def fake_editor(fragment_text, request, feedback=None):
+        ops = []
+        if "5 января 2024 года" in fragment_text:
+            ops.append({"op": "replace_text", "id": "p0", "old": "5 января 2024 года", "new": "05.01.2024"})
+        if "12 марта 2025 года" in fragment_text:
+            ops.append({"op": "replace_text", "id": "p1", "old": "12 марта 2025 года", "new": "12.03.2025"})
+        return {"ops": ops}
+
+    def ok_checker(request, diff):
+        return {"ok": True, "reason": "формат дат унифицирован"}
+
+    result, doc, idx = run_edit(
+        doc, idx, "Даты приведи к единому формату ДД.ММ.ГГГГ.",
+        navigator=fake_navigator, editor=fake_editor, checker=ok_checker,
+    )
+
+    assert result["verdict"] == "done", result
+    texts = [b["text"] for b in doc_map(doc, idx)]
+    assert "05.01.2024" in texts[0] and "12.03.2025" in texts[1], texts
+    assert "января" not in texts[0] and "марта" not in texts[1]
+    print("edit_demo: pattern без цитаты и id нашёл обе даты, обе приведены к ДД.ММ.ГГГГ")
+
+
+def test_pattern_invalid_regex_is_honest_refusal_not_exception():
+    # Гвард В5: модель-автор регулярки может прислать невалидный regex —
+    # честный отказ ("не нашёл адреса"), а не исключение наружу.
+    doc, idx = _fake_doc()
+
+    def fake_navigator(outline_text, request):
+        return {"kind": "local", "rule": None, "ids": [], "anchors": [], "pattern": "[неверная("}
+
+    def fake_editor(*a, **kw):
+        raise AssertionError("Редактор не должен вызываться — адреса нет вовсе")
+
+    result, doc, idx = run_edit(
+        doc, idx, "Приведи формат к единому виду.",
+        navigator=fake_navigator, editor=fake_editor,
+    )
+
+    assert result["verdict"] == "failed", result
+    print("edit_demo: невалидный regex от Навигатора — честный отказ, не исключение")
+
+
+def test_pattern_matching_implausible_share_treated_as_no_address():
+    # Гвард В5: жадная/сломанная регулярка, нашедшая неправдоподобную долю
+    # блоков документа, не должна адресовать правку на ВЕСЬ документ —
+    # это тот же класс риска, что и document-wide replace_all без разбора.
+    doc = Document()
+    doc.add_paragraph("Первый абзац: значение 1.")
+    doc.add_paragraph("Второй абзац: значение 5.")
+    doc.add_paragraph("Третий абзац: значение 10 и 20.")
+    doc.add_paragraph("Четвёртый абзац: значение 42.")
+    idx = index(doc)
+    before = [b["text"] for b in doc_map(doc, idx)]
+
+    def fake_navigator(outline_text, request):
+        return {"kind": "local", "rule": None, "ids": [], "anchors": [], "pattern": r"\d+"}
+
+    def fake_editor(*a, **kw):
+        raise AssertionError("Редактор не должен вызываться — доля совпадений неправдоподобна")
+
+    result, doc, idx = run_edit(
+        doc, idx, "Приведи числа к единому формату.",
+        navigator=fake_navigator, editor=fake_editor,
+    )
+
+    assert result["verdict"] == "failed", result
+    after = [b["text"] for b in doc_map(doc, idx)]
+    assert after == before, "документ не должен был измениться"
+    print("edit_demo: regex, нашедший неправдоподобную долю блоков (4 из 4), отклонён как адрес")
+
+
 if __name__ == "__main__":
     test_split_real_file()
     test_fallback_search_then_honest_refusal()
@@ -2343,3 +2432,6 @@ if __name__ == "__main__":
     test_trace_heading_text_passes_for_real_section()
     test_trace_table_passes_for_real_row_insert()
     test_trace_footnote_regression_real_footnote_not_blocked()
+    test_pattern_addresses_dates_without_quotable_anchor()
+    test_pattern_invalid_regex_is_honest_refusal_not_exception()
+    test_pattern_matching_implausible_share_treated_as_no_address()
