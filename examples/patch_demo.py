@@ -503,6 +503,44 @@ def test_footnote_new_and_existing_part():
     )
 
 
+def test_set_text_preserves_structure_loses_run_formatting():
+    # Ф19: set_text переписывает абзац целиком (Редактор — автор новой
+    # формулировки). Фиксируем, что именно сохраняется (стиль, level из
+    # w:outlineLvl, list из w:numPr), а что теряется (начертание отдельных
+    # ранов внутри абзаца — set_text не умеет их сохранить, это ограничение,
+    # записанное в BUILD_PLAN, а не баг).
+    doc = _build()
+    idx = index(doc)
+    p3 = doc.paragraphs[3]
+    p3.style = doc.styles["Heading 2"]
+    pPr = p3._p.get_or_add_pPr()
+    outline = OxmlElement("w:outlineLvl")
+    outline.set(qn("w:val"), "1")
+    pPr.append(outline)
+    _add_numpr(p3, ilvl=0, num_id=7)
+
+    blocks = doc_map(doc, idx)
+    assert blocks[3]["style"] == "Heading 2"
+    assert blocks[3]["level"] == 1
+    assert blocks[3]["list"] == {"ilvl": 0, "numId": 7}
+    assert any(r.get("b") or r.get("i") or r.get("u") for r in blocks[3]["runs"]), "фикстура обязана нести раны с начертанием"
+
+    op = {"op": "set_text", "id": "p3", "text": "Совсем новая формулировка."}
+    assert validate(blocks, op, doc) is None
+    apply(doc, idx, op)
+    blocks = doc_map(doc, idx)
+
+    assert blocks[3]["text"] == "Совсем новая формулировка."
+    assert blocks[3]["style"] == "Heading 2", "стиль абзаца обязан был сохраниться"
+    assert blocks[3]["level"] == 1, "level (w:outlineLvl) обязан был сохраниться"
+    assert blocks[3]["list"] == {"ilvl": 0, "numId": 7}, "list (w:numPr) обязан был сохраниться"
+    assert not any(r.get("b") or r.get("i") or r.get("u") for r in blocks[3]["runs"]), (
+        "set_text теряет начертание ранов — если этот assert упал, ограничение из BUILD_PLAN устарело"
+    )
+
+    print("patch_demo: set_text сохраняет стиль/level/list, теряет начертание ранов внутри абзаца")
+
+
 def test_all_ops_have_handlers():
     # Находка BUILD_PLAN: коммит однажды завёл set_format в _OPS без записи
     # в _HANDLERS — apply() падал бы KeyError на первом же применении.
@@ -544,3 +582,4 @@ if __name__ == "__main__":
     test_set_list_level()
     test_replace_all_reports_only_real_changes()
     test_footnote_new_and_existing_part()
+    test_set_text_preserves_structure_loses_run_formatting()
