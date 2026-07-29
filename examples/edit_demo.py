@@ -1988,6 +1988,37 @@ def test_rule_rolled_back_falls_through_to_local_done():
     print("edit_demo: rolled_back у rule продолжает локальным путём и доводит правку до done")
 
 
+def test_footnote_only_edit_reaches_done_not_failed():
+    # Ф19-бис: footnote применяется, но не трогает ни текст, ни style/level/
+    # list абзаца — раньше _diff видел пустой набор изменений и цикл откатывал
+    # уже сделанную работу с "операции применились, но текст не изменился".
+    # Единственная операция кластера — footnote; verdict обязан быть done.
+    doc = Document()
+    doc.add_paragraph("Термин имеет спорное определение в литературе.")
+    idx = index(doc)
+
+    def fake_navigator(outline_text, request):
+        return {"kind": "local", "rule": None, "ids": ["p0"], "anchors": []}
+
+    def fake_editor(fragment_text, request, feedback=None):
+        return {"ops": [{"op": "footnote", "id": "p0", "old": "спорное определение",
+                          "text": "См. обсуждение в разделе 2."}]}
+
+    def fake_checker(request, diff):
+        assert any("сносок" in d.get("note", "") for d in diff), diff
+        return {"ok": True, "reason": "сноска добавлена"}
+
+    result, doc, idx = run_edit(
+        doc, idx, "Добавь сноску после «спорное определение».",
+        navigator=fake_navigator, editor=fake_editor, checker=fake_checker,
+    )
+
+    assert result["verdict"] == "done", result
+    refs = idx["p0"].findall(".//" + qn("w:footnoteReference"))
+    assert len(refs) == 1, "сноска обязана была остаться в документе (не откачена)"
+    print("edit_demo: правка из одной сноски даёт done, а не 'текст не изменился'")
+
+
 if __name__ == "__main__":
     test_split_real_file()
     test_fallback_search_then_honest_refusal()
@@ -2047,3 +2078,4 @@ if __name__ == "__main__":
     test_unify_canonical_containing_old_is_done_not_leftover()
     test_rule_wins_when_unify_also_set()
     test_rule_rolled_back_falls_through_to_local_done()
+    test_footnote_only_edit_reaches_done_not_failed()

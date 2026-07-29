@@ -87,6 +87,13 @@ def _list(p_el):
     return {"ilvl": ilvl, "numId": int(numId_el.get(qn("w:val")))}
 
 
+def _footnotes(p_el):
+    """Число w:footnoteReference внутри абзаца (Ф19-бис: сноска не меняет ни
+    текст, ни стиль/level/list абзаца — без отдельного счётчика diff цикла
+    её не видит вовсе и объявляет правку пустышкой)."""
+    return len(p_el.findall(".//" + qn("w:footnoteReference")))
+
+
 def doc_map(doc, idx):
     """Блоки в текущем порядке body. Элементы, удалённые из body, выпадают.
 
@@ -111,6 +118,7 @@ def doc_map(doc, idx):
                 "runs": _runs(p),
                 "level": _level(el),
                 "list": _list(el),
+                "footnotes": _footnotes(el),
             })
         elif el.tag == _TBL:
             t = Table(el, doc)

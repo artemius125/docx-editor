@@ -357,7 +357,12 @@ def _struct_note(b, a):
     Сравнение runs добавлено для set_format (Ф15): эта операция не трогает
     текст абзаца вообще, только b/i/u ранов — без сравнения runs diff видел
     бы такую правку как пустышку, а именно это уже было дефектом Ф11
-    (set_style/move_after не давали diff и откатывались как "без изменений")."""
+    (set_style/move_after не давали diff и откатывались как "без изменений").
+
+    Сравнение footnotes добавлено Ф19-бис: footnote не трогает ни текст, ни
+    style/level/list/runs абзаца (w:footnoteReference — пустой для python-docx
+    ран без w:t) — без счётчика правка терялась тем же способом, что раньше
+    set_style/move_after."""
     if b["kind"] != "p" or a["kind"] != "p":
         return None
     parts = []
@@ -367,6 +372,8 @@ def _struct_note(b, a):
         parts.append(f'уровень {b.get("level")} → {a.get("level")}')
     if b.get("list") != a.get("list"):
         parts.append(f'список {b.get("list")} → {a.get("list")}')
+    if b.get("footnotes", 0) != a.get("footnotes", 0):
+        parts.append(f'сносок {b.get("footnotes", 0)} → {a.get("footnotes", 0)}')
     if b.get("runs") != a.get("runs"):
         old_fmt = ", ".join(_format_note(b.get("runs") or [])) or "без оформления"
         new_fmt = ", ".join(_format_note(a.get("runs") or [])) or "без оформления"
