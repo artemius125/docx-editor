@@ -86,7 +86,7 @@ def _fake_chat(messages):
         if CRASH_MARKER in user:
             raise RuntimeError("сбой навигатора (тест громких ошибок)")
         if ALREADY_MARKER in user:
-            return {"kind": "global", "rule": "typography", "ids": [], "anchors": []}
+            return {"kind": "local", "rule": "typography", "ids": [], "anchors": []}
         return {"kind": "local", "rule": None, "ids": ["p999"], "anchors": ["текст, которого точно нет"]}
     if "редактор" in system:
         if "не прошла проверку" in user:

@@ -202,7 +202,7 @@ def test_rule_no_op_yields_already():
     before = [b["text"] for b in doc_map(doc, idx)]
 
     def fake_navigator(outline_text, request):
-        return {"kind": "global", "rule": "typography", "ids": [], "anchors": []}
+        return {"kind": "local", "rule": "typography", "ids": [], "anchors": []}
 
     result, doc, idx = run_edit(doc, idx, "раздели слипшиеся предложения", navigator=fake_navigator)
 
@@ -1907,7 +1907,7 @@ def test_compose_oversized_fragment_refused_document_unchanged():
     # случался, см. Ф13-бис). Порог — код, не модель: Редактор и Проверяющий
     # не должны вызываться вовсе, документ не должен быть тронут.
     doc = Document()
-    doc.add_paragraph("Слово " * 3000)  # ~18 тыс. знаков — заведомо выше порога 15000
+    doc.add_paragraph("Слово " * 11000)  # ~66 тыс. знаков — заведомо выше порога
     doc.add_paragraph("Второй обычный абзац.")
     idx = index(doc)
     before = [b["text"] for b in doc_map(doc, idx)]
@@ -1927,7 +1927,7 @@ def test_compose_oversized_fragment_refused_document_unchanged():
     )
 
     assert result["verdict"] == "failed", result
-    assert "15000" in result["reason"] and "знаков" in result["reason"], result["reason"]
+    assert str(edit_mod._FRAGMENT_CHAR_LIMIT) in result["reason"] and "знаков" in result["reason"], result["reason"]
     after = [b["text"] for b in doc_map(doc, idx)]
     assert after == before, "документ не должен измениться при отказе по объёму"
     print(f"edit_demo: compose-фрагмент сверх порога честно отклонён: {result['reason']!r}")
@@ -2528,7 +2528,21 @@ def test_off_term_allows_op_covering_whole_variant():
     fragment = {"op": "replace_text", "id": "p5", "old": "кандидата", "new": "релиз-кандидата"}
     err = edit_mod._off_term_error(fragment, {"релиз-кандидат", "кандидат на релиз", "релиз кандидат"})
     assert err is not None and "не один из вариантов термина" in err, err
-    print("edit_demo: гвард термина пропускает old, накрывающий вариант целиком, и держит обрывок")
+
+    # Словоформы: инвентарь собран из базовых форм, а в тексте термин
+    # склоняется — «читателю» при варианте «читатель» отклонялся, и правка
+    # m14 скакала между замерами w21/w22. Форма засчитывается, только если
+    # РЕАЛЬНО стоит в документе; порча В6 при этом остаётся отклонённой.
+    doc = Document()
+    doc.add_paragraph("Я хочу, чтобы читатель знал: дальше я обращаюсь к читателю прямо.")
+    forms = edit_mod._term_forms(doc_map(doc, index(doc)), {"читатель", "вы"})
+    assert "читателю" in forms and "вы" not in forms, forms
+
+    doc2 = Document()
+    doc2.add_paragraph("Сборка кандидата собирается из ветки release.")
+    forms2 = edit_mod._term_forms(doc_map(doc2, index(doc2)), {"релиз-кандидат", "кандидат на релиз"})
+    assert "кандидата" not in forms2, forms2
+    print("edit_demo: гвард термина пропускает накрывающий old и словоформу из документа, но держит обрывок")
 
 
 if __name__ == "__main__":

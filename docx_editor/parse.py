@@ -203,8 +203,16 @@ def render(blocks):
         else:
             rows = b["rows"]
             ncols = len(rows[0]) if rows else 0
+            # Начертание ячейки — «[ж]» перед текстом, когда ВЕСЬ её текст
+            # жирный. Без этого Редактор не видел, выделен ли столбец уже, и
+            # не мог ни честно ответить «уже так», ни проверить свою работу
+            # (прогон за рулём 2026-07-30, правка 9).
+            fmt = b.get("fmt") or []
+            def _cell_mark(r, c):
+                runs = fmt[r][c] if r < len(fmt) and c < len(fmt[r]) else []
+                return "[ж]" if runs and all(run[0] for run in runs) else ""
             row_strs = [
-                " | ".join(f"r{r}c{c}:{cell}" for c, cell in enumerate(row))
+                " | ".join(f"r{r}c{c}:{_cell_mark(r, c)}{cell}" for c, cell in enumerate(row))
                 for r, row in enumerate(rows)
             ]
             body = " ;; ".join(row_strs)

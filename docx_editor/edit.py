@@ -19,7 +19,7 @@ from docx_editor.parse import _format_note, doc_map, index, render
 
 _NAV_PROMPT = """Ты — навигатор по документу .docx. Тебе дают компактное
 оглавление (id и начало текста абзаца на строку) и текст правки на русском.
-Верни ТОЛЬКО JSON {"kind":"local"|"global"|"unify"|"compose",
+Верни ТОЛЬКО JSON {"kind":"local"|"unify"|"compose",
 "rule":null|"typography"|"quotes","ids":[...],"anchors":[...],
 "position":null|"end","trace":null|"table"|"heading"|"heading+text"|"list"|"footnote"|
 "field"|"header_footer","pattern":null|"regex"} без пояснений и markdown-обвязки.
@@ -71,8 +71,10 @@ _NAV_PROMPT = """Ты — навигатор по документу .docx. Те
   прозу, а не саму формулу — формулы в правке и в документе записаны по-разному.
 - [B] перед текстом строки — абзац целиком жирный, хотя стиля заголовка у
   него нет; полезно для правок вида «заголовок — это просто жирный абзац».
-- "kind" = "global" можно ставить, только если ты вообще не можешь назвать ни
-  одного id. Если можешь назвать хотя бы один — это "local", а не "global".
+- Если ты не можешь назвать НИ ОДНОГО id (правка адресует то, чего в
+  оглавлении не видно, — даты, числа, форматы), оставь ids пустым и задай
+  "pattern": по образцу код найдёт места сам. Своего вида правки для этого
+  случая нет: kind остаётся "local".
 - "position" = "end" — правка адресует место ПОЗИЦИЕЙ в документе, а не
   текстом: "добавь раздел в конец документа", "допиши в самом конце" — цитаты
   или id тут нет и быть не может, потому что цель определена структурно, не
@@ -113,6 +115,8 @@ _EDIT_PROMPT = """Ты — редактор документа .docx. Тебе �
 жирный/курсивный/подчёркнутый» или, если оформлена только часть, «жирным:
 «кусок текста»»). Текст ПОСЛЕ закрывающей ] — дословный текст блока: "old"
 обязан быть процитирован буквально из него, метки из [] в "old" не входят.
+В таблице «[ж]» перед текстом ячейки означает, что вся ячейка жирная — это
+пометка кода, в "old" она тоже не входит.
 Если перед фрагментом отдельной строкой стоит «Найдено в документе: ...» —
 это посчитанные кодом варианты написания термина по всему документу (не
 часть текста для правки); канонический вариант выбирается ОДИН раз и
@@ -353,6 +357,24 @@ def _variant_counts(blocks, nav, request):
     variants = _dedupe([_strip_anchor(a) for a in (nav.get("anchors") or [])] + _literals(request))
     counts = [(v, len(find.by_text(blocks, v))) for v in variants]
     return [(v, n) for v, n in counts if n > 0]
+
+
+def _term_forms(blocks, variants):
+    """Словоформы посчитанных вариантов, РЕАЛЬНО стоящие в документе. Гвард
+    термина знал только цитаты из запроса и якоря — то есть базовые формы, а
+    в тексте термин склоняется: `old` «читателю» при варианте «читатель»
+    отклонялся, и правка m14 скакала между прогонами (замеры w21/w22).
+
+    Ищем по основе (вариант минус три буквы окончания) и ТОЛЬКО для
+    однословных вариантов не короче восьми букв. Оба ограничения — защита от
+    возврата порчи В6: там варианты «релиз-кандидат», «кандидат на релиз»,
+    и слово «кандидата» из чужой фразы не начинается ни с одной их основы,
+    а короткие слова («вы») основы не дают вовсе."""
+    stems = {v[:-3].lower() for v in variants if " " not in v and len(v) >= 8}
+    if not stems:
+        return set()
+    words = {w for b in blocks for w in re.findall(r"\w+(?:-\w+)*", _btext(b))}
+    return {w for w in words if any(w.lower().startswith(st) for st in stems)}
 
 
 def _variant_inventory(blocks, nav, request):
@@ -1293,7 +1315,14 @@ def _cluster(blocks, ids, around=1):
     return clusters
 
 
-_FRAGMENT_CHAR_LIMIT = 15000  # Ф20: см. гвард объёма в _run_clusters, ниже
+# Ф20: гвард объёма в _run_clusters, ниже. 15000 знаков было откалибровано под
+# окно модели, которого больше нет: оба приёмочных корпуса — 35 и 28 тыс.
+# знаков — влезают к 26B целиком. Порогом в 15000 отклонялась, не показав
+# модели документ вообще, целая правка (ColBERT 20, список литературы), а
+# compose по построению собирает фрагмент из ВСЕХ целей сразу. Порог поднят
+# до 60 тыс.: он остаётся защитой от переполнения (ContextWindowExceededError
+# уже случался, Ф13-бис), но перестаёт быть потолком ниже размера документа.
+_FRAGMENT_CHAR_LIMIT = 60000
 
 
 def _run_clusters(doc, idx, blocks, ids, request, editor, checker, nav, fallthrough, single_cluster=False):
@@ -1356,6 +1385,8 @@ def _run_clusters(doc, idx, blocks, ids, request, editor, checker, nav, fallthro
     # test_edit_12_on_real_doc_fixture) и не означает «трогать только термин».
     term_variants = ({v for v, n in _variant_counts(blocks, nav, request)}
                       if inventory and nav.get("kind") == "unify" else None)
+    if term_variants:
+        term_variants |= _term_forms(blocks, term_variants)
 
     applied_all, editor_replies, tries_total, partial, replace_all_seen = [], [], 0, False, set()
     ops_all = []  # В11: сырые op успешно применённых операций, см. _apply_ops/ops_out и _trace_error
