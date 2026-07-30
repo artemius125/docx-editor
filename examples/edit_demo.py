@@ -2863,6 +2863,22 @@ def test_off_term_op_blocked_on_local_path_after_unify_fallthrough():
     print("edit_demo: Редактор на локальном пути (после unify-фолбэка) не смог тронуть чужое слово 'кандидата'")
 
 
+def test_off_term_allows_op_covering_whole_variant():
+    # Замер w20: гвард требовал ТОЧНОГО равенства варианту и рубил операции,
+    # которые трогают сам термин вместе с окружением, — а это ровно то, что
+    # правка и просит поменять (скобки на кавычки, точка на запятую в числе).
+    # Три реальных old из w20 обязаны проходить, обрывок из В6 — нет.
+    variants = {"8.8", "Человек, который познал бесконечность", "Cross-encoder"}
+    for old in ("8.8 млн", "(Человек, который познал бесконечность)", "Cross-encoders"):
+        op = {"op": "replace_text", "id": "p1", "old": old, "new": "неважно"}
+        assert edit_mod._off_term_error(op, variants) is None, old
+
+    fragment = {"op": "replace_text", "id": "p5", "old": "кандидата", "new": "релиз-кандидата"}
+    err = edit_mod._off_term_error(fragment, {"релиз-кандидат", "кандидат на релиз", "релиз кандидат"})
+    assert err is not None and "не один из вариантов термина" in err, err
+    print("edit_demo: гвард термина пропускает old, накрывающий вариант целиком, и держит обрывок")
+
+
 if __name__ == "__main__":
     test_split_real_file()
     test_fallback_search_then_honest_refusal()
@@ -2948,3 +2964,4 @@ if __name__ == "__main__":
     test_unify_inflected_russian_word_routes_to_editor_not_replace_all()
     test_unify_word_not_term_kandidat_release_sentence()
     test_off_term_op_blocked_on_local_path_after_unify_fallthrough()
+    test_off_term_allows_op_covering_whole_variant()
