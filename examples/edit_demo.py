@@ -2579,6 +2579,54 @@ _LIVE_VARIANTS = [
 ]
 
 
+def test_llm_retries_provider_5xx_once():
+    # Замер w25 умер целиком на «500 inference error» посреди корпуса: ретрай
+    # llm.chat стоял только на обрыве транспорта, а вызывающий ловит только
+    # TransportError — сбой провайдера уносил весь прогон. 5xx той же природы,
+    # что обрыв: один повтор. 4xx повторять нельзя — это ответ по существу.
+    import httpx
+    from docx_editor import llm as llm_mod
+
+    calls = []
+
+    class _Resp:
+        reason_phrase = "Error"
+        request = response = None
+
+        def __init__(self, code, payload):
+            self.status_code, self._payload, self.text = code, payload, str(payload)
+        @property
+        def is_error(self):
+            return self.status_code >= 400
+        def json(self):
+            return self._payload
+
+    ok = {"choices": [{"message": {"content": '{"ops": []}'}}]}
+
+    def fake_post(url, **kw):
+        calls.append(url)
+        return _Resp(500, {"error": "inference error"}) if len(calls) == 1 else _Resp(200, ok)
+
+    real_post, real_env = httpx.post, llm_mod._env
+    httpx.post = fake_post
+    llm_mod._env = lambda: {"LLM_KEY": "k", "LLM_BASE_URL": "http://x", "LLM_MODEL": "m"}
+    try:
+        assert llm_mod.chat([{"role": "user", "content": "тест"}]) == {"ops": []}
+        assert len(calls) == 2, calls
+
+        calls.clear()
+        httpx.post = lambda url, **kw: (calls.append(url), _Resp(400, {"error": "context"}))[1]
+        try:
+            llm_mod.chat([{"role": "user", "content": "тест"}])
+            raise AssertionError("4xx обязан упасть, а не ретраиться")
+        except httpx.HTTPStatusError:
+            pass
+        assert len(calls) == 1, calls
+    finally:
+        httpx.post, llm_mod._env = real_post, real_env
+    print("edit_demo: 5xx провайдера повторяется один раз, 4xx падает сразу")
+
+
 def test_every_prompt_op_is_alive():
     # Ни одной мёртвой операции: то, что названо Редактору, обязано (1) пройти
     # validate на верном вызове, (2) примениться и (3) стать ВИДИМЫМ — либо в
@@ -2729,5 +2777,6 @@ if __name__ == "__main__":
     test_off_term_op_blocked_on_local_path_after_unify_fallthrough()
     test_off_term_allows_op_covering_whole_variant()
     test_every_prompt_op_is_alive()
+    test_llm_retries_provider_5xx_once()
     test_deleted_block_is_not_shown_as_truncated_text()
     test_set_format_in_table_cell_is_visible_to_diff()
