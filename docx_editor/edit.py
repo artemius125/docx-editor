@@ -1329,8 +1329,18 @@ def _cluster(blocks, ids, around=1):
 # уже случался, Ф13-бис), но перестаёт быть потолком ниже размера документа.
 _FRAGMENT_CHAR_LIMIT = 60000
 
+# В10: документ короче этого — Редактор видит его ЦЕЛИКОМ, без кластеризации.
+# Инвариант 3 CLAUDE.md («модель не видит документ целиком») откалиброван под
+# окно, которого больше нет: оба приёмочных корпуса (35 и 28 тыс. знаков)
+# влезают к 26B. Кластеризация же стоит денег: правка про первое упоминание
+# термина на кластерном пути неразрешима в принципе (Редактор видит один
+# кластер и не знает порядка), а половина вызовов уходит в кластеры, где
+# менять нечего (прогон за рулём 2026-07-30, c11 — 11 вызовов, 6 пустых).
+_WHOLE_DOC_LIMIT = 40000
 
-def _run_clusters(doc, idx, blocks, ids, request, editor, checker, nav, fallthrough, single_cluster=False):
+
+def _run_clusters(doc, idx, blocks, ids, request, editor, checker, nav, fallthrough, single_cluster=False,
+                  whole_doc=False):
     """Путь с несколькими маленькими шагами вместо одного большого фрагмента
     (измерено на 40 живых правках: Редактор отказывает по ОБЪЁМУ, а не по
     смыслу, когда целей много — edit с 4 целей до 10 упала done→rolled_back).
@@ -1378,7 +1388,7 @@ def _run_clusters(doc, idx, blocks, ids, request, editor, checker, nav, fallthro
     snapshot_path = _snapshot(doc)
     blocks_before = doc_map(doc, idx)
     hf_before = _hf_state(doc)
-    clusters = _cluster(blocks, ids, around=len(blocks) if single_cluster else 1)
+    clusters = _cluster(blocks, ids, around=len(blocks) if (single_cluster or whole_doc) else 1)
     inventory = _variant_inventory(blocks, nav, request)
     # Н69: правка класса «единое написание термина» идёт обычным локальным
     # путём (собственного маршрута у класса больше нет) — инвентарь уже
@@ -1399,7 +1409,8 @@ def _run_clusters(doc, idx, blocks, ids, request, editor, checker, nav, fallthro
     try:
         for cluster_ids in clusters:
             pre_cluster = doc_map(doc, idx)
-            frag_blocks = find.fragment(pre_cluster, cluster_ids, around=1)
+            frag_blocks = (pre_cluster if whole_doc
+                           else find.fragment(pre_cluster, cluster_ids, around=1))
             if not frag_blocks:
                 # Ф16, item 3: цели этого кластера уже пропали (удалены/слиты более
                 # ранним кластером) — пустой фрагмент даёт ПУСТОЕ множество
@@ -1506,7 +1517,8 @@ def _run_clusters(doc, idx, blocks, ids, request, editor, checker, nav, fallthro
 _CYRILLIC_RX = re.compile(r"[а-яё]", re.IGNORECASE)
 
 
-def _run_local(doc, idx, blocks, nav, request, editor, checker, fallthrough=False, single_cluster=False):
+def _run_local(doc, idx, blocks, nav, request, editor, checker, fallthrough=False, single_cluster=False,
+               whole_doc=False):
     """Локальный путь через Редактора: резолв id → кластеризация → цикл
     маленьких шагов (_run_clusters, один вызов Редактора на кластер). Нет
     верхней границы на число целей и нет отдельной ветки для одной цели —
@@ -1532,7 +1544,8 @@ def _run_local(doc, idx, blocks, nav, request, editor, checker, fallthrough=Fals
             reason = "не нашёл, где это править: ни id и якоря Навигатора, ни дословные цитаты из текста правки не нашли места в документе"
         return verdict_fn(reason, nav), doc, idx
 
-    return _run_clusters(doc, idx, blocks, ids, request, editor, checker, nav, fallthrough, single_cluster)
+    return _run_clusters(doc, idx, blocks, ids, request, editor, checker, nav, fallthrough, single_cluster,
+                         whole_doc=whole_doc)
 
 
 def run_edit(doc, idx, request, navigator=_navigate, editor=_edit_llm, checker=_check):
@@ -1573,11 +1586,13 @@ def run_edit(doc, idx, request, navigator=_navigate, editor=_edit_llm, checker=_
     blocks = doc_map(doc, idx)
     nav = navigator(find.outline(blocks), request) or {}
     rule = nav.get("rule")
+    whole_doc = sum(len(_btext(b)) for b in blocks) <= _WHOLE_DOC_LIMIT
 
     if not rule:
         if nav.get("kind") == "compose":
-            return _run_local(doc, idx, blocks, nav, request, editor, checker, single_cluster=True)
-        return _run_local(doc, idx, blocks, nav, request, editor, checker)
+            return _run_local(doc, idx, blocks, nav, request, editor, checker, single_cluster=True,
+                              whole_doc=whole_doc)
+        return _run_local(doc, idx, blocks, nav, request, editor, checker, whole_doc=whole_doc)
 
     # Правки типа rule идут мимо Редактора — код нормализует сам, LLM не зовём.
     ops, fragment_text = [{"op": "normalize", "rule": rule}], ""
