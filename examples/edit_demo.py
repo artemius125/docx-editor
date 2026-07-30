@@ -1323,6 +1323,44 @@ def test_collision_feedback_lets_retry_succeed():
     print(f"edit_demo: после совета в тексте ошибки самоколлизии ретрай прошёл, verdict={result['verdict']!r}")
 
 
+def test_set_text_over_earlier_write_in_same_batch():
+    # Регресс m11 замера w19 (в w18 та же правка была done): Редактор в одном
+    # батче сначала правит термин в p12, потом переписывает ВЕСЬ абзац через
+    # set_text. Цель set_text — весь блок, значит она пересекается с любой
+    # более ранней записью батча, и гвард самоколлизии отказывал ей всегда,
+    # печатая «текст «None»» (old у set_text нет). Переписывание блока целиком
+    # не читает собственный вывод — оно его выбрасывает, батч обязан пройти.
+    doc = Document()
+    doc.add_paragraph("Тегмарк называет это «математическим универсализмом» и на этом строит вывод.")
+    idx = index(doc)
+
+    def fake_navigator(outline_text, request):
+        return {"kind": "local", "rule": None, "ids": ["p0"], "anchors": []}
+
+    def fake_editor(fragment_text, request, feedback=None):
+        assert feedback is None, f"ретрая быть не должно: {feedback}"
+        return {"ops": [
+            {"op": "replace_text", "id": "p0", "old": "«математическим универсализмом»",
+             "new": "гипотезой математической Вселенной"},
+            {"op": "set_text", "id": "p0",
+             "text": "Тегмарк выдвигает гипотезу математической Вселенной: физическая реальность и есть математическая структура."},
+        ]}
+
+    def fake_checker(request, diff):
+        return {"ok": True, "reason": "ok"}
+
+    result, doc, idx = run_edit(
+        doc, idx, "поправь название гипотезы Тегмарка",
+        navigator=fake_navigator, editor=fake_editor, checker=fake_checker,
+    )
+
+    assert result["verdict"] == "done", result
+    text = doc_map(doc, idx)[0]["text"]
+    assert text.startswith("Тегмарк выдвигает гипотезу математической Вселенной"), text
+    assert "универсализм" not in text, text
+    print(f"edit_demo: set_text поверх более ранней записи батча прошёл, verdict={result['verdict']!r}")
+
+
 def test_partial_cluster_processing_not_done():
     # Change 3 (Ф13): набор кластеров зафиксирован ДО мутации (p0 и p7 —
     # два непересекающихся кластера). Кластер p0 честно применяет операцию,
@@ -2864,6 +2902,7 @@ if __name__ == "__main__":
     test_variant_inventory_appears_for_multiple_targets()
     test_variant_inventory_absent_for_single_target()
     test_collision_feedback_lets_retry_succeed()
+    test_set_text_over_earlier_write_in_same_batch()
     test_partial_cluster_processing_not_done()
     test_retry_recomputes_fragment_after_batch_mutation()
     test_failed_records_ops_applied_before_batch_failure()

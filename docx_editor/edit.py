@@ -772,9 +772,14 @@ def _shift_written(ranges, start, end, new_len):
     пересечение ДО применения, поэтому операция, которая задела бы такой
     диапазон, отклоняется раньше, чем эта замена вообще случится. Каждый
     диапазон несёт op, который его записал (Change 2) — нужен для текста
-    ошибки, сама логика сдвига его не касается."""
+    ошибки, сама логика сдвига его не касается.
+
+    Исключение — set_text: он один допущен писать поверх диапазона батча (см.
+    _apply_ops), и накрытый им целиком диапазон исчезает вместе со своим
+    текстом. Сдвигать его некуда — он бы врал про чужое место."""
     delta = new_len - (end - start)
-    return [(s, e, o) if e <= start else (s + delta, e + delta, o) for s, e, o in ranges]
+    return [(s, e, o) if e <= start else (s + delta, e + delta, o)
+            for s, e, o in ranges if not (start <= s and e <= end)]
 
 
 def _op_targets(doc, idx, op):
@@ -979,7 +984,17 @@ def _apply_ops(doc, idx, ops, fragment_text, request, editor, fragment_ids=None,
             # которую validate всё равно отклонил бы (например old=None).
             err = patch.validate(doc_map(doc, idx), op, doc)
             targets = _op_targets(doc, idx, op) if err is None else []
-            collision = _collision_source(targets, written) if err is None else None
+            # set_text не ИЩЕТ текст, а переписывает блок целиком: его цель —
+            # весь абзац, поэтому она пересекается с любой более ранней записью
+            # этого же батча в тот же блок, и гвард отказывал ей всегда (m11
+            # замера w19: replace_text + set_text на p12 → правка, бывшая done
+            # в w18, стала failed, а текст ошибки печатал «текст «None»» —
+            # old у set_text нет). Редактировать собственный вывод она не
+            # может по построению: старый текст блока целиком выбрасывается,
+            # итог задаёт сама операция. Обратный порядок (set_text, потом
+            # replace_text по написанному) гвардом по-прежнему ловится.
+            collision = (_collision_source(targets, written)
+                         if err is None and op.get("op") != "set_text" else None)
             if collision is not None:
                 err = _own_output_error(op, collision)
         if err is None:
