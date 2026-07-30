@@ -361,6 +361,22 @@ def test_set_format_rejects_no_flags():
     print("patch_demo: set_format без b/i/u отбит валидатором")
 
 
+def test_set_format_rejects_non_bool_flags():
+    # Crash 2 (a): живой прогон Математика прислал set_format с "u": "null" —
+    # СТРОКОЙ, не JSON null. validate раньше проверял только отсутствие
+    # b/i/u, тип не проверял вовсе — op доходила до _op_set_format и падала
+    # там ValueError ("'null' is not a valid WD_UNDERLINE"), роняя весь
+    # процесс. Три испорченных формы, которые реально может прислать модель:
+    # строка "null", русское "да", число 1.
+    doc = _build()
+    idx = index(doc)
+    blocks = doc_map(doc, idx)
+    for bad in ("null", "да", 1):
+        err = validate(blocks, {"op": "set_format", "id": "p0", "old": "Первый", "u": bad}, doc)
+        assert isinstance(err, str) and "u" in err, (bad, err)
+    print("patch_demo: set_format с не-bool значением b/i/u отбит валидатором вместо крэша apply")
+
+
 def test_set_list_level():
     doc = _build()
     doc.add_paragraph("Пункт списка")
@@ -988,6 +1004,7 @@ if __name__ == "__main__":
     test_set_format()
     test_set_format_splits_run_boundary()
     test_set_format_rejects_no_flags()
+    test_set_format_rejects_non_bool_flags()
     test_set_list_level()
     test_set_list_turns_plain_paragraph_into_list_item()
     test_set_list_rejects_without_numbering_definitions()

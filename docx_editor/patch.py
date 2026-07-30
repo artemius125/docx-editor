@@ -359,6 +359,15 @@ def validate(blocks, op, doc):
             return f"блок {block_id!r} не найден в документе"
         if op.get("b") is None and op.get("i") is None and op.get("u") is None:
             return f"{block_id}: не указано ни одного из b/i/u — операция ничего не меняет"
+        # Модель прислала СТРОКУ "null" вместо JSON null для "u" — validate это
+        # пропускал (проверялось только отсутствие поля), а font.underline =
+        # "null" падает ValueError уже внутри _op_set_format и убивает ВЕСЬ
+        # прогон корпуса, а не одну правку. b/i/u — только true, false или
+        # отсутствие; иначе ошибка валидатора с текстом для ретрая модели.
+        for flag in ("b", "i", "u"):
+            val = op.get(flag)
+            if val is not None and not isinstance(val, bool):
+                return f"{block_id}: «{flag}» должен быть true, false или отсутствовать, получено {val!r}"
         block = by_id[block_id]
         if block["kind"] == "t":
             # В2, п.3: set_format адресуется ячейкой таблицы (row+col) — то же,

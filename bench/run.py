@@ -7,18 +7,37 @@
 import json
 import os
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-import httpx
 from docx import Document
 
 REPO = "/home/artem/Документы/artemius125/docx-editor"
 sys.path.insert(0, REPO)
 
+from docx_editor import llm  # noqa: E402
 from docx_editor.edit import _btext, run_edit, split  # noqa: E402
 from docx_editor.parse import doc_map, index  # noqa: E402
+
+# Счётчик РЕАЛЬНЫХ обращений к модели: поле iter считает вызовы editor() на
+# уровне кластера и с контуром инструментов недосчитывает (внутри одного
+# editor() модель может сходить в инструменты несколько раз). Считаем на
+# уровне llm — потоки идут параллельно, поэтому счётчик локальный для потока.
+_calls = threading.local()
+
+
+def _counting(fn):
+    def wrapper(*args, **kwargs):
+        _calls.n = getattr(_calls, "n", 0) + 1
+        return fn(*args, **kwargs)
+    return wrapper
+
+
+for _name in ("chat", "chat_tools"):
+    if hasattr(llm, _name):
+        setattr(llm, _name, _counting(getattr(llm, _name)))
 
 CORPORA = {
     "colbert": {
@@ -46,6 +65,7 @@ def _styles(blocks):
 
 
 def _run_one(n, task, src):
+    _calls.n = 0
     doc = Document(src)
     idx = index(doc)
     blocks_before = doc_map(doc, idx)
@@ -56,9 +76,13 @@ def _run_one(n, task, src):
     t0 = time.perf_counter()
     try:
         result, doc, idx = run_edit(doc, idx, task)
-    except httpx.TransportError as e:
-        # обрыв транспорта — не повод терять остальные правки (см. colbert_run.py);
-        # doc/idx либо не тронуты, либо run_edit сам откатил их на месте
+    except Exception as e:
+        # Было except httpx.TransportError — живой прогон 40 правок умер на
+        # ДВУХ других исключениях (JSONDecodeError на "Extra data" в
+        # _final_ops, ValueError на set_format с "u": "null"), и любое из них
+        # убивало ВЕСЬ прогон корпуса, а не одну правку. Обрыв транспорта не
+        # особый случай — правило то же для любого исключения: doc/idx либо
+        # не тронуты, либо run_edit сам откатил их на месте (см. edit.py)
         elapsed = time.perf_counter() - t0
         blocks_after = doc_map(doc, idx)
         texts_after = [_btext(b) for b in blocks_after]
@@ -87,6 +111,7 @@ def _run_one(n, task, src):
         "styles_before": styles_before, "styles_after": styles_after,
         "chars_before": chars_before, "chars_after": sum(len(t) for t in texts_after),
         "seconds": elapsed,
+        "calls": getattr(_calls, "n", 0),
     }
     return record, doc
 
