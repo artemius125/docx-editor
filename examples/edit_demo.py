@@ -2878,10 +2878,16 @@ def test_deleted_block_is_not_shown_as_truncated_text():
     before = doc_map(doc, idx)
     patch.apply(doc, idx, {"op": "replace_text", "id": "p0", "old": "слегка правится", "new": "правится"})
     patch.apply(doc, idx, {"op": "delete", "id": "p1"})
+    patch.apply(doc, idx, {"op": "insert_paragraphs", "id": "p0", "items": [
+        {"text": "6. Пересмотр", "style": "Heading 1"},
+        {"text": "Раздел пересматривается раз в год.", "style": "Normal"},
+    ]})
 
     diff = edit_mod._diff(before, doc_map(doc, idx))
     deleted = next(d for d in diff if d["id"] == "p1")
     assert deleted.get("deleted") is True, deleted
+    added = [d for d in diff if d.get("inserted")]
+    assert len(added) == 2 and added[0]["note"] == 'стиль «Heading 1»', added
 
     sent = {}
     real_chat = llm_mod.chat
@@ -2893,7 +2899,9 @@ def test_deleted_block_is_not_shown_as_truncated_text():
 
     assert "p1: блок удалён целиком" in sent["user"], sent["user"]
     assert "стало 0 зн." not in sent["user"], sent["user"]
-    print("edit_demo: удалённый блок назван Проверяющему удалением, а не обрубленным текстом")
+    assert 'новый блок, стиль «Heading 1»' in sent["user"], sent["user"]
+    assert "было 0 зн." not in sent["user"], sent["user"]
+    print("edit_demo: удалённый и новый блоки названы Проверяющему своими именами, а не длинами 0 зн.")
 
 
 def test_off_term_allows_op_covering_whole_variant():

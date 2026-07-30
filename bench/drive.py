@@ -26,6 +26,13 @@ from run import CORPORA  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
 
+# Структурный корпус (таблица, заголовки, список) лежит в репозитории и в
+# CORPORA стенда не входит — у run.py 20 правок, здесь их 10.
+CORPORA = dict(CORPORA, reglament={
+    "doc": str(HERE / "fixtures" / "Регламент.docx"),
+    "edits": str(HERE / "fixtures" / "Правки_Регламент_10.md"),
+})
+
 
 class Stop(Exception):
     """Ответа на этот вызов ещё нет — печатаем запрос и выходим."""
