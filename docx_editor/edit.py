@@ -1166,6 +1166,25 @@ def _hf_state(doc):
     return (sec.header.is_linked_to_previous, sec.footer.is_linked_to_previous)
 
 
+def _leftover_variants_error(base_variants, blocks_after):
+    """Правка класса «единое написание термина» не может быть `done`, пока в
+    документе стоит НЕСКОЛЬКО написаний из посчитанного инвентаря — это и есть
+    самая старая ложь проекта (`c7`: вердикт «выполнено», а в тексте пять
+    написаний). Проверка была у снятого маршрута `unify` (вердикт считался по
+    инвентарю, а не по словам модели) и ушла вместе с ним; здесь она
+    возвращается на общий путь, где ей и место — считает КОД, не модель.
+
+    Берётся БАЗОВЫЙ инвентарь (якоря и цитаты запроса), без словоформ из
+    _term_forms: склонения одного и того же написания — не разные варианты."""
+    if not base_variants:
+        return None
+    left = sorted(v for v in base_variants if find.by_text(blocks_after, v))
+    if len(left) < 2:
+        return None
+    return (f'правка требовала одного написания, а в документе осталось несколько: '
+            f'{", ".join(f"«{v}»" for v in left)} — часть вариантов не заменена')
+
+
 def _move_no_op_error(applied_ops, before, after):
     """В11 (находка Н68): «перенеси пункт про окно на первое место» дала два
     move_after, которые в сумме вернули список в исходный порядок — оба
@@ -1192,7 +1211,7 @@ def _move_no_op_error(applied_ops, before, after):
 
 
 def _finish(doc, idx, snapshot_path, blocks_before, applied, request, checker, nav, editor_reply, tries,
-            hf_before=None, applied_ops=()):
+            hf_before=None, applied_ops=(), base_variants=None):
     """Общий хвост ПОСЛЕ применения операций — общий и для одного вызова
     Редактора, и для нескольких (см. _run_clusters): diff по всему снимку →
     Проверяющий → вердикт → коммит/откат. Ровно один снимок, один diff, один
@@ -1230,6 +1249,15 @@ def _finish(doc, idx, snapshot_path, blocks_before, applied, request, checker, n
         doc, idx = _restore(snapshot_path)
         reply = {"nav": nav, "editor": editor_reply}
         return ({"verdict": "failed", "reason": trace_err, "applied": applied, "ids": [],
+                  "iter": tries, "reply": reply}, doc, idx, tries)
+
+    # Самая старая ложь проекта: правка «сделай одно написание» отчитывается
+    # выполненной, а в документе стоит несколько. Считает код по инвентарю.
+    left_err = _leftover_variants_error(base_variants, blocks_after)
+    if left_err is not None:
+        doc, idx = _restore(snapshot_path)
+        reply = {"nav": nav, "editor": editor_reply}
+        return ({"verdict": "failed", "reason": left_err, "applied": applied, "ids": [],
                   "iter": tries, "reply": reply}, doc, idx, tries)
 
     # Н68: move_after, применившийся без ошибки, ещё не значит «переместил» —
@@ -1398,8 +1426,9 @@ def _run_clusters(doc, idx, blocks, ids, request, editor, checker, nav, fallthro
     # это обычная local-правка, у которой инвентарь варьируется по ДРУГОЙ
     # причине (несколько цитат старого/нового текста, см. edit_demo.py
     # test_edit_12_on_real_doc_fixture) и не означает «трогать только термин».
-    term_variants = ({v for v, n in _variant_counts(blocks, nav, request)}
+    base_variants = ({v for v, n in _variant_counts(blocks, nav, request)}
                       if inventory and nav.get("kind") == "unify" else None)
+    term_variants = set(base_variants) if base_variants else base_variants
     if term_variants:
         term_variants |= _term_forms(blocks, term_variants)
 
@@ -1508,7 +1537,8 @@ def _run_clusters(doc, idx, blocks, ids, request, editor, checker, nav, fallthro
                 "reply": {"nav": nav, "editor": editor_replies}}, doc, idx
 
     result, doc, idx, tries = _finish(doc, idx, snapshot_path, blocks_before, applied_all, request, checker, nav,
-                                       editor_replies, tries_total, hf_before, ops_all)
+                                       editor_replies, tries_total, hf_before, ops_all,
+                                       base_variants=base_variants)
     if result is not None:
         return result, doc, idx
     return _failed("операции применились, но текст не изменился", nav, editor_replies, tries), doc, idx
