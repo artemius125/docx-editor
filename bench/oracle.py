@@ -89,6 +89,60 @@ def c19(before, after, sb, sa, docx_path=None):
     return sa.count("[table]") > sb.count("[table]")
 
 
+def _expanded_once(b, a, term):
+    # Расшифровка обязана появиться сразу после ПЕРВОГО упоминания термина, а
+    # у остальных упоминаний окно вокруг термина должно остаться нетронутым —
+    # иначе расшифровка либо не встала вовсе, либо размножилась не на то
+    # вхождение (замер w25: FLOPs расшифрован дважды — и на первом, и на
+    # втором появлении — verdict соврал «done», проверка это ловит).
+    # Окно берётся ПО ОБЕ стороны термина: расшифровку можно поставить и в
+    # скобках после («nDCG@10 (normalized Discounted…)»), и заменой перед
+    # («normalized Discounted… (nDCG@10)») — маркер обязан выражать просьбу,
+    # а не диктовать один способ (правило В8, на нём уже переписаны m9 и c12).
+    bp = [(m.start(), m.end()) for m in re.finditer(re.escape(term), b)]
+    ap = [(m.start(), m.end()) for m in re.finditer(re.escape(term), a)]
+    if not bp or len(bp) != len(ap):
+        return None
+    wb = [b[max(0, s - 40):e + 60] for s, e in bp]
+    wa = [a[max(0, s - 40):e + 60] for s, e in ap]
+    return wa[0] != wb[0] and all(x == y for x, y in zip(wa[1:], wb[1:]))
+
+
+_WORKS = ("Khattab", "Weller", "Luan", "ColBERTv2", "PLAID", "ColPali",
+          "Rivera", "Menolascina", "Remy", "CMC", "MetaEmbed", "PyLate")
+
+
+def c20(before, after, sb, sa, docx_path=None):
+    # Просьба: списка литературы нет вообще — собери в КОНЦЕ и пронумеруй.
+    # Маркер не диктует ни оформление записей, ни поля («желательно полями» —
+    # пожелание, а не условие), ни полноту списка: проверяется, что в хвосте
+    # документа появился раздел, называющий хотя бы пять из перечисленных в
+    # правке работ, и что записи пронумерованы — текстом («1.») или списочным
+    # стилем Word. Достоверность выходных данных проверить нечем — это
+    # названо ограничением мерила, а не засчитано в успех.
+    tail_n = max(1, len(after) - len(before) + 1)
+    tail, tail_styles = after[-tail_n:], sa[-tail_n:]
+    text = _j(tail)
+    if not re.search(r"(?i)список\s+литератур|литература|библиограф|references", text):
+        return False
+    if sum(1 for w in _WORKS if w in text) < 5:
+        return False
+    numbered = bool(re.search(r"(?m)^\s*\[?\d+[.)\]]", text)) or any("List" in s for s in tail_styles)
+    return numbered
+
+
+def c14(before, after, sb, sa, docx_path=None):
+    # Формулировка не диктует способ расшифровки — только то, что она у
+    # ПЕРВОГО появления каждой метрики и не повторяется у остальных.
+    b, a = _j(before), _j(after)
+    results = [_expanded_once(b, a, t) for t in ("nDCG@10", "MRR@10", "Recall@k", "FLOPs")]
+    if any(r is False for r in results):
+        return False
+    if any(r is True for r in results):
+        return True
+    return None
+
+
 # --- math ---
 
 def _violates_spacing(texts):
@@ -303,8 +357,14 @@ def m20(before, after, sb, sa, docx_path=None):
 CHECKS = {
     "colbert": {
         1: c1, 2: c2, 3: c3, 4: c4, 5: c5, 6: c6, 7: c7, 8: c8, 9: c9, 10: c10,
-        11: c11, 12: c12, 13: c13, 14: None, 15: None, 16: c16, 17: c17, 18: c18,
-        19: c19, 20: None,
+        # 15 остаётся n/a сознательно: правка просит «привести в порядок»
+        # вложенность списка И разнобой жирный/курсив в подписях, а что
+        # считать порядком — не сказано ни в правке, ни в документе. Любой
+        # маркер здесь диктовал бы ОДИН вариант оформления, а это ровно то,
+        # из-за чего пришлось переписывать m9, c12 и c16. Честный пробел
+        # мерила: одна правка из сорока не измеряется.
+        11: c11, 12: c12, 13: c13, 14: c14, 15: None, 16: c16, 17: c17, 18: c18,
+        19: c19, 20: c20,
     },
     "math": {
         1: m1, 2: m2, 3: m3, 4: m4, 5: m5, 6: m6, 7: m7, 8: m8, 9: m9, 10: m10,
