@@ -2937,6 +2937,9 @@ def test_deleted_block_is_not_shown_as_truncated_text():
     assert "стало 0 зн." not in sent["user"], sent["user"]
     assert 'новый блок, стиль «Heading 1»' in sent["user"], sent["user"]
     assert "было 0 зн." not in sent["user"], sent["user"]
+    # Правка текста режет runs иначе, и сравнение runs заявляло изменение
+    # оформления там, где его не было («без оформления» → «без оформления»).
+    assert "оформление" not in sent["user"], sent["user"]
     print("edit_demo: удалённый и новый блоки названы Проверяющему своими именами, а не длинами 0 зн.")
 
 
