@@ -133,7 +133,13 @@ def doc_map(doc, idx):
         elif el.tag == _TBL:
             t = Table(el, doc)
             rows = [[cell.text for cell in row.cells] for row in t.rows]
-            blocks.append({"id": block_id, "kind": "t", "rows": rows})
+            # Начертание ячеек: без него set_format по row/col не менял НИЧЕГО
+            # видимого diff'у (текст ячейки тот же), и правка «выдели жирным
+            # первый столбец» всегда падала с «операции применились, но текст
+            # не изменился» — прогон за рулём 2026-07-30, правка 9.
+            fmt = [[[[r.get("b"), r.get("i"), r.get("u")] for p in cell.paragraphs for r in _runs(p)]
+                    for cell in row.cells] for row in t.rows]
+            blocks.append({"id": block_id, "kind": "t", "rows": rows, "fmt": fmt})
     return blocks
 
 

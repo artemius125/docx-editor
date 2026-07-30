@@ -2863,6 +2863,42 @@ def test_off_term_op_blocked_on_local_path_after_unify_fallthrough():
     print("edit_demo: Редактор на локальном пути (после unify-фолбэка) не смог тронуть чужое слово 'кандидата'")
 
 
+def test_set_format_in_table_cell_is_visible_to_diff():
+    # Прогон за рулём 2026-07-30, правка 9 («выдели жирным первый столбец»):
+    # set_format по row/col применялся, но блок таблицы нёс только тексты
+    # ячеек — diff не видел ничего, и правка падала с «операции применились,
+    # но текст не изменился». Ни одна правка начертания в таблице не могла
+    # завершиться иначе как отказом.
+    doc = Document()
+    table = doc.add_table(rows=2, cols=2)
+    table.cell(0, 0).text = "Роль"
+    table.cell(0, 1).text = "Зона ответственности"
+    table.cell(1, 0).text = "Релиз-менеджер"
+    table.cell(1, 1).text = "Решение о выпуске"
+    idx = index(doc)
+
+    def fake_navigator(outline_text, request):
+        return {"kind": "local", "rule": None, "ids": ["t0"], "anchors": [], "trace": "table"}
+
+    def fake_editor(fragment_text, request, feedback=None):
+        assert feedback is None, feedback
+        return {"ops": [{"op": "set_format", "id": "t0", "row": 1, "col": 0,
+                         "old": "Релиз-менеджер", "b": True}]}
+
+    def fake_checker(request, diff):
+        assert any("оформление ячеек изменено" in (d.get("note") or "") for d in diff), diff
+        return {"ok": True, "reason": "ok"}
+
+    result, doc, idx = run_edit(
+        doc, idx, "выдели жирным названия ролей в первом столбце",
+        navigator=fake_navigator, editor=fake_editor, checker=fake_checker,
+    )
+
+    assert result["verdict"] == "done", result
+    assert table.cell(1, 0).paragraphs[0].runs[0].bold is True
+    print(f"edit_demo: начертание ячейки таблицы видно diff'у, verdict={result['verdict']!r}")
+
+
 def test_deleted_block_is_not_shown_as_truncated_text():
     # Прогон за рулём 2026-07-30: удалённый блок уходил Проверяющему строкой
     # «было N зн. «…» стало 0 зн. «»», а _CHECK_PROMPT велит считать такую
@@ -3007,3 +3043,4 @@ if __name__ == "__main__":
     test_off_term_op_blocked_on_local_path_after_unify_fallthrough()
     test_off_term_allows_op_covering_whole_variant()
     test_deleted_block_is_not_shown_as_truncated_text()
+    test_set_format_in_table_cell_is_visible_to_diff()

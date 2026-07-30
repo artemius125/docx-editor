@@ -629,6 +629,13 @@ def _struct_note(b, a):
     ран без w:t) — без счётчика правка терялась тем же способом, что раньше
     set_style/move_after. Сравнение fields — тот же приём для В2-бис: field
     (w:fldSimple/w:fldChar) тоже не меняет текст абзаца ни на символ."""
+    if b["kind"] == "t" and a["kind"] == "t":
+        # Начертание ячеек — единственная структура таблицы, которую умеет
+        # менять операция (set_format по row/col); без этой ветки её результат
+        # был невидим diff'у и правка не могла завершиться иначе как отказом.
+        changed = [f"r{ri}c{ci}" for ri, (rb, ra) in enumerate(zip(b.get("fmt") or [], a.get("fmt") or []))
+                   for ci, (cb, ca) in enumerate(zip(rb, ra)) if cb != ca]
+        return f'оформление ячеек изменено ({", ".join(changed)})' if changed else None
     if b["kind"] != "p" or a["kind"] != "p":
         return None
     parts = []
