@@ -123,9 +123,14 @@ def m9(before, after, sb, sa, docx_path=None):
     # СПИСКУ блоков, то есть точное равенство элементу, а блок в документе —
     # «Сначала — о первом.» с тире и точкой. Возвращала False всегда, из-за
     # чего верная правка считалась провалом и вдобавок ложным вердиктом.
-    frag = "Сначала — о первом."
-    alone = lambda blocks: any(t.strip() == frag for t in blocks)
-    merged = any(frag in t and len(t) > len(frag) for t in after)
+    # Второй раз сломана тем же способом (w19): маркер держал КОНЕЧНУЮ ТОЧКУ,
+    # а слияние двух абзацев её законно меняет — модель написала «Сначала — о
+    # первом: в этой позиции…», и верная правка снова считалась провалом, да
+    # ещё и ложным вердиктом. Знак в конце фразы к сути правки не относится.
+    frag = "Сначала — о первом"
+    strip_tail = lambda t: t.strip().rstrip(".:;,—- ")
+    alone = lambda blocks: any(strip_tail(t) == frag for t in blocks)
+    merged = any(frag in t and len(strip_tail(t)) > len(frag) for t in after)
     return alone(before) and not alone(after) and merged
 
 
