@@ -138,16 +138,6 @@ def _mid_word_cut(haystack, span):
     return end < len(haystack) and haystack[end - 1].isalnum() and haystack[end].isalnum()
 
 
-def _word_bounded(text, start, end):
-    """True — совпадение [start:end) не приклеено к букве/цифре соседнего
-    слова ни слева, ни справа. Нужна флагу "word" у replace_all (Ф18): без
-    него «Bi-encoder» считался бы найденным и переписывался бы внутри
-    «Bi-encoders» — того самого случая, ради которого флаг введён."""
-    left_ok = start == 0 or not text[start - 1].isalnum()
-    right_ok = end == len(text) or not text[end].isalnum()
-    return left_ok and right_ok
-
-
 def _mid_word_error(block_id, old):
     where = f"{block_id}: " if block_id else ""
     return (
@@ -349,19 +339,11 @@ def validate(blocks, op, doc):
             if _ellipsis_truncation(old, new):
                 return _ellipsis_error(op["id"])
         else:
-            # word=True (Ф18, replace_all с флагом): совпадение внутри более
-            # длинного слова («Bi-encoder» внутри «Bi-encoders») — не ошибка
-            # обрезания, это ровно то, что флаг обязан молча пропустить, а не
-            # завернуть всю операцию. Такой span просто не считается ни found,
-            # ни cut — сам факт его существования не отклоняет операцию.
-            word = op.get("word")
             found = cut = False
             for b in blocks:
                 for t in ([b["text"]] if b["kind"] == "p" else _table_texts(b)):
                     span = _flex_span(t, old)
                     if span is not None:
-                        if word and not _word_bounded(t, *span):
-                            continue
                         found = True
                         cut = cut or _mid_word_cut(t, span)
             if not found:
@@ -967,7 +949,7 @@ def _op_delete_col(doc, idx, op):
 
 
 def _op_replace_all(doc, idx, op):
-    old, new, word = op["old"], op["new"], op.get("word")
+    old, new = op["old"], op["new"]
     total = blocks_touched = 0
     for p_el in doc.element.body.iter(qn("w:p")):
         full = _ptext(p_el)
@@ -978,10 +960,6 @@ def _op_replace_all(doc, idx, op):
                 break
             m_start, m_end = pos + span[0], pos + span[1]
             pos += span[1]
-            # word=True (Ф18): матч приклеен к соседней букве/цифре — часть
-            # более длинного слова («Bi-encoders»), а не сам термин, пропускаем.
-            if word and not _word_bounded(full, m_start, m_end):
-                continue
             matches.append((m_start, m_end))
         if not matches:
             continue

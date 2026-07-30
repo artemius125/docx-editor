@@ -241,27 +241,6 @@ def _check(request, diff):
     return llm.chat(messages)
 
 
-_UNIFY_PROMPT = """Ты — редактор, приводящий документ .docx к единообразию.
-Тебе дают инвентарь вариантов написания/формата, посчитанный кодом по всему
-документу (строку "Найдено в документе: «вариант» — N блока/блоков, ..."),
-и текст правки. Выбери ОДИН канонический вариант из инвентаря и перечисли
-КАЖДЫЙ из остальных вариантов инвентаря как пару ["вариант","канонический"]
-— код сам заменит их по всему документу везде, где они встречаются как
-отдельное слово/фраза; ты только решаешь, что на что менять, замену делает
-код. Канонический вариант в pairs на себя не добавляется. Верни ТОЛЬКО JSON
-{"pairs": [["старое","новое"], ...], "note": "..."}. Если по инвентарю
-нельзя понять, какой вариант канонический, или правка на самом деле не про
-единообразие написания/формата — верни {"pairs": [], "note": "почему"}. Это
-честный отказ, а не провал — пустые pairs с внятной note ожидаемы не реже,
-чем список пар."""
-
-
-def _unify_llm(inventory_text, request):
-    messages = [
-        {"role": "system", "content": _UNIFY_PROMPT},
-        {"role": "user", "content": f"{inventory_text}\n\nПравка: {request}"},
-    ]
-    return llm.chat(messages)
 
 
 _ID_PREFIX = re.compile(r"^p\d+\s+")
@@ -369,9 +348,8 @@ def _variant_counts(blocks, nav, request):
     Навигатора + дословные цитаты из текста правки), частоты через
     find.by_text. Вариант с нулём попаданий отбрасывается (найден не по
     тексту документа, а домыслен). Общая основа для _variant_inventory
-    (строка для промпта Редактора-унификатора) и для _run_unify (Ф18-бис:
-    вердикт проверяется по ЭТОМУ инвентарю, а не по списку пар модели —
-    вариант, который модель не назвала, обязан пропасть из документа тоже)."""
+    (строка для промпта Редактора) и для гварда термина (_off_term_error):
+    правка класса «единое написание» правит ТОЛЬКО посчитанные варианты."""
     variants = _dedupe([_strip_anchor(a) for a in (nav.get("anchors") or [])] + _literals(request))
     counts = [(v, len(find.by_text(blocks, v))) for v in variants]
     return [(v, n) for v, n in counts if n > 0]
@@ -777,10 +755,10 @@ def _out_of_lane(op, fragment_ids):
 
 def _off_term_error(op, term_variants):
     """В11 (находка Н69): правка класса «единое написание термина» бьёт по
-    ЧУЖОЙ фразе не только на маршруте unify (В6/Н62 — «Сборка кандидата» →
-    «Сборка релиз-кандидата»), но и на ЛОКАЛЬНОМ пути, когда Навигатор не
-    распознал unify и правка идёт обычным _run_clusters — там защиты не было
-    вовсе. term_variants — множество вариантов термина, уже посчитанное
+    ЧУЖОЙ фразе («Сборка кандидата» → «Сборка релиз-кандидата», В6/Н62):
+    правка класса «единое написание термина» (kind=unify у Навигатора — это
+    теперь только КЛАСС, отдельного маршрута у него нет) идёт обычным
+    _run_clusters, и без гварда Редактор повторяет ту же порчу. term_variants — множество вариантов термина, уже посчитанное
     кодом (_variant_counts, то же самое, что строит инвентарь для промпта, —
     второй инвентарь не заводим). None — эта правка не того класса (инвентарь
     пуст/не считался), гвард выключен. Иначе: replace_text/replace_all,
@@ -981,7 +959,7 @@ def _apply_ops(doc, idx, ops, fragment_text, request, editor, fragment_ids=None,
     класса, гвард выключен. См. `_off_term_error`: replace_text/replace_all,
     чей "old" не входит в этот набор, отклоняется как невалидная операция —
     защита В6/Н62 («Сборка кандидата» → «Сборка релиз-кандидата») раньше
-    стояла только на маршруте unify, здесь распространена на локальный путь.
+    включается по классу правки, названному Навигатором (kind=unify).
 
     fragment_ids=None — гвард выключен (путь rule: editor=None, id-полей у
     normalize нет). Иначе — set id блоков фрагмента, который видел Редактор;
@@ -1368,9 +1346,9 @@ def _run_clusters(doc, idx, blocks, ids, request, editor, checker, nav, fallthro
     hf_before = _hf_state(doc)
     clusters = _cluster(blocks, ids, around=len(blocks) if single_cluster else 1)
     inventory = _variant_inventory(blocks, nav, request)
-    # Н69: та же правка класса «единое написание термина», но упавшая на
-    # ЛОКАЛЬНЫЙ путь (см. _run_unify → _run_local при _inflects/без единого
-    # канона) — инвентарь уже посчитан для промпта (см. inventory выше),
+    # Н69: правка класса «единое написание термина» идёт обычным локальным
+    # путём (собственного маршрута у класса больше нет) — инвентарь уже
+    # посчитан для промпта (см. inventory выше),
     # берём его же набором вариантов для _off_term_error, второй инвентарь не
     # строим. Только когда Навигатор НАЗВАЛ класс unify (nav["kind"]) — иначе
     # это обычная local-правка, у которой инвентарь варьируется по ДРУГОЙ
@@ -1489,122 +1467,7 @@ def _run_clusters(doc, idx, blocks, ids, request, editor, checker, nav, fallthro
     return _failed("операции применились, но текст не изменился", nav, editor_replies, tries), doc, idx
 
 
-def _word_pattern(text):
-    """Regex словограничного, пробельно-гибкого поиска text по всему
-    документу — та же техника, что и find._flex_span (части, разбитые по
-    пробельным разрывам, между ними \\s+), плюс границы слова (?<!\\w)…(?!\\w)
-    снаружи, чтобы «Bi-encoder» не считался найденным внутри «Bi-encoders»."""
-    parts = [re.escape(p) for p in re.split(r"\s+", text) if p]
-    return r"(?<!\w)" + r"\s+".join(parts) + r"(?!\w)"
-
-
 _CYRILLIC_RX = re.compile(r"[а-яё]", re.IGNORECASE)
-
-
-def _inflects(word):
-    """В6: True — word похоже на русскую словоформу, которая может менять
-    окончание по падежу/числу/роду. unify заменяет буквально, без спряжения
-    (replace_all по всему документу) — измерено дважды на battery: канон
-    «литий-ионный» (именительный, ед.ч., муж.р.) встал во ВСЕ позиции,
-    включая те, где нужен был другой падеж/число («литий-ионный
-    аккумуляторы», «литий-ионный состоит»). Такое умеет только Редактор
-    (локальный путь, per-occurrence).
-
-    Латиница, аббревиатуры (ВСЕ буквы прописные — не склоняются как обычное
-    слово), числа и даты — безопасны для буквальной замены, поэтому не
-    кириллица или кириллица целиком в верхнем регистре не считается
-    инфлексией."""
-    return bool(_CYRILLIC_RX.search(word)) and word != word.upper()
-
-
-def _run_unify(doc, idx, blocks, nav, request, editor, checker, unifier):
-    """Ф18: правки вида «сделай одинаково по всему документу» (унификация
-    термина, дат, чисел) — по замеру w12 самый большой источник провалов и
-    единственный источник лжи (ColBERT 7: вердикт done при ЧЕТЫРЁХ написаниях
-    Bi-encoder в файле). Причина — кластеры (_run_clusters) видят только свой
-    кусок документа и "унифицируют" к тому варианту, который уже стоит перед
-    ними. Здесь ОДИН вызов модели решает, какие пары заменить, а всю мутацию
-    и весь вердикт делает код (инвариант 1/5) — Проверяющий-LLM на этом пути
-    не зовётся вовсе, вердикт — это счёт оставшихся вхождений.
-
-    Инвентарь (_variant_counts) пуст, если в документе меньше двух реально
-    найденных вариантов — Навигатор промахнулся с маршрутом unify, это
-    обычная локальная (или пустая) правка: тот же путь, что и раньше до Ф18.
-
-    Дефект w13 (ColBERT 7): вердикт "done" сверялся только с ПАРАМИ, которые
-    назвала модель — вариант, который она не назвала (или обрубок вроде
-    "Single-vector" вместо "Single-Vector Bi-encoders"), молча оставался в
-    документе, а код всё равно говорил "заменено". Теперь: (1) применяется
-    только пара, чей old буквально совпадает с посчитанным инвентарём — код
-    посчитал документ, модель нет, невыдуманный вариант не портит текст;
-    (2) все применённые пары обязаны сходиться к ОДНОМУ new — иначе модель
-    не выбрала канон, это честный failed; (3) вердикт проверяется по ВСЕМУ
-    инвентарю, а не по списку пар модели — вариант, не попавший ни в одну
-    применённую пару, тоже обязан пропасть из документа."""
-    counts = _variant_counts(blocks, nav, request)
-    if len(counts) < 2:
-        return _run_local(doc, idx, blocks, nav, request, editor, checker)
-    inventory = _variant_inventory(blocks, nav, request)
-
-    reply = unifier(inventory, request) or {}
-    pairs = [tuple(p) for p in (reply.get("pairs") or []) if isinstance(p, (list, tuple)) and len(p) == 2]
-    if not pairs:
-        return _failed(reply.get("note") or "модель не предложила ни одной пары для унификации", nav, reply), doc, idx
-
-    # Замер w14: маршрут не должен ПЕРЕХВАТЫВАТЬ правку, которую он не тянет.
-    # Пары не совпали с инвентарём (Математика 5) или разошлись по нескольким
-    # канонам (ColBERT 4 — шесть разных чисел, ColBERT 12 — две формулировки):
-    # это не унификация одного написания, а обычная локальная правка, и в w12
-    # локальный путь её делал. Отказ здесь был чистой потерей: −4 правки.
-    variant_set = {v for v, n in counts}
-    pairs = [(old, new) for old, new in pairs if old != new and old in variant_set]
-
-    # В6: русская словоформа, способная склоняться, не унифицируется буквальной
-    # заменой (см. _inflects) — это работа Редактора, не document-wide replace_all.
-    if any(_inflects(old) or _inflects(new) for old, new in pairs):
-        return _run_local(doc, idx, blocks, nav, request, editor, checker)
-
-    canonicals = {new for old, new in pairs}
-    if len(canonicals) != 1:
-        return _run_local(doc, idx, blocks, nav, request, editor, checker)
-    canonical = canonicals.pop()
-
-    # УБЫВАНИЕ длины old — иначе «Bi-encoder» переписал бы внутренность
-    # «Bi-encoders» до того, как до неё дойдёт её собственная пара.
-    pairs = sorted(pairs, key=lambda p: -len(p[0]))
-    snapshot_path = _snapshot(doc)
-    applied, replaced_n = [], 0
-    for old, new in pairs:
-        op = {"op": "replace_all", "old": old, "new": new, "word": True}
-        err = patch.validate(doc_map(doc, idx), op, doc)
-        if err is not None:
-            continue
-        desc = patch.apply(doc, idx, op)
-        applied.append(desc)
-        m = re.search(r"Заменено (\d+) вхождений", desc)
-        replaced_n += int(m.group(1)) if m else 0
-
-    # Вердикт по СВОЕМУ инвентарю (Defect 1), не по списку пар модели.
-    # Вариант, оказавшийся ПОДСТРОКОЙ канонической формы (Defect 2, Математика
-    # 5: канон добавил кавычки вокруг старого текста), не считается
-    # оставшимся — он неизбежно найдётся внутри canonical.
-    blocks_after = doc_map(doc, idx)
-    remaining = [v for v, n in counts if v != canonical and v not in canonical
-                 and find.by_regex(blocks_after, _word_pattern(v))]
-    if remaining:
-        doc, idx = _restore(snapshot_path)
-        reason = "не удалось привести к одному написанию, остались варианты: " + ", ".join(f"«{r}»" for r in remaining)
-        return _failed(reason, nav, reply, applied=applied), doc, idx
-
-    diff_all = _diff(blocks, blocks_after)
-    if not diff_all:
-        os.remove(snapshot_path)
-        return _already("документ уже унифицирован — заменять было нечего", nav, reply), doc, idx
-
-    os.remove(snapshot_path)
-    reason = f"заменено {replaced_n} вхождений {len(applied)} вариантов"
-    return {"verdict": "done", "reason": reason, "applied": applied, "ids": [d["id"] for d in diff_all],
-            "iter": 1, "reply": {"nav": nav, "editor": reply}}, doc, idx
 
 
 def _run_local(doc, idx, blocks, nav, request, editor, checker, fallthrough=False, single_cluster=False):
@@ -1636,7 +1499,7 @@ def _run_local(doc, idx, blocks, nav, request, editor, checker, fallthrough=Fals
     return _run_clusters(doc, idx, blocks, ids, request, editor, checker, nav, fallthrough, single_cluster)
 
 
-def run_edit(doc, idx, request, navigator=_navigate, editor=_edit_llm, checker=_check, unifier=_unify_llm):
+def run_edit(doc, idx, request, navigator=_navigate, editor=_edit_llm, checker=_check):
     """Один цикл правки. Возвращает (result, doc, idx) — после отката
     (verdict != "done" после применения) doc/idx уже перечитаны из снимка,
     старые ссылки вызывающего использовать нельзя.
@@ -1659,15 +1522,11 @@ def run_edit(doc, idx, request, navigator=_navigate, editor=_edit_llm, checker=_
     "уже чисто"/"не тот класс" от "не умею это делать", это умеет только
     реальная попытка через Редактора. done у rule — по-прежнему терминал.
 
-    Ф18: kind="unify" (навигатор) уходит в _run_unify — там "editor" в reply
-    не список ответов по кластерам, а ОДИН ответ unifier (пары "старое"→
-    "новое"), Проверяющий-LLM не зовётся вовсе, вердикт считает код.
-
-    Замер w14 отменил обратный порядок: rule ВЫШЕ unify, как и было до Ф18.
-    Когда Навигатор проставлял оба, а выигрывал unify, ломались ColBERT 6
-    (кавычки) и Математика 1 (пробелы) — обе делались нормализацией и обе
-    упали. Защита от неверного rule — не приоритет unify, а fallthrough
-    ниже: откат Проверяющего продолжается локальным путём.
+    Владелец 2026-07-30 снял маршрут unify целиком: измеренный четырежды
+    (w13–w16, w21), он ни разу не окупился. kind="unify" остался КЛАССОМ
+    правки — идёт обычным локальным путём, включая инвентарь вариантов в
+    промпте Редактора и гвард термина (_off_term_error), но собственного
+    маршрута, роли-унификатора и флага "word" у replace_all больше нет.
 
     Ф20: kind="compose" (Навигатор) идёт тем же _run_local/_run_clusters, что
     и обычная local-правка — единственная разница в single_cluster=True: одна
@@ -1680,8 +1539,6 @@ def run_edit(doc, idx, request, navigator=_navigate, editor=_edit_llm, checker=_
     rule = nav.get("rule")
 
     if not rule:
-        if nav.get("kind") == "unify":
-            return _run_unify(doc, idx, blocks, nav, request, editor, checker, unifier)
         if nav.get("kind") == "compose":
             return _run_local(doc, idx, blocks, nav, request, editor, checker, single_cluster=True)
         return _run_local(doc, idx, blocks, nav, request, editor, checker)
