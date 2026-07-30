@@ -434,6 +434,19 @@ def test_diff_move_and_insert():
     assert len(move_entries) == 1, move_diff
     assert move_entries[0]["id"] == "p0", move_diff
 
+    # Обмен двух СОСЕДЕЙ: сдвиг у обоих одинаковый, и без подсказки о реально
+    # применённой операции diff называл не тот блок (правка 10 прогона за
+    # рулём 2026-07-30: перенесли p1, а Проверяющему сообщили про p0).
+    doc3 = Document()
+    for t in ("Первый", "Второй", "Третий"):
+        doc3.add_paragraph(t)
+    idx3 = index(doc3)
+    before3 = doc_map(doc3, idx3)
+    patch.apply(doc3, idx3, {"op": "move_after", "id": "p1", "after": "p2"})
+    swap_diff = _diff(before3, doc_map(doc3, idx3), moved_ids=["p1"])
+    swap_entries = [d for d in swap_diff if "перемещ" in d.get("note", "")]
+    assert len(swap_entries) == 1 and swap_entries[0]["id"] == "p1", swap_diff
+
     doc2 = Document()
     for t in ("Первый", "Второй", "Третий", "Четвёртый"):
         doc2.add_paragraph(t)

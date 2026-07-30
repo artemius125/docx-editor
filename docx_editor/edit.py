@@ -662,7 +662,7 @@ def _struct_note(b, a):
     return "; ".join(parts) if parts else None
 
 
-def _move_note(before, after, a_by_id):
+def _move_note(before, after, a_by_id, moved_ids=()):
     """Запись diff'а на переместившийся блок, если множество id одинаково, а
     порядок отличается (move_after), иначе None. Переместившимся считается id
     с наибольшим сдвигом индекса — соседи, чья позиция сдвинулась заодно с
@@ -674,7 +674,13 @@ def _move_note(before, after, a_by_id):
         return None
     pos_before = {i: n for n, i in enumerate(order_before)}
     pos_after = {i: n for n, i in enumerate(order_after)}
-    moved_id = max(pos_before, key=lambda i: abs(pos_before[i] - pos_after[i]))
+    # Обмен двух соседей даёт одинаковый сдвиг у обоих, и max() называл
+    # Проверяющему НЕ тот блок: «перенеси пункт про окно выпуска» (правка 10
+    # прогона за рулём) отчитывалось как «p5 перемещён после p6», хотя
+    # переносили p6. moved_ids — id из реально применённых move_after, они и
+    # есть ответ на вопрос «что двигали».
+    candidates = [i for i in moved_ids if i in pos_before and i in pos_after] or list(pos_before)
+    moved_id = max(candidates, key=lambda i: abs(pos_before[i] - pos_after[i]))
     idx_after = pos_after[moved_id]
     after_id = order_after[idx_after - 1] if idx_after > 0 else None
     note = f"перемещён после {after_id}" if after_id else "перемещён в начало документа"
@@ -682,7 +688,7 @@ def _move_note(before, after, a_by_id):
     return {"id": moved_id, "before": text, "after": text, "note": note}
 
 
-def _diff(before, after):
+def _diff(before, after, moved_ids=()):
     """Блоки, у которых текст, стиль, уровень или список реально изменились,
     плюс исчезнувшие (delete) и появившиеся (insert_after/create_table) —
     только это видит Проверяющий, не документ целиком (инвариант 3 из
@@ -727,7 +733,7 @@ def _diff(before, after):
                 for i, b in b_by_id.items() if i not in a_by_id]
 
     if set(b_by_id) == set(a_by_id):
-        move = _move_note(before, after, a_by_id)
+        move = _move_note(before, after, a_by_id, moved_ids)
         if move:
             existing = next((c for c in changed if c["id"] == move["id"]), None)
             if existing:
@@ -1203,7 +1209,8 @@ def _finish(doc, idx, snapshot_path, blocks_before, applied, request, checker, n
     верить ярлыку trace от Навигатора) и _move_no_op_error (перенос, отменивший
     сам себя, не должен считаться перемещением)."""
     blocks_after = doc_map(doc, idx)
-    diff = _diff(blocks_before, blocks_after)
+    moved_ids = [op["id"] for op in applied_ops if op.get("op") == "move_after"]
+    diff = _diff(blocks_before, blocks_after, moved_ids)
     hf_changed = hf_before is not None and hf_before != _hf_state(doc)
     if not diff and not hf_changed:
         doc, idx = _restore(snapshot_path)
