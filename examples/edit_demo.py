@@ -1902,6 +1902,63 @@ def test_compose_single_editor_call_over_scattered_targets():
     print("edit_demo: compose дал один вызов Редактора над всеми тремя разнесёнными целями")
 
 
+def _run_two_targets(request, doc_words):
+    """Один прогон правки на двух разнесённых целях (p0 и p6 в документе из 12
+    абзацев — при обычной кластеризации это ДВА кластера). Возвращает список
+    фрагментов, показанных Редактору: сколько фрагментов, столько и вызовов."""
+    doc = Document()
+    for i in range(12):
+        doc.add_paragraph(f"Абзац {i}: {doc_words}.")
+    idx = index(doc)
+    target_ids = ["p0", "p6"]
+    calls = []
+
+    def fake_navigator(outline_text, request_):
+        # Тот же ярлык, что Навигатор реально вернул на colbert#11 во всех трёх
+        # прогонах, — не compose: решать класс обязан код, а не модель.
+        return {"kind": "unify", "rule": None, "ids": target_ids, "anchors": []}
+
+    def fake_editor(fragment_text, request_, feedback=None):
+        calls.append(fragment_text)
+        present = [t for t in target_ids
+                   if any(ln.startswith(f"{t} ") for ln in fragment_text.splitlines())]
+        return {"ops": [{"op": "replace_text", "id": t, "old": "термин", "new": "понятие"} for t in present]}
+
+    def fake_checker(request_, diff):
+        return {"ok": True, "reason": "ok"}
+
+    result, doc, idx = run_edit(
+        doc, idx, request,
+        navigator=fake_navigator, editor=fake_editor, checker=fake_checker,
+    )
+    assert result["verdict"] == "done", result
+    return calls
+
+
+def test_first_mention_edit_goes_in_one_cluster():
+    # Н41: правка, решение которой зависит от ПОРЯДКА мест в документе
+    # («английское написание дай один раз, при первом упоминании»), на
+    # кластерном пути неразрешима — кластеры слепы друг к другу, и каждый
+    # объявляет первым СВОЁ место. Улика: colbert#11 в замерах w22/w23/w24 —
+    # кластер p4 вписал «кросс-энкодеров (Cross-encoders)» как первое
+    # упоминание, следующий кластер вписал то же в p10, тоже как первое.
+    # Такая правка обязана идти ОДНИМ вызовом (тот же single_cluster, что у
+    # compose), и класс распознаёт код: Навигатор во всех трёх прогонах
+    # называл эту правку unify, хотя _NAV_PROMPT относит её к compose.
+    calls = _run_two_targets(
+        "Оставь русское написание, а английское дай один раз в скобках, "
+        "когда термин вводится первый раз.", "термин вводится тут")
+    assert len(calls) == 1, f"правка про первое упоминание обязана дать ОДИН вызов, получили {len(calls)}"
+    assert all(f"{t} " in calls[0] for t in ("p0", "p6")), \
+        f"единственный фрагмент обязан показать обе цели сразу: {calls[0]!r}"
+
+    # Вторая половина приёмки: обычная правка того же вида и на тех же целях
+    # НЕ должна поменять поведение — она по-прежнему дробится на два кластера.
+    plain = _run_two_targets("Приведи термин к единому написанию.", "термин вводится тут")
+    assert len(plain) == 2, f"обычная правка обязана остаться кластерной, получили {len(plain)} вызов(а)"
+    print("edit_demo: правка «при первом упоминании» идёт одним кластером, обычная — по-прежнему двумя")
+
+
 def test_compose_oversized_fragment_refused_document_unchanged():
     # Ф20: гвард объёма. compose собирает ОДИН фрагмент из всех целей — именно
     # здесь он способен вырасти за окно модели (ContextWindowExceededError уже
@@ -2736,6 +2793,7 @@ if __name__ == "__main__":
     test_rule_rolled_back_falls_through_to_local_done()
     test_footnote_only_edit_reaches_done_not_failed()
     test_compose_single_editor_call_over_scattered_targets()
+    test_first_mention_edit_goes_in_one_cluster()
     test_compose_oversized_fragment_refused_document_unchanged()
     test_position_end_resolves_to_last_block()
     test_trace_table_catches_paragraph_faking_a_row()

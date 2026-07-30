@@ -1515,6 +1515,34 @@ def _run_clusters(doc, idx, blocks, ids, request, editor, checker, nav, fallthro
     return _failed("операции применились, но текст не изменился", nav, editor_replies, tries), doc, idx
 
 
+_FIRST_MENTION_RX = re.compile(r"перв\w*\s+(?:раз|упомина\w*|появлен\w*|вхожден\w*|встреч\w*)|впервые",
+                                re.IGNORECASE)
+
+
+def _needs_document_order(request):
+    """Н41: правка, чьё решение зависит от ПОРЯДКА мест в документе — «дай
+    английское написание один раз, когда термин вводится первый раз». На
+    кластерном пути такая правка неразрешима: кластеры слепы друг к другу, и
+    каждый решает «первое упоминание — здесь» заново.
+
+    Улика (замеры w22, w23, w24, colbert#11, failed во всех трёх): кластер p4
+    пишет «кросс-энкодеров (Cross-encoders)» с примечанием «это первое
+    упоминание», следующий кластер пишет то же самое в p10 с примечанием «в
+    p10 термин вводится впервые» — расшифровка в скобках встаёт ДВАЖДЫ.
+    Строка «Уже сделано в этой правке» (ПАРТИЯ 5) этого не лечит: она была в
+    промпте всех трёх прогонов и называла кластеру ровно ту правку p4,
+    которую он повторил. Правка ТОГО ЖЕ класса colbert#14 («расшифруй каждую
+    при первом появлении») проходит 3/3 — единственная разница в том, что
+    Навигатор назвал её compose и кластеризация выключилась.
+
+    Класс распознаёт КОД, а не Навигатор: _NAV_PROMPT прямо называет «первое
+    упоминание» примером compose, и Навигатор всё равно вернул unify во всех
+    трёх прогонах (инвариант 1 — что решается детерминированно, решает код).
+    На обоих приёмочных корпусах (40 правок) образец находит ровно две
+    правки — c11 и c14, а вторая и так идёт одним кластером."""
+    return bool(_FIRST_MENTION_RX.search(request))
+
+
 _CYRILLIC_RX = re.compile(r"[а-яё]", re.IGNORECASE)
 
 
@@ -1581,15 +1609,19 @@ def run_edit(doc, idx, request, navigator=_navigate, editor=_edit_llm, checker=_
     правка строит одно целое из нескольких мест документа, поэтому
     кластеризация по соседству здесь противоречит задаче, а не помогает (см.
     _run_clusters). Своего "editor"/"reply" формата у compose нет — reply
-    остаётся списком из ОДНОГО ответа (один кластер — один вызов)."""
+    остаётся списком из ОДНОГО ответа (один кластер — один вызов).
+
+    Н41: single_cluster включает не только ярлык compose от Навигатора, но и
+    код — по тексту правки, когда решение зависит от порядка мест в документе
+    («первое упоминание», см. _needs_document_order). Остальные правки
+    кластеризуются как раньше."""
     blocks = doc_map(doc, idx)
     nav = navigator(find.outline(blocks), request) or {}
     rule = nav.get("rule")
 
     if not rule:
-        if nav.get("kind") == "compose":
-            return _run_local(doc, idx, blocks, nav, request, editor, checker, single_cluster=True)
-        return _run_local(doc, idx, blocks, nav, request, editor, checker)
+        single = nav.get("kind") == "compose" or _needs_document_order(request)
+        return _run_local(doc, idx, blocks, nav, request, editor, checker, single_cluster=single)
 
     # Правки типа rule идут мимо Редактора — код нормализует сам, LLM не зовём.
     ops, fragment_text = [{"op": "normalize", "rule": rule}], ""
