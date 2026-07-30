@@ -193,15 +193,122 @@ def m14(before, after, sb, sa, docx_path=None):
     return third_gone or you(_j(after)) < you(_j(before))
 
 
+def c8(before, after, sb, sa, docx_path=None):
+    # Формат годов должен стать ОДНИМ. Способ правка не диктует, поэтому
+    # считаем не конкретное написание, а число разных форм в тексте.
+    forms = set(re.findall(r"20\d\d\s*[–\-/]\s*20\d\d\s*(годов|годах|года|гг\.|г\.)?", _j(after)))
+    return len(forms) == 1
+
+
+def c11(before, after, sb, sa, docx_path=None):
+    # Русское написание везде, английское — один раз при вводе термина.
+    a = _j(after)
+    latin = re.findall(r"(?i)cross[-\s]?encoders?", a)
+    return len(latin) <= 1 and "росс-энкодер" in a
+
+
+def c13(before, after, sb, sa, docx_path=None):
+    # Двусмысленная фраза обязана перестать читаться двояко: в исходном виде
+    # («падение до 86–97%») она остаться не может. Каким словом уточнили —
+    # дело автора правки.
+    return "падение до 86–97%" not in _j(after)
+
+
+def c16(before, after, sb, sa, docx_path=None):
+    # Обозначения обязаны СОЙТИСЬ, а какое из двух станет общим — правка не
+    # диктует: модель законно привела первую формулу ко второй (замер w24).
+    # Считаем согласованность: во всех формулах индекс суммы один и тот же и
+    # индекс максимума один и тот же.
+    a = _j(after)
+    sums = set(re.findall(r"\\sum_\{i=1\}\^([mn])", a))
+    maxs = set(re.findall(r"\\max_\{1 ?\\le j ?\\le ([mn])\}", a))
+    return len(sums) == 1 and len(maxs) == 1 and sums != maxs
+
+
+def c17(before, after, sb, sa, docx_path=None):
+    a = _j(after)
+    return "транспонир" in a.lower() and "$\\top$ представляет собой скалярное произведение" not in a
+
+
+def c18(before, after, sb, sa, docx_path=None):
+    # Неточность именно в объяснении «благодаря недифференцируемой природе».
+    return "недифференцируемой природе" not in _j(after)
+
+
+def m7(before, after, sb, sa, docx_path=None):
+    # Обрубленное второе предложение («Там, где — нет, хмурились») обязано быть
+    # переписано; каким именно оборотом — дело автора.
+    return "Там, где — нет, хмурились" not in _j(after)
+
+
+def m8(before, after, sb, sa, docx_path=None):
+    return "сравнимый с маленьким ребёнком" not in _j(after)
+
+
+def m12(before, after, sb, sa, docx_path=None):
+    # Атрибуция смягчена: либо названы пифагорейцы, либо прямое утверждение
+    # «Пифагор ... утверждал» ушло.
+    a = _j(after)
+    return "пифагорейц" in a.lower() or "утверждал, что «всё есть число»" not in a
+
+
+def m13(before, after, sb, sa, docx_path=None):
+    # Два абзаца говорили одно и то же; после правки формула-повтор остаётся
+    # максимум в одном блоке.
+    return sum(1 for t in after if "мир чисел" in t) <= 1
+
+
+def m15(before, after, sb, sa, docx_path=None):
+    # Уточнить, что за соревнования были в университете: слитное утверждение
+    # «в средней школе И В УНИВЕРСИТЕТЕ выигрывал городские олимпиады» обязано
+    # уйти. Оба слова могут остаться в одном предложении — если школа и
+    # университет разведены (ровно это сделала модель в w24), правка верна.
+    return "школе и в университете я ежегодно выигрывал городские олимпиады" not in _j(after)
+
+
+def m16(before, after, sb, sa, docx_path=None):
+    # Раздел сжат примерно вдвое, но обязательные тезисы на месте. Границы
+    # раздела — от его заголовка до абзаца, которым глава кончается.
+    def section(texts):
+        start = next((i for i, t in enumerate(texts) if t.startswith("Немного о формулах")), None)
+        if start is None:
+            return None
+        end = next((i for i, t in enumerate(texts) if i > start and t.startswith("Потому что во второй части")),
+                   len(texts))
+        return sum(len(t) for t in texts[start:end])
+    was, now = section(before), section(after)
+    if not was or now is None:
+        return None
+    a = _j(after).lower()
+    kept = "формул" in a and "поясн" in a and ("провер" in a or "расчёт" in a)
+    return now <= was * 0.75 and kept
+
+
+def m17(before, after, sb, sa, docx_path=None):
+    # Неверное утверждение — что быстрой проверки простоты не существует.
+    # Требуем, чтобы именно оно ушло (первый вариант маркера был вакуумным:
+    # слово «тест» в документе есть и без правки).
+    return "является ли большое число простым, не существует" not in _j(after)
+
+
+def m18(before, after, sb, sa, docx_path=None):
+    return "Сакс" in _j(after)
+
+
+def m20(before, after, sb, sa, docx_path=None):
+    # Концовка обязана перестать быть одной строкой того же вида.
+    return "Потому что во второй части книги я собираюсь показать нечто действительно серьезное" not in _j(after)
+
+
 CHECKS = {
     "colbert": {
-        1: c1, 2: c2, 3: c3, 4: c4, 5: c5, 6: c6, 7: c7, 8: None, 9: c9, 10: c10,
-        11: None, 12: c12, 13: None, 14: None, 15: None, 16: None, 17: None, 18: None,
+        1: c1, 2: c2, 3: c3, 4: c4, 5: c5, 6: c6, 7: c7, 8: c8, 9: c9, 10: c10,
+        11: c11, 12: c12, 13: c13, 14: None, 15: None, 16: c16, 17: c17, 18: c18,
         19: c19, 20: None,
     },
     "math": {
-        1: m1, 2: m2, 3: m3, 4: m4, 5: m5, 6: m6, 7: None, 8: None, 9: m9, 10: m10,
-        11: m11, 12: None, 13: None, 14: m14, 15: None, 16: None, 17: None, 18: None,
-        19: m19, 20: None,
+        1: m1, 2: m2, 3: m3, 4: m4, 5: m5, 6: m6, 7: m7, 8: m8, 9: m9, 10: m10,
+        11: m11, 12: m12, 13: m13, 14: m14, 15: m15, 16: m16, 17: m17, 18: m18,
+        19: m19, 20: m20,
     },
 }
