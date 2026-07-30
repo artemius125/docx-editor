@@ -2863,6 +2863,39 @@ def test_off_term_op_blocked_on_local_path_after_unify_fallthrough():
     print("edit_demo: Редактор на локальном пути (после unify-фолбэка) не смог тронуть чужое слово 'кандидата'")
 
 
+def test_deleted_block_is_not_shown_as_truncated_text():
+    # Прогон за рулём 2026-07-30: удалённый блок уходил Проверяющему строкой
+    # «было N зн. «…» стало 0 зн. «»», а _CHECK_PROMPT велит считать такую
+    # форму обрубленным текстом — сжатие раздела через delete откатывалось
+    # (m16 замера w21). Проверяем и данные (_diff), и то, что реально уходит
+    # в модель (_check строит user-сообщение).
+    from docx_editor import llm as llm_mod
+
+    doc = Document()
+    doc.add_paragraph("Первый абзац остаётся и слегка правится.")
+    doc.add_paragraph("Второй абзац — повтор, его удаляем целиком.")
+    idx = index(doc)
+    before = doc_map(doc, idx)
+    patch.apply(doc, idx, {"op": "replace_text", "id": "p0", "old": "слегка правится", "new": "правится"})
+    patch.apply(doc, idx, {"op": "delete", "id": "p1"})
+
+    diff = edit_mod._diff(before, doc_map(doc, idx))
+    deleted = next(d for d in diff if d["id"] == "p1")
+    assert deleted.get("deleted") is True, deleted
+
+    sent = {}
+    real_chat = llm_mod.chat
+    llm_mod.chat = lambda messages, **kw: sent.setdefault("user", messages[1]["content"]) and None or {"ok": True, "reason": "ok"}
+    try:
+        edit_mod._check("убери повторяющийся абзац", diff)
+    finally:
+        llm_mod.chat = real_chat
+
+    assert "p1: блок удалён целиком" in sent["user"], sent["user"]
+    assert "стало 0 зн." not in sent["user"], sent["user"]
+    print("edit_demo: удалённый блок назван Проверяющему удалением, а не обрубленным текстом")
+
+
 def test_off_term_allows_op_covering_whole_variant():
     # Замер w20: гвард требовал ТОЧНОГО равенства варианту и рубил операции,
     # которые трогают сам термин вместе с окружением, — а это ровно то, что
@@ -2965,3 +2998,4 @@ if __name__ == "__main__":
     test_unify_word_not_term_kandidat_release_sentence()
     test_off_term_op_blocked_on_local_path_after_unify_fallthrough()
     test_off_term_allows_op_covering_whole_variant()
+    test_deleted_block_is_not_shown_as_truncated_text()
