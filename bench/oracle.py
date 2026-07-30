@@ -167,15 +167,38 @@ def m19(before, after, sb, sa, docx_path=None):
     return has_text and has_rel
 
 
+def c12(before, after, sb, sa, docx_path=None):
+    # Обе названные в запросе нестыковки «порядок против кратности» должны
+    # исчезнуть: «на порядок» с вилкой от шести и «два порядка» с ~170.
+    a = _j(after)
+    return "(в 6–10 раз)" not in a and "(в ~170 раз)" not in a
+
+
+def m5(before, after, sb, sa, docx_path=None):
+    # Название фильма было в круглых скобках, второе — в кавычках; после
+    # правки оба обязаны быть оформлены одинаково, кавычками.
+    a = _j(after)
+    return "«Человек, который познал бесконечность»" in a and "(Человек, который познал бесконечность)" not in a
+
+
+def m14(before, after, sb, sa, docx_path=None):
+    # Направление унификации запрос не задаёт («приведи к одному»), поэтому
+    # маркер, требующий конкретно «вы», врал бы на верной правке: засчитываем
+    # ЛИБО уход третьего лица из названной в запросе фразы, ЛИБО убыль «вы».
+    you = lambda t: len(re.findall(r"(?<!\w)вы(?!\w)", t))
+    third_gone = "чтобы читатель знал" not in _j(after)
+    return third_gone or you(_j(after)) < you(_j(before))
+
+
 CHECKS = {
     "colbert": {
         1: c1, 2: c2, 3: c3, 4: c4, 5: c5, 6: c6, 7: c7, 8: None, 9: c9, 10: c10,
-        11: None, 12: None, 13: None, 14: None, 15: None, 16: None, 17: None, 18: None,
+        11: None, 12: c12, 13: None, 14: None, 15: None, 16: None, 17: None, 18: None,
         19: c19, 20: None,
     },
     "math": {
-        1: m1, 2: m2, 3: m3, 4: m4, 5: None, 6: m6, 7: None, 8: None, 9: m9, 10: m10,
-        11: m11, 12: None, 13: None, 14: None, 15: None, 16: None, 17: None, 18: None,
+        1: m1, 2: m2, 3: m3, 4: m4, 5: m5, 6: m6, 7: None, 8: None, 9: m9, 10: m10,
+        11: m11, 12: None, 13: None, 14: m14, 15: None, 16: None, 17: None, 18: None,
         19: m19, 20: None,
     },
 }
