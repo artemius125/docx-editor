@@ -21,21 +21,6 @@ EDITS_FILE = "/home/artem/Загрузки/Правки_ColBERT_20.md"
 REGLAMENT_DOC = "/home/artem/Документы/artemius125/docx-editor/bench/fixtures/Регламент.docx"
 
 
-def _clustered(fn):
-    """Демо кластерного пути. В10 отдаёт документ короче _WHOLE_DOC_LIMIT
-    Редактору ЦЕЛИКОМ, и на игрушечных документах этих демо кластеров просто
-    не существует — а проверяют они именно дробление, которое остаётся в силе
-    для документов длиннее порога. Занижаем порог на время вызова."""
-    def wrapper():
-        old = edit_mod._WHOLE_DOC_LIMIT
-        edit_mod._WHOLE_DOC_LIMIT = 0
-        try:
-            return fn()
-        finally:
-            edit_mod._WHOLE_DOC_LIMIT = old
-    wrapper.__name__ = fn.__name__
-    return wrapper
-
 
 def test_split_real_file():
     text = open(EDITS_FILE, encoding="utf-8").read()
@@ -351,7 +336,6 @@ def test_checker_exception_restores_document_and_cleans_snapshot():
     print("edit_demo: исключение Проверяющего долетает наружу, doc восстановлен на месте, снимок не течёт")
 
 
-@_clustered
 def test_editor_exception_mid_batch_restores_earlier_cluster():
     # В11 (замер w18, colbert#4/math#4): обрыв транспорта у Редактора ВТОРОГО
     # кластера — уже ПОСЛЕ того, как первый кластер успешно применил set_style
@@ -662,7 +646,6 @@ def test_edit_12_on_real_doc_fixture():
     print(f"edit_demo: правка №12 на реальном документе (фикстура): p76 было {p76_before!r}, стало {p76_after!r}")
 
 
-@_clustered
 def test_scattered_targets_three_calls_one_verdict():
     # Спецификация кластеризации: цели в трёх разных частях документа (индексы
     # 0/5/10 из 12 абзацев — при around=1 окна p0/p5/p10 не пересекаются)
@@ -742,7 +725,6 @@ def test_adjacent_targets_one_call():
     print("edit_demo: два соседних резолвленных id слились в один кластер — один вызов Редактора")
 
 
-@_clustered
 def test_empty_ops_cluster_skipped_others_apply():
     # Кластер, где Редактор честно вернул пустые ops ("нечего делать здесь"),
     # не должен проваливать правку — другие кластеры всё ещё могут дать работу,
@@ -774,7 +756,6 @@ def test_empty_ops_cluster_skipped_others_apply():
     print("edit_demo: пустой ops одного кластера пропущен, другой кластер применился, вердикт done")
 
 
-@_clustered
 def test_invalid_cluster_aborts_whole_edit():
     # Кластер, чьи ops не проходят валидацию даже после ретрая внутри
     # _apply_ops, обязан прервать ВСЮ правку — включая откат уже применённого
@@ -812,7 +793,6 @@ def test_invalid_cluster_aborts_whole_edit():
     print("edit_demo: невалидный кластер после ретрая откатил всю правку, документ побайтово как был")
 
 
-@_clustered
 def test_many_scattered_targets_no_cap():
     # Владелец явно снял верхнюю границу на число целей: сколько бы
     # резолвленных id ни было, каждый непересекающийся кластер даёт свой
@@ -854,7 +834,6 @@ def test_many_scattered_targets_no_cap():
     print(f"edit_demo: {n_targets} разнесённых целей — {len(calls)} вызовов Редактора, кэп на 12 отсутствует")
 
 
-@_clustered
 def test_out_of_lane_op_blocked_document_unchanged():
     # Находка: _apply_ops звал patch.validate с картой ВСЕГО документа, поэтому
     # операция на любой существующий id проходила, даже если Редактор видел
@@ -889,7 +868,6 @@ def test_out_of_lane_op_blocked_document_unchanged():
     print(f"edit_demo: операция на блок вне фрагмента отклонена, документ не тронут: {result['reason']!r}")
 
 
-@_clustered
 def test_out_of_lane_retry_recovers_within_fragment():
     # Тот же случай, но Редактор, получив ошибку об "вне фрагмента" как
     # feedback, на ретрае отвечает верно — в пределах СВОЕГО фрагмента.
@@ -1780,7 +1758,6 @@ def test_editor_already_gives_already_not_failed():
     print("edit_demo: already на локальном пути отличается от «не умею»")
 
 
-@_clustered
 def test_later_clusters_see_what_earlier_ones_did():
     """ПАРТИЯ 5: кластер видит, что уже сделали предыдущие.
 
