@@ -2507,6 +2507,7 @@ def test_deleted_block_is_not_shown_as_truncated_text():
         llm_mod.chat = real_chat
 
     assert "p1: блок удалён целиком" in sent["user"], sent["user"]
+    assert "Итого удалено блоков: 1 (43 зн.)" in sent["user"], sent["user"]
     assert "стало 0 зн." not in sent["user"], sent["user"]
     assert 'новый блок, стиль «Heading 1»' in sent["user"], sent["user"]
     assert "было 0 зн." not in sent["user"], sent["user"]

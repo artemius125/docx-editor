@@ -238,6 +238,17 @@ def _check(request, diff):
             if note:
                 line += f'; {note}'
             lines.append(line)
+    # Итог по удалённому: в w24 правка «добавь ссылку на Оливера Сакса»
+    # отчиталась выполненной, а вместе со ссылкой тихо исчез абзац на 970
+    # знаков — Проверяющий видел строку про удаление, но не видел, СКОЛЬКО
+    # документ на этом потерял, и одобрил. Строка появляется только когда
+    # что-то удалено: там, где удалений нет, она была бы шумом.
+    deleted = [d for d in diff if d.get("deleted")]
+    if deleted:
+        added = sum(len(d["after"]) for d in diff if d.get("inserted"))
+        lines.append(f'Итого удалено блоков: {len(deleted)} '
+                     f'({sum(len(d["before"]) for d in deleted)} зн.), добавлено новых: {added} зн. '
+                     f'— сверь с тем, просила ли правка что-то убирать')
     diff_text = "\n".join(lines)
     messages = [
         {"role": "system", "content": _CHECK_PROMPT},
