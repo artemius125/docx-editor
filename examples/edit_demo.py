@@ -2541,6 +2541,7 @@ _LIVE_OPS = {
         {"text": "6. Пересмотр", "style": "Heading 1"}, {"text": "Раз в год.", "style": "Normal"}]},
     "field": {"op": "field", "id": "p2", "instr": "DATE"},
     "set_header_footer": {"op": "set_header_footer", "which": "header", "text": "Регламент", "field": "PAGE"},
+    "bookmark": {"op": "bookmark", "id": "p2", "name": "istochnik1"},
 }
 
 # Вторые формы адресации той же операции — их промпт описывает прозой, но

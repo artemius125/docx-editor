@@ -24,6 +24,7 @@ w:fldChar begin/separate/end + w:instrText — механизм выбирает
 которые python-docx уже умеет заводить как отдельные части пакета).
 """
 
+import re
 from copy import deepcopy
 from difflib import SequenceMatcher
 
@@ -45,10 +46,11 @@ _OPS = {
     "set_style", "create_table", "set_cell", "normalize", "replace_all",
     "set_format", "set_list_level", "footnote", "set_list",
     "insert_row", "delete_row", "insert_col", "delete_col", "insert_paragraphs",
-    "field", "set_header_footer",
+    "field", "set_header_footer", "bookmark",
 }
 _PARAGRAPH_ONLY = {
     "replace_text", "set_text", "set_style", "set_list_level", "footnote", "set_list", "field",
+    "bookmark",
 }
 # set_format не входит в _PARAGRAPH_ONLY (В2): адресуется и абзацем, и ячейкой
 # таблицы, поэтому проверку его id/kind ведёт собственная ветка validate.
@@ -193,7 +195,7 @@ _REQUIRED_TEXT = {
     "replace_text": ("old", "new"), "replace_all": ("old", "new"),
     "set_format": ("old",), "footnote": ("old", "text"),
     "set_text": ("text",), "insert_after": ("text",),
-    "field": ("instr",), "set_header_footer": ("text",),
+    "field": ("instr",), "set_header_footer": ("text",), "bookmark": ("name",),
 }
 
 
@@ -386,6 +388,14 @@ def validate(blocks, op, doc):
             return f"в {op['id']} нет текста «{old}»"
         if _mid_word_cut(text, span):
             return _mid_word_error(op["id"], old)
+
+    if name == "bookmark":
+        bad = _BOOKMARK_NAME_RX.match(op["name"]) is None
+        if bad:
+            return (f"имя закладки {op['name']!r} не годится: только латинские буквы, цифры и _, "
+                    f"начиная с буквы, без пробелов — Word другие имена не принимает")
+        if op["name"] in _bookmark_names(doc):
+            return f"закладка {op['name']!r} в документе уже есть — выбери другое имя"
 
     if name == "field":
         err = _field_verb_error(op["instr"])
@@ -809,6 +819,32 @@ def _field_elements(instr):
     return [_fldchar_run("begin"), instr_r, _fldchar_run("separate"), _fldchar_run("end")]
 
 
+_BOOKMARK_NAME_RX = re.compile(r"[A-Za-z][A-Za-z0-9_]*$")
+
+
+def _bookmark_names(doc):
+    return {b.get(qn("w:name")) for b in doc.element.body.iter(qn("w:bookmarkStart"))}
+
+
+def _op_bookmark(doc, idx, op):
+    """Закладка на весь абзац: цель для перекрёстной ссылки (field REF), без
+    которой REF ссылаться не на что — операция заведена именно поэтому.
+    w:id должен быть уникальным числом в пределах документа, имя — тем, что
+    модель напишет в инструкцию поля."""
+    el, name = idx[op["id"]], op["name"]
+    used = {int(b.get(qn("w:id"))) for b in doc.element.body.iter(qn("w:bookmarkStart"))
+            if (b.get(qn("w:id")) or "").isdigit()}
+    num = str(max(used) + 1 if used else 1)
+    start = OxmlElement("w:bookmarkStart")
+    start.set(qn("w:id"), num)
+    start.set(qn("w:name"), name)
+    end = OxmlElement("w:bookmarkEnd")
+    end.set(qn("w:id"), num)
+    el.insert(0, start)
+    el.append(end)
+    return f"На {op['id']} поставлена закладка «{name}» — на неё можно сослаться полем REF"
+
+
 def _op_field(doc, idx, op):
     el, instr = idx[op["id"]], op["instr"]
     old = op.get("old")
@@ -1005,6 +1041,7 @@ _HANDLERS = {
     "delete_col": _op_delete_col,
     "insert_paragraphs": _op_insert_paragraphs,
     "field": _op_field,
+    "bookmark": _op_bookmark,
     "set_header_footer": _op_set_header_footer,
 }
 

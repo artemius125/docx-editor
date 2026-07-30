@@ -94,6 +94,13 @@ def _footnotes(p_el):
     return len(p_el.findall(".//" + qn("w:footnoteReference")))
 
 
+def _bookmarks(p_el):
+    """Число закладок (w:bookmarkStart) внутри абзаца — тот же приём, что и
+    _footnotes/_fields: закладка не меняет ни текст, ни стиль абзаца, и без
+    счётчика операция bookmark была бы невидима diff'у, то есть мёртвой."""
+    return len(p_el.findall(".//" + qn("w:bookmarkStart")))
+
+
 def _fields(p_el):
     """Число полей Word (простых w:fldSimple и составных — по числу
     w:fldChar begin) внутри абзаца (В2-бис: тот же приём, что и
@@ -129,6 +136,7 @@ def doc_map(doc, idx):
                 "list": _list(el),
                 "footnotes": _footnotes(el),
                 "fields": _fields(el),
+                "bookmarks": _bookmarks(el),
             })
         elif el.tag == _TBL:
             t = Table(el, doc)

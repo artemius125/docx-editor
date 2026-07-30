@@ -947,6 +947,33 @@ def test_missing_required_field_is_rejected_not_crash():
     print("patch_demo: операция без обязательного поля отбита текстом, а не падением")
 
 
+def test_bookmark_gives_ref_field_a_target():
+    # Прогон за рулём 2026-07-30: field умел REF, но создать закладку было
+    # нечем — «пронумеруй ссылки полями» (ColBERT 20) невыполнимо по
+    # контракту. Пара bookmark + field REF обязана дать в пакете и цель, и
+    # ссылку на неё, а второе имя той же закладки — честный отказ.
+    doc = Document()
+    doc.add_paragraph("Khattab и Zaharia, ColBERT: эффективный поиск.")
+    doc.add_paragraph("Как показано в работе, поздняя интеракция выигрывает.")
+    idx = index(doc)
+
+    assert validate(doc_map(doc, idx), {"op": "bookmark", "id": "p0", "name": "istochnik1"}, doc) is None
+    apply(doc, idx, {"op": "bookmark", "id": "p0", "name": "istochnik1"})
+    apply(doc, idx, {"op": "field", "id": "p1", "instr": "REF istochnik1 \\h", "old": "в работе"})
+
+    xml = doc.element.body.xml
+    assert 'w:name="istochnik1"' in xml, "закладка не попала в документ"
+    assert "bookmarkEnd" in xml, "закладка не закрыта"
+    assert "REF istochnik1" in xml, "поле REF не попало в документ"
+    assert doc_map(doc, idx)[0]["bookmarks"] == 1, doc_map(doc, idx)[0]
+
+    dup = validate(doc_map(doc, idx), {"op": "bookmark", "id": "p1", "name": "istochnik1"}, doc)
+    assert dup and "уже есть" in dup, dup
+    bad = validate(doc_map(doc, idx), {"op": "bookmark", "id": "p1", "name": "источник 1"}, doc)
+    assert bad and "латинские" in bad, bad
+    print("patch_demo: bookmark даёт REF-ссылке цель, повтор имени и кириллица отклонены")
+
+
 if __name__ == "__main__":
     test_all_ops_have_handlers()
     test_missing_required_field_is_rejected_not_crash()
@@ -967,6 +994,7 @@ if __name__ == "__main__":
     test_replace_all_reports_only_real_changes()
     test_footnote_new_and_existing_part()
     test_set_text_preserves_run_formatting_via_diff()
+    test_bookmark_gives_ref_field_a_target()
     test_set_text_preserves_structure_loses_run_formatting()
     test_insert_delete_row_on_real_table()
     test_insert_delete_col_on_real_table()
