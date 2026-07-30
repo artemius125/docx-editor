@@ -2515,6 +2515,90 @@ def test_deleted_block_is_not_shown_as_truncated_text():
     print("edit_demo: удалённый и новый блоки названы Проверяющему своими именами, а не длинами 0 зн.")
 
 
+# Один пример вызова на КАЖДУЮ операцию из промпта Редактора. Добавил
+# операцию — добавь строку сюда, иначе демо ниже упадёт: это и есть контракт
+# «операция считается существующей, только когда она есть на всех
+# поверхностях» (прогон за рулём 2026-07-30, мёртвый set_format в ячейке).
+_LIVE_OPS = {
+    "replace_text": {"op": "replace_text", "id": "p2", "old": "Документ описывает", "new": "Документ задаёт"},
+    "set_text": {"op": "set_text", "id": "p3", "text": "Ответственный за релиз — релиз-менеджер."},
+    "insert_after": {"op": "insert_after", "id": "p2", "text": "Новый абзац.", "style": "Normal"},
+    "delete": {"op": "delete", "id": "p12"},
+    "move_after": {"op": "move_after", "id": "p6", "after": "p4"},
+    "set_style": {"op": "set_style", "id": "p2", "style": "Heading 2"},
+    "create_table": {"op": "create_table", "after": "p2", "rows": [["Колонка", "Значение"]], "header": True},
+    "set_cell": {"op": "set_cell", "id": "t0", "row": 1, "col": 1, "text": "Новое значение"},
+    "replace_all": {"op": "replace_all", "old": "Регламент", "new": "Документ"},
+    "set_format": {"op": "set_format", "id": "p2", "old": "Документ", "b": True},
+    "set_list_level": {"op": "set_list_level", "id": "p6", "ilvl": 1},
+    "footnote": {"op": "footnote", "id": "p15", "old": "регрессию", "text": "Проверка ранее работавшей функциональности"},
+    "set_list": {"op": "set_list", "id": "p3", "ilvl": 0},
+    "insert_row": {"op": "insert_row", "id": "t0", "at": 4, "cells": ["Служба", "Согласование", "нет"]},
+    "delete_row": {"op": "delete_row", "id": "t0", "row": 3},
+    "insert_col": {"op": "insert_col", "id": "t0", "at": 3, "cells": ["Телефон", "", "", ""]},
+    "delete_col": {"op": "delete_col", "id": "t0", "col": 2},
+    "insert_paragraphs": {"op": "insert_paragraphs", "id": "p2", "items": [
+        {"text": "6. Пересмотр", "style": "Heading 1"}, {"text": "Раз в год.", "style": "Normal"}]},
+    "field": {"op": "field", "id": "p2", "instr": "DATE"},
+    "set_header_footer": {"op": "set_header_footer", "which": "header", "text": "Регламент", "field": "PAGE"},
+}
+
+# Вторые формы адресации той же операции — их промпт описывает прозой, но
+# мёртвыми они бывают ровно так же (set_format по row/col был мёртв, а по
+# абзацу работал).
+_LIVE_VARIANTS = [
+    ("set_format в ячейке таблицы",
+     {"op": "set_format", "id": "t0", "row": 1, "col": 0, "old": "Релиз-менеджер", "b": True}),
+    ("field с якорем old",
+     {"op": "field", "id": "p2", "instr": "PAGE", "old": "Документ описывает"}),
+]
+
+
+def test_every_prompt_op_is_alive():
+    # Ни одной мёртвой операции: то, что названо Редактору, обязано (1) пройти
+    # validate на верном вызове, (2) примениться и (3) стать ВИДИМЫМ — либо в
+    # diff, который читает Проверяющий, либо в состоянии колонтитулов. Третья
+    # проверка и есть та, что поймала бы set_format по ячейке таблицы: он
+    # применялся, но diff оставался пуст, и правка не могла завершиться.
+    names = set(re.findall(r'\{"op":"(\w+)"', edit_mod._EDIT_PROMPT))
+    assert names == set(_LIVE_OPS), (
+        f"операции промпта без примера: {names - set(_LIVE_OPS)}; "
+        f"примеры без операции в промпте: {set(_LIVE_OPS) - names}")
+
+    # set_list_level требует абзаца, УЖЕ являющегося списком: в фикстуре
+    # нумерация приходит от стиля, а не от w:numPr, поэтому подготовка.
+    prep = {"set_list_level": {"op": "set_list", "id": "p6", "ilvl": 0}}
+    for name, op in list(_LIVE_OPS.items()) + _LIVE_VARIANTS:
+        doc = Document(REGLAMENT_DOC)
+        idx = index(doc)
+        if name in prep:
+            patch.apply(doc, idx, prep[name])
+        before = doc_map(doc, idx)
+        hf_before = edit_mod._hf_state(doc)
+        err = patch.validate(before, op, doc)
+        assert err is None, f"{name}: верный вызов отклонён валидатором — {err}"
+        patch.apply(doc, idx, op)
+        visible = bool(edit_mod._diff(before, doc_map(doc, idx))) or edit_mod._hf_state(doc) != hf_before
+        assert visible, f"{name}: операция применилась, но её результат невидим — Проверяющему нечего судить"
+
+    # И наоборот: заведомо неверный вызов обязан получить внятный отказ, а не
+    # исключение — модель чинится по тексту ошибки на ретрае.
+    doc = Document(REGLAMENT_DOC)
+    idx = index(doc)
+    for name, op in _LIVE_OPS.items():
+        if "id" in op:
+            broken = {**op, "id": "p999"}
+        elif "after" in op:
+            broken = {**op, "after": "p999"}
+        elif "old" in op:
+            broken = {**op, "old": "такого текста в документе нет"}
+        else:
+            broken = {**op, "which": "серединка"}
+        err = patch.validate(doc_map(doc, idx), broken, doc)
+        assert err and isinstance(err, str), f"{name}: неверный вызов не получил объяснения"
+    print(f"edit_demo: все {len(_LIVE_OPS) + len(_LIVE_VARIANTS)} операций и форм адресации живы — применяются, видимы, объясняют отказ")
+
+
 def test_off_term_allows_op_covering_whole_variant():
     # Замер w20: гвард требовал ТОЧНОГО равенства варианту и рубил операции,
     # которые трогают сам термин вместе с окружением, — а это ровно то, что
@@ -2619,5 +2703,6 @@ if __name__ == "__main__":
     test_pattern_matching_implausible_share_treated_as_no_address()
     test_off_term_op_blocked_on_local_path_after_unify_fallthrough()
     test_off_term_allows_op_covering_whole_variant()
+    test_every_prompt_op_is_alive()
     test_deleted_block_is_not_shown_as_truncated_text()
     test_set_format_in_table_cell_is_visible_to_diff()
