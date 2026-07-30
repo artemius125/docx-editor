@@ -976,6 +976,61 @@ def _redundant_in_batch(op, idx, written):
     return False
 
 
+_DELETE_GUARD_CHARS = 300
+# Правка, которая САМА просит убрать текст: сжать, сократить, снять повтор,
+# слить абзацы. Здесь удаление — то, за чем правку и звали, гвард молчит.
+_DELETE_ASKED_RX = re.compile(
+    r"сожм|сожа|сократ|укорот|убер|удал|выброс|выкин|лишн|повтор|дублир|слей|слить|объедин|короче",
+    re.IGNORECASE)
+
+
+def _delete_without_carrier(op, doc, idx, ops, request):
+    """Н42: правка молча теряет текст. Улика — замер w24, Математика 18: правка
+    «добавь ссылку на Сакса» отчиталась выполненной, документ похудел на 970
+    знаков — модель к двум точечным вставкам добавила delete целого абзаца,
+    и ни один контроль этого не увидел (Проверяющий с тех пор видит строку об
+    удалении, но она только ИНФОРМАЦИЯ, а гварда не было).
+
+    Условие срабатывания узкое, чтобы не срубить законное удаление (все три
+    класса взяты из журналов w22–w24, где delete работал ПРАВИЛЬНО):
+    (a) правка сама просит убрать/сжать/слить — _DELETE_ASKED_RX (Математика
+        9 «слей со следующим», Математика 16 «сожми вдвое»);
+    (b) батч уносит содержимое абзаца в другое место — новый текст любой
+        другой операции этого же батча содержит кусок удаляемого (то самое
+        слияние абзацев);
+    (c) батч перекладывает содержимое в структуру — create_table/insert_row/
+        insert_col (ColBERT 19: список из десяти абзацев стал таблицей).
+
+    Ни один из трёх — значит абзац длиннее _DELETE_GUARD_CHARS исчезает
+    бесследно; такая операция ПРОПУСКАЕТСЯ (как избыточная в
+    _redundant_in_batch), а не превращается в жёсткую ошибку: остальные
+    операции батча — ровно то, о чём просила правка, — применяются, и правка
+    остаётся выполненной. Ретрай на это не тратится.
+
+    Возвращает строку для applied (операция пропущена) или None."""
+    if op.get("op") != "delete":
+        return None
+    el = idx.get(op.get("id"))
+    if el is None or el.tag != qn("w:p"):
+        return None
+    text = patch._ptext(el)
+    if len(text) <= _DELETE_GUARD_CHARS or _DELETE_ASKED_RX.search(request or ""):
+        return None
+    chunks = [text[i:i + 40] for i in range(0, len(text) - 40, 40)]
+    for other in ops:
+        if other is op:
+            continue
+        if other.get("op") in ("create_table", "insert_row", "insert_col"):
+            return None
+        new = other.get("new") or other.get("text") or ""
+        if other.get("op") == "insert_paragraphs":
+            new = " ".join(it.get("text") or "" for it in other.get("items") or [])
+        if any(c in new for c in chunks):
+            return None
+    return (f'пропущена операция delete {op.get("id")} — абзац на {len(text)} зн. исчез бы бесследно: '
+            f'правка не просит ничего убирать, и ни одна другая операция батча не переносит его текст')
+
+
 def _apply_ops(doc, idx, ops, fragment_text, request, editor, fragment_ids=None, written=None, ops_out=None,
                 term_variants=None):
     """Применяет ops по очереди; на невалидной операции — один ретрай к
@@ -1043,6 +1098,14 @@ def _apply_ops(doc, idx, ops, fragment_text, request, editor, fragment_ids=None,
         if anchor_id is not None and anchor_id in anchor_chain:
             op = {**op, "id": anchor_chain[anchor_id]}
             ops[i] = op
+        # Н42: удаление длинного абзаца, чей текст никуда не переносится и
+        # которого правка не просила, — пропускается до валидатора и без
+        # ретрая (сама операция валидна, вопрос не в форме, а в цене).
+        dropped = _delete_without_carrier(op, doc, idx, ops, request)
+        if dropped is not None:
+            applied.append(dropped)
+            i += 1
+            continue
         out = _out_of_lane(op, fragment_ids) if fragment_ids is not None else None
         term_err = _off_term_error(op, term_variants) if out is None else None
         if out is not None:

@@ -1902,6 +1902,59 @@ def test_compose_single_editor_call_over_scattered_targets():
     print("edit_demo: compose дал один вызов Редактора над всеми тремя разнесёнными целями")
 
 
+_LONG = ("Второй абзац — большой кусок содержательного текста про историю двух братьев, "
+         "которую автор пересказывает подробно и с деталями, занимающими существенную часть "
+         "раздела, поэтому его исчезновение меняет документ, а не приводит его в порядок. ") * 2
+
+
+def _run_delete_batch(request, extra_op=None):
+    """Прогон правки, в которой Редактор к нужной операции добавил delete
+    длинного абзаца p1. Возвращает (result, тексты блоков после, applied)."""
+    doc = Document()
+    doc.add_paragraph("Первый абзац, в него добавляется ссылка на источник.")
+    doc.add_paragraph(_LONG)
+    doc.add_paragraph("Третий абзац.")
+    idx = index(doc)
+
+    def fake_navigator(outline_text, request_):
+        return {"kind": None, "rule": None, "ids": ["p0", "p1"], "anchors": []}
+
+    def fake_editor(fragment_text, request_, feedback=None):
+        ops = [extra_op or {"op": "replace_text", "id": "p0", "old": "на источник",
+                             "new": "на источник (Сакс, 1985)"}]
+        return {"ops": ops + [{"op": "delete", "id": "p1"}]}
+
+    result, doc, idx = run_edit(doc, idx, request, navigator=fake_navigator,
+                                editor=fake_editor, checker=lambda r, d: {"ok": True, "reason": "ok"})
+    return result, [b["text"] for b in doc_map(doc, idx) if b["kind"] == "p"], result.get("applied") or []
+
+
+def test_unrequested_delete_of_long_paragraph_is_dropped():
+    # Н42: замер w24, Математика 18 — правка «добавь ссылку на Сакса»
+    # отчиталась выполненной, а документ потерял 970 знаков: модель к двум
+    # точечным вставкам добавила delete целого абзаца. Такая операция теперь
+    # ПРОПУСКАЕТСЯ: остальное применяется, правка остаётся выполненной, текст
+    # остаётся в документе.
+    result, texts, applied = _run_delete_batch("Добавь ссылку на источник, эпизод известен в пересказе Сакса.")
+    assert result["verdict"] == "done", result
+    assert any(t.startswith("Второй абзац") for t in texts), "длинный абзац обязан уцелеть"
+    assert any("пропущена операция delete" in a for a in applied), applied
+    assert any("Сакс, 1985" in t for t in texts), "то, о чём просила правка, обязано примениться"
+
+    # Обратная сторона: правка, которая САМА просит убрать текст, удаляет как
+    # и раньше (Математика 16 «сожми вдвое», Математика 9 «слей со следующим»).
+    _, texts_asked, applied_asked = _run_delete_batch("Сожми этот раздел примерно вдвое.")
+    assert not any(t.startswith("Второй абзац") for t in texts_asked), "запрошенное удаление обязано пройти"
+    assert not any("пропущена операция delete" in a for a in applied_asked), applied_asked
+
+    # И вторая законная форма: батч уносит текст абзаца в другое место
+    # (слияние абзацев) — удаление источника после переноса законно.
+    carry = {"op": "set_text", "id": "p0", "text": "Первый абзац. " + _LONG[:200]}
+    _, texts_carried, _ = _run_delete_batch("Перепиши первый абзац.", extra_op=carry)
+    assert not any(t.startswith("Второй абзац") for t in texts_carried), "перенесённый текст можно удалять"
+    print("edit_demo: незапрошенное удаление длинного абзаца пропущено, запрошенное и перенос — проходят")
+
+
 def _run_two_targets(request, doc_words):
     """Один прогон правки на двух разнесённых целях (p0 и p6 в документе из 12
     абзацев — при обычной кластеризации это ДВА кластера). Возвращает список
@@ -2794,6 +2847,7 @@ if __name__ == "__main__":
     test_footnote_only_edit_reaches_done_not_failed()
     test_compose_single_editor_call_over_scattered_targets()
     test_first_mention_edit_goes_in_one_cluster()
+    test_unrequested_delete_of_long_paragraph_is_dropped()
     test_compose_oversized_fragment_refused_document_unchanged()
     test_position_end_resolves_to_last_block()
     test_trace_table_catches_paragraph_faking_a_row()
