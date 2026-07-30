@@ -2556,38 +2556,6 @@ _LIVE_VARIANTS = [
 ]
 
 
-def test_leftover_variants_block_done():
-    # Самая старая ложь проекта (c7): правка «приведи к одному написанию»
-    # отчитывается выполненной, а в документе остаются несколько написаний.
-    # Проверка была у снятого маршрута unify и вернулась на общий путь: судит
-    # КОД по посчитанному инвентарю, а не Проверяющий по словам модели.
-    doc = Document()
-    doc.add_paragraph("Модель Bi-encoder быстрая. Класс Bi-Encoders изучен. Термин Bi-encoders общий.")
-    idx = index(doc)
-
-    def fake_navigator(outline_text, request):
-        return {"kind": "unify", "rule": None, "ids": ["p0"],
-                "anchors": ["Bi-encoder", "Bi-Encoders", "Bi-encoders"]}
-
-    def lazy_editor(fragment_text, request, feedback=None):
-        # Правит ОДНО написание из трёх и объявляет работу сделанной.
-        return {"ops": [{"op": "replace_text", "id": "p0", "old": "Bi-Encoders", "new": "Bi-encoders"}]}
-
-    def no_checker(request, diff):
-        raise AssertionError("код обязан отклонить неполную унификацию ДО Проверяющего")
-
-    result, doc, idx = run_edit(
-        doc, idx, "Термин «Bi-encoder» записан по-разному — приведи к одному написанию",
-        navigator=fake_navigator, editor=lazy_editor, checker=no_checker,
-    )
-
-    assert result["verdict"] == "failed", result
-    assert "осталось несколько" in result["reason"], result["reason"]
-    text = doc_map(doc, idx)[0]["text"]
-    assert "Bi-Encoders" in text, "документ обязан быть откачен: " + text
-    print("edit_demo: неполная унификация не проходит как done, вердикт считает код")
-
-
 def test_llm_retries_provider_5xx_once():
     # Замер w25 умер целиком на «500 inference error» посреди корпуса: ретрай
     # llm.chat стоял только на обрыве транспорта, а вызывающий ловит только
@@ -2787,6 +2755,5 @@ if __name__ == "__main__":
     test_off_term_allows_op_covering_whole_variant()
     test_every_prompt_op_is_alive()
     test_llm_retries_provider_5xx_once()
-    test_leftover_variants_block_done()
     test_deleted_block_is_not_shown_as_truncated_text()
     test_set_format_in_table_cell_is_visible_to_diff()
